@@ -1,0 +1,1255 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MultiChat — AI Developer Workspace</title>
+  
+  <!-- Import Outfit and JetBrains Mono Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <!-- Import marked.js for Markdown parsing -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.5/marked.min.js"></script>
+
+  <!-- Import Prism.js for high-fidelity syntax highlighting -->
+  <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:          radial-gradient(circle at top right, #0e121a, #07090d);
+      --bg-solid:    #07090d;
+      --surface:     rgba(20, 24, 33, 0.7);
+      --surface-solid: #10141d;
+      --surface2:    rgba(30, 36, 48, 0.5);
+      --surface2-solid: #1b202a;
+      --border:      rgba(255, 255, 255, 0.08);
+      --border-hover: rgba(88, 166, 255, 0.4);
+      --text:        #e6edf3;
+      --muted:       #8b949e;
+      --accent:      #58a6ff;
+      --accent-glow: rgba(88, 166, 255, 0.15);
+      --llm:         #a371f7;
+      --llm-glow:    rgba(163, 113, 247, 0.15);
+      --green:       #3fb950;
+      --green-glow:  rgba(63, 185, 80, 0.2);
+      --red:         #f85149;
+      --user-bg:     rgba(28, 33, 40, 0.45);
+      --llm-bg:      rgba(28, 17, 40, 0.45);
+      
+      --font-main:   'Outfit', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      --font-mono:   'JetBrains Mono', Consolas, monospace;
+    }
+
+    html, body {
+      height: 100%;
+      font-family: var(--font-main);
+      background-color: var(--bg-solid);
+      background-image: var(--bg);
+      color: var(--text);
+      overflow: hidden;
+      line-height: 1.5;
+    }
+
+    /* ── Animations ────────────────────────── */
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(12px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    
+    @keyframes pulse {
+      0%, 100% { opacity: 0.6; }
+      50% { opacity: 1; }
+    }
+
+    /* ── Custom Scrollbar ──────────────────── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+    /* ── Join modal ────────────────────────── */
+    #modal {
+      position: fixed; inset: 0; z-index: 60;
+      background: rgba(0,0,0,0.85);
+      backdrop-filter: blur(16px);
+      display: flex; align-items: center; justify-content: center;
+    }
+    #modal-box {
+      background: var(--surface-solid); border: 1px solid var(--border);
+      border-radius: 16px; padding: 2.5rem; width: 400px;
+      display: flex; flex-direction: column; gap: 1.2rem;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+      animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    }
+    #modal-box h2 { font-size: 1.8rem; font-weight: 700; color: var(--accent); text-align: center; }
+    #modal-box p  { font-size: .95rem; color: var(--muted); text-align: center; margin-bottom: 0.5rem; }
+    
+    .text-input {
+      background: var(--surface2-solid); border: 1px solid var(--border);
+      border-radius: 8px; padding: .75rem 1rem;
+      color: var(--text); font-size: 1rem; outline: none; width: 100%;
+      font-family: inherit; transition: all 0.2s;
+    }
+    .text-input:focus { border-color: var(--accent); box-shadow: 0 0 10px var(--accent-glow); }
+    
+    .btn-primary {
+      background: var(--accent); color: #0d1117;
+      border: none; border-radius: 8px;
+      padding: .75rem 1.2rem; font-size: 1rem; font-weight: 700; cursor: pointer;
+      font-family: inherit; transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 0 4px 14px var(--accent-glow);
+    }
+    .btn-primary:hover { opacity: .9; transform: translateY(-1px); box-shadow: 0 6px 20px var(--accent-glow); }
+    .btn-primary:active { transform: translateY(0); }
+
+    /* ── App layout ────────────────────────── */
+    #app { display: none; height: 100vh; }
+    #app.visible { display: flex; }
+
+    /* ── Sidebar ────────────────────────────── */
+    #sidebar {
+      width: 240px; flex-shrink: 0;
+      background: rgba(16, 20, 29, 0.8);
+      backdrop-filter: blur(12px);
+      border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; padding: 1.5rem; gap: 1.8rem; overflow: hidden;
+    }
+    .sl { font-size: .75rem; font-weight: 700; text-transform: uppercase; letter-spacing: .12em; color: var(--muted); margin-bottom: .6rem; }
+    #participants { display: flex; flex-direction: column; gap: .45rem; }
+    .participant {
+      font-size: .9rem; padding: .35rem .6rem; border-radius: 6px;
+      display: flex; align-items: center; gap: .5rem; color: var(--text);
+      background: rgba(255,255,255,0.02); border: 1px solid transparent;
+      transition: all 0.2s;
+    }
+    .participant:hover { border-color: var(--border); background: rgba(255,255,255,0.04); }
+    .participant::before { content: '●'; font-size: .6rem; color: var(--green); text-shadow: 0 0 6px var(--green); }
+
+    #ai-list { display: flex; flex-direction: column; gap: .45rem; }
+    .ai-chip {
+      font-size: .8rem; font-family: var(--font-mono);
+      color: var(--llm); background: var(--llm-glow);
+      padding: .35rem .6rem; border-radius: 6px;
+      border: 1px solid rgba(163, 113, 247, 0.2);
+      transition: all 0.2s;
+    }
+    .ai-chip.disabled { color: var(--muted); background: transparent; border-color: var(--border); opacity: .4; text-decoration: line-through; }
+
+    /* ── Chat area ──────────────────────────── */
+    #chat-area { flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative; }
+
+    #chat-header {
+      padding: .9rem 1.5rem;
+      background: rgba(16, 20, 29, 0.8);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: .6rem;
+      font-weight: 600;
+    }
+    #chat-header .title { flex: 1; font-size: 1.2rem; font-weight: 700; letter-spacing: -0.01em; }
+    .hdr-btn {
+      background: rgba(255,255,255,0.02); border: 1px solid var(--border);
+      color: var(--muted); border-radius: 8px;
+      padding: .45rem .9rem; cursor: pointer; font-size: .85rem;
+      font-family: inherit; font-weight: 500;
+      white-space: nowrap; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .hdr-btn:hover { border-color: var(--accent); color: var(--text); background: var(--accent-glow); }
+    #stop-btn { border-color: transparent; opacity: .35; cursor: default; }
+    #stop-btn.active { border-color: var(--red); color: var(--red); opacity: 1; cursor: pointer; }
+    #stop-btn.active:hover { background: rgba(248,81,73,.12); }
+
+    #messages {
+      flex: 1; overflow-y: auto; padding: 1.5rem;
+      display: flex; flex-direction: column; gap: .8rem;
+    }
+
+    /* ── Messages ────────────────────────────── */
+    .msg {
+      padding: 1rem 1.25rem; border-radius: 12px; max-width: 85%; word-wrap: break-word;
+      animation: fadeIn 0.28s cubic-bezier(0.25, 1, 0.5, 1) forwards;
+      border: 1px solid var(--border);
+    }
+    .msg .sender { font-size: .8rem; font-weight: 700; display: block; margin-bottom: .4rem; }
+    
+    /* Markdown rendering support styling */
+    .msg-content { font-size: .92rem; line-height: 1.6; }
+    .msg-content p { margin-bottom: 0.6rem; }
+    .msg-content p:last-child { margin-bottom: 0; }
+    .msg-content blockquote {
+      border-left: 3px solid var(--accent); padding-left: 0.8rem; margin: 0.5rem 0; color: var(--muted); font-style: italic;
+    }
+    .msg-content ul, .msg-content ol { margin: 0.5rem 0 0.5rem 1.2rem; }
+    .msg-content li { margin-bottom: 0.25rem; }
+    .msg-content table {
+      border-collapse: collapse; width: 100%; margin: 0.8rem 0; font-size: 0.85rem;
+    }
+    .msg-content th, .msg-content td {
+      border: 1px solid var(--border); padding: 0.5rem 0.8rem; text-align: left;
+    }
+    .msg-content th { background: var(--surface2-solid); font-weight: 600; }
+    .msg-content code {
+      background: var(--surface2-solid); padding: 0.15rem 0.35rem; border-radius: 4px; font-family: var(--font-mono); font-size: 0.85rem;
+    }
+    .msg-content pre {
+      background: #111b27 !important; border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem; margin: 0.8rem 0; overflow-x: auto;
+    }
+    .msg-content pre code { background: transparent; padding: 0; font-size: 0.85rem; }
+
+    .msg .footer { display: flex; align-items: center; gap: .6rem; margin-top: .6rem; flex-wrap: wrap; border-top: 1px solid rgba(255,255,255,0.03); padding-top: 0.4rem; }
+    .msg .ts   { font-size: .7rem; color: var(--muted); }
+    .msg .usage { font-size: .7rem; color: var(--muted); font-family: var(--font-mono); }
+    .msg .audit-btn {
+      font-size: .7rem; color: var(--accent); cursor: pointer; font-weight: 500; opacity: 0.65; transition: opacity 0.2s, text-shadow 0.2s;
+    }
+    .msg .audit-btn:hover {
+      opacity: 1; text-shadow: 0 0 8px var(--accent);
+    }
+    .msg .files { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
+    
+    .file-chip {
+      font-size: .75rem; font-family: var(--font-mono);
+      color: var(--accent); background: var(--surface2-solid);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: .25rem .6rem; cursor: pointer;
+      display: inline-flex; align-items: center; gap: .4rem;
+      transition: all 0.2s;
+    }
+    .file-chip:hover { border-color: var(--accent); background: var(--accent-glow); }
+    .file-chip .sz { color: var(--muted); font-size: .68rem; }
+
+    .msg.user { background: var(--user-bg); border-left: 4px solid var(--accent); }
+    .msg.user .sender { color: var(--accent); }
+    .msg.llm  { background: var(--llm-bg);  border-left: 4px solid var(--llm); }
+    .msg.llm  .sender { color: var(--llm); }
+    .msg.system { align-self: center; background: transparent; border: none; padding: .25rem 1rem; animation: fadeIn 0.2s; }
+    .msg.system p { font-size: .8rem; color: var(--muted); font-style: italic; text-align: center; }
+
+    /* Streaming layout styling */
+    .msg.streaming {
+      border-style: dashed;
+      border-color: rgba(163, 113, 247, 0.4);
+    }
+
+    /* typing dots */
+    .dots span {
+      display: inline-block; width: 6px; height: 6px;
+      background: var(--llm); border-radius: 50%; margin: 0 2px;
+      animation: bounce 1.1s infinite;
+    }
+    .dots span:nth-child(2) { animation-delay: .18s; }
+    .dots span:nth-child(3) { animation-delay: .36s; }
+    @keyframes bounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-6px)} }
+
+    /* ── Input bar ──────────────────────────── */
+    #input-bar {
+      padding: 1rem 1.5rem;
+      background: rgba(16, 20, 29, 0.8);
+      backdrop-filter: blur(12px);
+      border-top: 1px solid var(--border);
+      display: flex; gap: .75rem; align-items: flex-end;
+    }
+    #msg-input {
+      flex: 1; background: var(--surface2-solid);
+      border: 1px solid var(--border); border-radius: 10px;
+      padding: .65rem 1rem; color: var(--text);
+      font-size: .95rem; font-family: inherit;
+      resize: none; outline: none; max-height: 120px;
+      transition: all 0.2s;
+    }
+    #msg-input:focus { border-color: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
+    #send-btn {
+      background: var(--accent); color: #0d1117;
+      border: none; border-radius: 10px;
+      padding: .65rem 1.4rem; font-weight: 700; cursor: pointer;
+      font-family: inherit; transition: all 0.2s;
+    }
+    #send-btn:hover { opacity: .9; box-shadow: 0 0 12px var(--accent-glow); }
+
+    /* ── Workspace File Drawer (Slide-Over) ── */
+    .drawer {
+      position: fixed; top: 0; right: -660px; bottom: 0; z-index: 55;
+      width: 630px; max-width: 90vw; background: rgba(11, 14, 20, 0.96);
+      backdrop-filter: blur(20px); border-left: 1px solid var(--border);
+      box-shadow: -10px 0 35px rgba(0,0,0,0.6);
+      display: flex; flex-direction: column;
+      transition: right 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      overflow: hidden;
+    }
+    .drawer.open { right: 0; }
+    .drawer-header {
+      padding: 1rem 1.5rem; border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; justify-content: space-between;
+      background: rgba(16, 20, 29, 0.8);
+    }
+    #file-drawer-title { font-family: var(--font-mono); font-size: .85rem; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+    .drawer-actions { display: flex; align-items: center; gap: .6rem; }
+    .drawer-close { background: none; border: none; color: var(--muted); font-size: 1.3rem; cursor: pointer; line-height: 1; }
+    .drawer-close:hover { color: var(--text); }
+    
+    #file-drawer-body {
+      flex: 1; overflow: auto; padding: 1.2rem;
+      background: #0c1015;
+    }
+    #file-drawer-body pre { margin: 0; background: transparent !important; border: none; }
+    #file-drawer-body code { font-family: var(--font-mono); font-size: .82rem; line-height: 1.5; }
+    
+    .btn-success {
+      background: var(--green); color: #0d1117;
+      border: none; border-radius: 6px;
+      padding: .45rem .9rem; font-size: .82rem; font-weight: 700; cursor: pointer;
+      font-family: inherit; transition: all 0.2s;
+    }
+    .btn-success:hover { opacity: .95; box-shadow: 0 0 10px var(--green-glow); }
+
+    /* ── Custom Selector Modal ────────────── */
+    .custom-modal {
+      display: none; position: fixed; inset: 0; z-index: 65;
+      background: rgba(0, 0, 0, 0.8);
+      backdrop-filter: blur(10px);
+      align-items: center; justify-content: center;
+    }
+    .custom-modal.open { display: flex; }
+    .custom-modal-box {
+      background: var(--surface-solid); border: 1px solid var(--border);
+      border-radius: 16px; padding: 1.8rem; width: 380px;
+      display: flex; flex-direction: column; gap: 1.2rem;
+      box-shadow: 0 15px 40px rgba(0,0,0,0.6);
+      animation: fadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .custom-modal-box h3 { font-size: 1.3rem; font-weight: 700; color: var(--accent); }
+    .custom-modal-box p { font-size: .9rem; color: var(--muted); line-height: 1.4; }
+    .audit-options { display: flex; flex-direction: column; gap: .6rem; }
+    .audit-opt-btn {
+      background: var(--surface2-solid); border: 1px solid var(--border);
+      color: var(--text); border-radius: 8px; padding: .7rem 1rem; text-align: left;
+      font-size: .95rem; font-family: inherit; font-weight: 500; cursor: pointer; transition: all 0.2s;
+    }
+    .audit-opt-btn:hover { border-color: var(--accent); background: var(--accent-glow); transform: translateX(2px); }
+
+    /* ── Settings drawer ─────────────────────── */
+    #settings-overlay {
+      display: none; position: fixed; inset: 0; z-index: 40;
+      background: rgba(0,0,0,.65);
+      backdrop-filter: blur(4px);
+    }
+    #settings-overlay.open { display: block; }
+    #settings-drawer {
+      position: fixed; top: 0; right: -410px; bottom: 0; z-index: 50;
+      width: 400px; background: rgba(16, 20, 29, 0.95);
+      backdrop-filter: blur(20px);
+      border-left: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      transition: right .28s cubic-bezier(0.4, 0, 0.2, 1);
+      overflow: hidden;
+      box-shadow: -5px 0 25px rgba(0,0,0,0.5);
+    }
+    #settings-drawer.open { right: 0; }
+
+    #settings-header {
+      padding: 1.2rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: .6rem;
+      font-weight: 700; font-size: 1.1rem;
+      background: rgba(16, 20, 29, 0.8);
+    }
+    #settings-header span { flex: 1; }
+    #close-settings {
+      background: none; border: none; color: var(--muted);
+      font-size: 1.3rem; cursor: pointer; line-height: 1;
+    }
+    #close-settings:hover { color: var(--text); }
+
+    #settings-body {
+      flex: 1; overflow-y: auto; padding: 1.2rem;
+      display: flex; flex-direction: column; gap: 1rem;
+    }
+
+    #settings-footer {
+      padding: 1.2rem;
+      border-top: 1px solid var(--border);
+      display: flex; gap: .6rem; align-items: center;
+      background: rgba(16, 20, 29, 0.8);
+    }
+    #save-msg { font-size: .85rem; color: var(--green); flex: 1; font-weight: 600; }
+
+    /* provider cards */
+    .pcard {
+      border: 1px solid var(--border); border-radius: 12px;
+      overflow: hidden; flex-shrink: 0;
+      background: rgba(255,255,255,0.01);
+      transition: all 0.2s;
+    }
+    .pcard:hover { border-color: rgba(255,255,255,0.12); background: rgba(255,255,255,0.02); }
+    .pcard-head {
+      padding: .8rem 1.2rem;
+      background: rgba(30, 36, 48, 0.3);
+      display: flex; align-items: center; gap: .6rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .pcard-head .pname { font-weight: 700; font-size: .95rem; flex: 1; }
+    .pcard-head .ptag  { font-size: .75rem; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; }
+    .pcard-body { padding: 1rem 1.2rem; display: flex; flex-direction: column; gap: .6rem; }
+    .pcard-body label { font-size: .8rem; color: var(--muted); font-weight: 600; }
+    
+    .pcard-body select,
+    .pcard-body input[type="text"],
+    .pcard-body input[type="number"],
+    .pcard-body input[type="password"] {
+      background: var(--surface2-solid); border: 1px solid var(--border);
+      border-radius: 6px; padding: .5rem .8rem;
+      color: var(--text); font-size: .9rem; outline: none; width: 100%;
+      font-family: inherit; transition: all 0.2s;
+    }
+    .pcard-body select:focus,
+    .pcard-body input:focus { border-color: var(--accent); }
+    .pcard-hint { font-size: .75rem; color: var(--llm); font-family: var(--font-mono); line-height: 1.4; }
+
+    .pcard-body .row { display: flex; gap: .5rem; align-items: flex-end; }
+    .pcard-body .row input { flex: 1; }
+    
+    #ollama-detected { font-size: .8rem; color: var(--muted); margin-top: 0.2rem; }
+    #ollama-detected span { color: var(--green); font-weight: 600; }
+
+    /* Environment health status dots */
+    .status-dot {
+      display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+      margin-left: .5rem; vertical-align: middle;
+      box-shadow: 0 0 6px rgba(0,0,0,0.5);
+      transition: all 0.3s;
+    }
+    .status-dot.online { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .status-dot.offline { background: var(--red); box-shadow: 0 0 8px var(--red); }
+
+    /* toggle switch */
+    .toggle { position: relative; display: inline-block; width: 38px; height: 22px; flex-shrink: 0; }
+    .toggle input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute; inset: 0; background: rgba(255,255,255,0.1);
+      border-radius: 22px; cursor: pointer; transition: background .2s;
+    }
+    .slider::before {
+      content: ''; position: absolute;
+      height: 16px; width: 16px; left: 3px; bottom: 3px;
+      background: var(--text); border-radius: 50%; transition: transform .2s;
+    }
+    .toggle input:checked + .slider { background: var(--accent); }
+    .toggle input:checked + .slider::before { transform: translateX(16px); }
+  </style>
+</head>
+<body>
+
+<!-- ── Join modal ───────────────────────────────────────── -->
+<div id="modal">
+  <div id="modal-box">
+    <h2>MultiChat</h2>
+    <p>Enter your name to join the workspace window.</p>
+    <input id="username-input" class="text-input" type="text" placeholder="Your name…" maxlength="24" autocomplete="off">
+    <button class="btn-primary" onclick="join()">Join Workspace</button>
+  </div>
+</div>
+
+<!-- ── App ──────────────────────────────────────────────── -->
+<div id="app">
+  <!-- Sidebar -->
+  <aside id="sidebar">
+    <div>
+      <div class="sl">Online</div>
+      <div id="participants"></div>
+    </div>
+    <div>
+      <div class="sl">Active AI</div>
+      <div id="ai-list"></div>
+    </div>
+  </aside>
+
+  <!-- Chat -->
+  <div id="chat-area">
+    <div id="chat-header">
+      <span class="title">MultiChat</span>
+      <button id="stop-btn"     class="hdr-btn"          onclick="stopLLM()"      title="Stop current AI response">■ Stop</button>
+      <button class="hdr-btn"   onclick="clearChat()"    title="Clear visible messages">Clear chat</button>
+      <button class="hdr-btn"   onclick="newSession()"   title="Delete all history and reset for everyone">New session</button>
+      <button class="hdr-btn"   onclick="openSettings()">⚙ Settings</button>
+      <button class="hdr-btn"   onclick="leaveChat()"    title="Leave the chat workspace">Leave</button>
+    </div>
+    <div id="messages"></div>
+    <div id="input-bar">
+      <textarea id="msg-input" rows="1" placeholder="Message… @claude @gemini @ollama:model @openrouter/model" onkeydown="if ((event.key === 'Enter' || event.keyCode === 13 || event.which === 13) && !event.shiftKey) { event.preventDefault(); sendMsg(); }"></textarea>
+      <button id="send-btn" onclick="sendMsg()">Send</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Workspace File Drawer (Slide-Over) ── -->
+<div id="file-drawer" class="drawer">
+  <div class="drawer-header">
+    <span id="file-drawer-title"></span>
+    <div class="drawer-actions">
+      <button id="file-drawer-apply" class="btn-success" onclick="applyWorkspaceFile()">Apply to Root</button>
+      <a id="file-drawer-download" class="hdr-btn" download>Download</a>
+      <button class="drawer-close" onclick="closeFileDrawer()">✕</button>
+    </div>
+  </div>
+  <div id="file-drawer-body">
+    <pre><code id="file-drawer-code"></code></pre>
+  </div>
+</div>
+
+<!-- ── Validator Selector Modal ──────────────────────────── -->
+<div id="audit-modal" class="custom-modal" onclick="closeAuditModalIfBg(event)">
+  <div class="custom-modal-box">
+    <h3>🔬 Select Audit Model</h3>
+    <p>Choose an independent AI model to perform a Zero-Trust verification of this response.</p>
+    <div class="audit-options">
+      <button class="audit-opt-btn" onclick="runSelectedAudit('claude')">Claude (CLI)</button>
+      <button class="audit-opt-btn" onclick="runSelectedAudit('gemini')">Gemini (CLI)</button>
+      <button class="audit-opt-btn" onclick="runSelectedAudit('ollama')">Ollama (Local)</button>
+      <button class="audit-opt-btn" onclick="runSelectedAudit('openrouter')">OpenRouter (Cloud)</button>
+    </div>
+    <button class="hdr-btn" style="margin-top:0.4rem; width:100%;" onclick="closeAuditModal()">Cancel</button>
+  </div>
+</div>
+
+<!-- ── Settings overlay + drawer ────────────────────────── -->
+<div id="settings-overlay" onclick="closeSettings()"></div>
+<div id="settings-drawer">
+  <div id="settings-header">
+    <span>⚙ Provider Settings</span>
+    <button id="close-settings" onclick="closeSettings()">✕</button>
+  </div>
+  <div id="settings-body">
+
+    <!-- Global settings -->
+    <div class="pcard">
+      <div class="pcard-head">
+        <span class="pname">Conversation Chains</span>
+        <span class="ptag">Global</span>
+      </div>
+      <div class="pcard-body">
+        <label>Max AI-to-AI Exchanges</label>
+        <input type="number" id="max-exchanges" min="0" max="10" value="1">
+        <span class="pcard-hint">How many times AI models can call each other in a single turn. Set to 0 to disable AI-to-AI chat entirely.</span>
+        
+        <label style="margin-top:0.8rem; display:block;">Context Window Limit (Compact Mode)</label>
+        <input type="number" id="context-limit" min="1" max="100" value="20">
+        <span class="pcard-hint">Limits the conversation history window sent to models (sliding window), preventing token burning.</span>
+      </div>
+    </div>
+
+    <!-- Zero-Trust Governance -->
+    <div class="pcard">
+      <div class="pcard-head">
+        <span class="pname">Zero-Trust Audit & Budget</span>
+        <span class="ptag">Mandate</span>
+      </div>
+      <div class="pcard-body">
+        <label>Max Token Budget Cap</label>
+        <input type="number" id="max-token-budget" min="1000" step="1000" value="100000">
+        <span class="pcard-hint">Enforces Zero-Trust cost governance token budget checks to stop runaway loops.</span>
+        
+        <label style="margin-top:0.8rem; display:block;">WORM Chain Integrity (WORM Cryptography)</label>
+        <button class="hdr-btn" style="width:100%; margin-top:0.3rem;" onclick="auditIntegrity()">Run Cryptographic Chain Verification</button>
+        <div id="audit-result-display" style="font-size:0.8rem; opacity:0.8; margin-top:0.5rem; white-space:pre-wrap; line-height:1.3; font-family:var(--font-mono);"></div>
+      </div>
+    </div>
+
+    <!-- Claude -->
+    <div class="pcard">
+      <div class="pcard-head">
+        <span class="pname">Claude</span>
+        <span id="claude-status-badge" class="status-dot offline"></span>
+        <span class="ptag">CLI</span>
+        <label class="toggle"><input type="checkbox" id="claude-enabled"><span class="slider"></span></label>
+      </div>
+      <div class="pcard-body">
+        <label>Default model</label>
+        <select id="claude-model">
+          <option value="claude-sonnet-4-6">Sonnet 4.6 — balanced</option>
+          <option value="claude-opus-4-7">Opus 4.7 — most capable</option>
+          <option value="claude-opus-4-6">Opus 4.6</option>
+          <option value="claude-haiku-4-5-20251001">Haiku 4.5 — fastest</option>
+          <option value="sonnet">sonnet (latest alias)</option>
+          <option value="opus">opus (latest alias)</option>
+          <option value="haiku">haiku (latest alias)</option>
+        </select>
+        <span class="pcard-hint">@claude · @claude-sonnet-4-6 · @sonnet · @opus · @haiku</span>
+      </div>
+    </div>
+
+    <!-- Gemini -->
+    <div class="pcard">
+      <div class="pcard-head">
+        <span class="pname">Gemini</span>
+        <span id="gemini-status-badge" class="status-dot offline"></span>
+        <span class="ptag">CLI</span>
+        <label class="toggle"><input type="checkbox" id="gemini-enabled"><span class="slider"></span></label>
+      </div>
+      <div class="pcard-body">
+        <label>Default model</label>
+        <select id="gemini-model">
+          <option value="gemini-3.5-flash-high">Gemini 3.5 Flash (High)</option>
+          <option value="gemini-3.5-flash-medium">Gemini 3.5 Flash (Medium)</option>
+          <option value="gemini-3.1-pro-high">Gemini 3.1 Pro (High)</option>
+          <option value="gemini-3.1-pro-low">Gemini 3.1 Pro (Low)</option>
+        </select>
+        <span class="pcard-hint">@gemini · @gemini:gemini-3.5-flash-high · @gemini-3.1-pro-high</span>
+      </div>
+    </div>
+
+    <!-- Ollama -->
+    <div class="pcard">
+      <div class="pcard-head">
+        <span class="pname">Ollama</span>
+        <span id="ollama-status-badge" class="status-dot offline"></span>
+        <span class="ptag">local</span>
+        <label class="toggle"><input type="checkbox" id="ollama-enabled"><span class="slider"></span></label>
+      </div>
+      <div class="pcard-body">
+        <label>Host URL</label>
+        <div class="row">
+          <input type="text" id="ollama-host" placeholder="http://localhost:11434">
+          <button class="hdr-btn" onclick="detectOllama()">Detect</button>
+        </div>
+        <label>Default model</label>
+        <input type="text" id="ollama-model" placeholder="llama3.2">
+        <div id="ollama-detected"></div>
+        <span class="pcard-hint">@ollama · @ollama:mistral · @ollama:llama3.2</span>
+      </div>
+    </div>
+
+    <!-- OpenRouter -->
+    <div class="pcard">
+      <div class="pcard-head">
+        <span class="pname">OpenRouter</span>
+        <span id="openrouter-status-badge" class="status-dot offline"></span>
+        <span class="ptag">API key</span>
+        <label class="toggle"><input type="checkbox" id="or-enabled"><span class="slider"></span></label>
+      </div>
+      <div class="pcard-body">
+        <label>API Key</label>
+        <input type="password" id="or-key" placeholder="sk-or-…">
+        <label>Default model</label>
+        <input type="text" id="or-model" placeholder="meta-llama/llama-3.1-8b-instruct:free">
+        <span class="pcard-hint">@openrouter · @openrouter/mistralai/mistral-7b-instruct</span>
+      </div>
+    </div>
+
+  </div>
+  <div id="settings-footer">
+    <span id="save-msg"></span>
+    <button class="btn-primary" onclick="saveSettings()">Save</button>
+  </div>
+</div>
+
+<script>
+'use strict';
+let ws, myName;
+const msgsEl = document.getElementById('messages');
+let typingCount = 0;
+let currentWorkspace = "";
+let currentFilePath = "";
+let activeAuditMsgId = "";
+const streamTexts = {}; // Accumulates plain text chunks during active streaming
+
+/* ── Join ──────────────────────────────────────────── */
+function join() {
+  const name = document.getElementById('username-input').value.trim();
+  if (!name) return;
+  myName = name;
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  
+  let token = sessionStorage.getItem('multichat_session_token');
+  if (!token) {
+    token = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2);
+    sessionStorage.setItem('multichat_session_token', token);
+  }
+  
+  ws = new WebSocket(`${proto}//${location.host}/ws/${encodeURIComponent(name)}?token=${token}`);
+
+  ws.onopen = async () => {
+    localStorage.setItem('multichat_username', name);
+    document.getElementById('modal').style.display = 'none';
+    document.getElementById('app').classList.add('visible');
+    await loadConfig();
+    await loadDiagnostics();
+    const resp = await fetch('/history');
+    const msgs = await resp.json();
+    msgs.forEach(renderMsg);
+    scrollBottom();
+    document.getElementById('msg-input').focus();
+  };
+  ws.onmessage = (e) => handleMsg(JSON.parse(e.data));
+  ws.onclose   = () => appendSystem('Disconnected. Refresh to reconnect.');
+}
+
+/* ── Incoming messages ─────────────────────────────── */
+function handleMsg(msg) {
+  if (msg.type === 'typing')         { showTyping(msg.sender); return; }
+  if (msg.type === 'users')          { renderUsers(msg.users);  return; }
+  if (msg.type === 'llm_stopped')    { clearAllTyping(); return; }
+  if (msg.type === 'session_cleared'){ clearAll(); return; }
+  
+  // Dynamic streaming WebSocket processing
+  if (msg.type === 'stream_start') {
+    removeTyping(msg.sender);
+    createStreamingPlaceholder(msg.id, msg.sender);
+    return;
+  }
+  if (msg.type === 'stream_chunk') {
+    appendStreamChunk(msg.id, msg.text);
+    return;
+  }
+  if (msg.type === 'stream_end') {
+    finalizeStream(msg.id, msg.message);
+    return;
+  }
+  
+  removeTyping(msg.sender);
+  renderMsg(msg);
+  scrollBottom();
+}
+
+function renderMsg(msg) {
+  if (msg.type === 'system') { appendSystem(msg.text); return; }
+  const div = document.createElement('div');
+  div.className = `msg ${msg.type}`;
+  const label = msg.type === 'user' && msg.sender === myName
+    ? `${esc(msg.sender)} <span style="font-weight:400;opacity:.6">(you)</span>`
+    : esc(msg.sender);
+  const time = new Date(msg.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', hour12:false});
+  let usageHtml = '';
+  if (msg.meta) {
+    const { model, in_tokens, out_tokens } = msg.meta;
+    usageHtml = `<span class="usage">${esc(model)} · ↓${in_tokens} ↑${out_tokens}</span>`;
+  }
+  let filesHtml = '';
+  if (msg.meta && msg.meta.files && msg.meta.workspace) {
+    const ws = msg.meta.workspace;
+    const chips = msg.meta.files.map(f => {
+      const size = formatBytes(f.size);
+      return `<span class="file-chip" onclick="openFile('${esc(ws)}','${esc(f.path)}')">`
+        + `📄 ${esc(f.path)} <span class="sz">${size}</span></span>`;
+    }).join('');
+    filesHtml = `<div class="files">${chips}</div>`;
+  }
+  let auditHtml = '';
+  if (msg.type === 'llm' && !msg.sender.includes('(Auditor)')) {
+    auditHtml = ` · <span class="audit-btn" onclick="triggerAudit('${esc(msg.id)}')">🔬 Verify</span>`;
+  }
+  
+  // Safe Markdown parsing
+  let formattedText = "";
+  if (window.marked) {
+    formattedText = marked.parse(msg.text);
+  } else {
+    formattedText = `<p>${esc(msg.text)}</p>`;
+  }
+  
+  div.innerHTML = `<span class="sender">${label}</span><div class="msg-content">${formattedText}</div>`
+    + filesHtml
+    + `<div class="footer"><span class="ts">${time}</span>${usageHtml}${auditHtml}</div>`;
+  msgsEl.appendChild(div);
+  
+  // Syntax Highlight with Prism
+  if (window.Prism) {
+    Prism.highlightAllUnder(div);
+  }
+}
+
+function formatBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+/* ── Streaming Placeholders ───────────────────────── */
+function createStreamingPlaceholder(id, sender) {
+  streamTexts[id] = "";
+  const div = document.createElement('div');
+  div.id = `msg-${id}`;
+  div.className = 'msg llm streaming';
+  
+  div.innerHTML = `<span class="sender">${esc(sender)}</span>`
+    + `<div class="msg-content"><p class="streaming-text"></p></div>`
+    + `<div class="footer"><span class="ts">Streaming…</span></div>`;
+  
+  msgsEl.appendChild(div);
+  scrollBottom();
+  updateStopBtn();
+}
+
+function appendStreamChunk(id, text) {
+  const div = document.getElementById(`msg-${id}`);
+  if (!div) return;
+  
+  streamTexts[id] = (streamTexts[id] || "") + text;
+  const contentEl = div.querySelector('.msg-content');
+  if (contentEl) {
+    if (window.marked) {
+      contentEl.innerHTML = marked.parse(streamTexts[id]);
+    } else {
+      contentEl.innerHTML = `<p>${esc(streamTexts[id])}</p>`;
+    }
+    if (window.Prism) {
+      Prism.highlightAllUnder(contentEl);
+    }
+  }
+  scrollBottom();
+}
+
+function finalizeStream(id, message) {
+  delete streamTexts[id];
+  const placeholder = document.getElementById(`msg-${id}`);
+  if (placeholder) {
+    placeholder.remove();
+  }
+  renderMsg(message);
+  scrollBottom();
+  updateStopBtn();
+}
+
+/* ── Workspace File Drawer (Slide-Over Explorer) ── */
+async function openFile(workspace, path) {
+  currentWorkspace = workspace;
+  currentFilePath = path;
+  
+  const drawer = document.getElementById('file-drawer');
+  const title = document.getElementById('file-drawer-title');
+  const codeEl  = document.getElementById('file-drawer-code');
+  const dl    = document.getElementById('file-drawer-download');
+  const url = `/file/${encodeURIComponent(workspace)}?path=${encodeURIComponent(path)}`;
+  
+  title.textContent = path;
+  codeEl.textContent = 'Loading…';
+  dl.href = url;
+  dl.setAttribute('download', path.split('/').pop());
+  
+  drawer.classList.add('open');
+  
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      codeEl.textContent = `Error ${resp.status}: ${await resp.text()}`;
+      return;
+    }
+    const ct = resp.headers.get('content-type') || '';
+    if (ct.startsWith('text/plain')) {
+      const text = await resp.text();
+      codeEl.textContent = text;
+      
+      // Auto-detect extension class for Prism
+      codeEl.className = "";
+      const ext = path.split('.').pop().toLowerCase();
+      if (ext === 'py') codeEl.className = 'language-python';
+      else if (ext === 'js') codeEl.className = 'language-javascript';
+      else if (ext === 'json') codeEl.className = 'language-json';
+      else if (ext === 'sh' || ext === 'bash') codeEl.className = 'language-bash';
+      else codeEl.className = 'language-none';
+      
+      if (window.Prism) {
+        Prism.highlightElement(codeEl);
+      }
+    } else {
+      codeEl.textContent = '(binary file — use Download)';
+    }
+  } catch (e) {
+    codeEl.textContent = 'Failed to load: ' + e.message;
+  }
+}
+
+function closeFileDrawer() {
+  document.getElementById('file-drawer').classList.remove('open');
+}
+
+async function applyWorkspaceFile() {
+  if (!currentWorkspace || !currentFilePath) return;
+  const btn = document.getElementById('file-drawer-apply');
+  const oldText = btn.textContent;
+  btn.textContent = 'Applying…';
+  btn.disabled = true;
+  
+  try {
+    const resp = await fetch('/workspace/apply', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({workspace: currentWorkspace, path: currentFilePath})
+    });
+    if (resp.ok) {
+      btn.textContent = '✓ Applied!';
+      btn.style.background = 'var(--green)';
+      btn.style.color = '#0d1117';
+      setTimeout(() => {
+        btn.textContent = oldText;
+        btn.style.background = '';
+        btn.style.color = '';
+        btn.disabled = false;
+      }, 2500);
+    } else {
+      const err = await resp.text();
+      alert('Failed to apply workspace modifications: ' + err);
+      btn.textContent = 'Error';
+      setTimeout(() => {
+        btn.textContent = oldText;
+        btn.disabled = false;
+      }, 2500);
+    }
+  } catch (e) {
+    alert('Network error: ' + e.message);
+    btn.textContent = oldText;
+    btn.disabled = false;
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeFileDrawer();
+    closeAuditModal();
+  }
+});
+
+function appendSystem(text) {
+  const div = document.createElement('div');
+  div.className = 'msg system';
+  div.innerHTML = `<p>${esc(text)}</p>`;
+  msgsEl.appendChild(div);
+  scrollBottom();
+}
+
+function showTyping(sender) {
+  if (document.getElementById(`t-${sender}`)) return;
+  typingCount++;
+  const div = document.createElement('div');
+  div.id = `t-${sender}`;
+  div.className = 'msg llm';
+  div.innerHTML = `<span class="sender">${esc(sender)}</span><p><span class="dots"><span></span><span></span><span></span></span></p>`;
+  msgsEl.appendChild(div);
+  scrollBottom();
+  updateStopBtn();
+}
+
+function removeTyping(sender) {
+  const el = document.getElementById(`t-${sender}`);
+  if (el) { el.remove(); typingCount = Math.max(0, typingCount - 1); }
+  updateStopBtn();
+}
+
+function clearAllTyping() {
+  document.querySelectorAll('[id^="t-"]').forEach(el => el.remove());
+  typingCount = 0;
+  updateStopBtn();
+}
+
+function updateStopBtn() {
+  const btn = document.getElementById('stop-btn');
+  const activeStreams = Object.keys(streamTexts).length;
+  btn.classList.toggle('active', typingCount > 0 || activeStreams > 0);
+}
+
+function renderUsers(users) {
+  const el = document.getElementById('participants');
+  el.innerHTML = '';
+  users.forEach(u => {
+    const d = document.createElement('div');
+    d.className = 'participant';
+    d.textContent = u;
+    el.appendChild(d);
+  });
+}
+
+/* ── Custom Auditor Verification Selector ────────────── */
+async function triggerAudit(msgId) {
+  activeAuditMsgId = msgId;
+  document.getElementById('audit-modal').classList.add('open');
+}
+
+function closeAuditModal() {
+  document.getElementById('audit-modal').classList.remove('open');
+  activeAuditMsgId = "";
+}
+
+function closeAuditModalIfBg(e) {
+  if (e.target.id === 'audit-modal') closeAuditModal();
+}
+
+async function runSelectedAudit(providerName) {
+  if (!activeAuditMsgId) return;
+  const target = providerName;
+  closeAuditModal();
+  appendSystem(`Initiating independent Zero-Trust audit of message using @${target}...`);
+  
+  try {
+    const resp = await fetch('/api/audit/cross_validate', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message_id: activeAuditMsgId, auditor_mention: target})
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      appendSystem(`Zero-Trust Audit Failed: ${err}`);
+    }
+  } catch (e) {
+    appendSystem(`Zero-Trust Audit Network Error: ${e.message}`);
+  }
+}
+
+async function auditIntegrity() {
+  const display = document.getElementById('audit-result-display');
+  display.style.color = '#fff';
+  display.textContent = 'Running WORM chain integrity check…';
+  
+  try {
+    const resp = await fetch('/api/audit/verify');
+    if (!resp.ok) {
+      display.style.color = 'var(--red)';
+      display.textContent = `Verify Error: ${resp.status} ${await resp.text()}`;
+      return;
+    }
+    const result = await resp.json();
+    if (result.valid) {
+      display.style.color = '#4effa5';
+      display.textContent = `🔒 Cryptographic Chain VERIFIED!\nTotal checked: ${result.total_messages}\nStatus: IMMUTABLE & SECURE`;
+    } else {
+      display.style.color = 'var(--red)';
+      display.textContent = `⚠️ BREACH DETECTED!\nCorrupted messages: ${result.corrupted_count}\nSequence discontinuities found.`;
+    }
+  } catch (e) {
+    display.style.color = 'var(--red)';
+    display.textContent = `Audit Failed: ${e.message}`;
+  }
+}
+
+/* ── Stop / Clear / New session ────────────────────── */
+function stopLLM() {
+  if (ws && ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify({action: 'stop'}));
+}
+
+function clearChat() {
+  msgsEl.innerHTML = '';
+  typingCount = 0;
+  for (const id in streamTexts) {
+    delete streamTexts[id];
+  }
+  updateStopBtn();
+}
+
+function clearAll() {
+  clearChat();
+  appendSystem('Session cleared — new conversation started.');
+}
+
+async function newSession() {
+  if (!confirm('Clear all chat history for everyone?')) return;
+  await fetch('/session/clear', {method: 'POST'});
+}
+
+/* ── Send ──────────────────────────────────────────── */
+function sendMsg() {
+  const inp = document.getElementById('msg-input');
+  const text = inp.value.trim();
+  if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({text}));
+  inp.value = ''; inp.style.height = 'auto';
+}
+
+/* ── Settings ──────────────────────────────────────── */
+let currentCfg = {};
+
+async function loadConfig() {
+  currentCfg = await fetch('/config').then(r => r.json());
+  applyConfigToForm(currentCfg);
+  renderAiList(currentCfg);
+}
+
+// Dynamically fetch and display environment diagnostic health checks
+async function loadDiagnostics() {
+  try {
+    const resp = await fetch('/api/health/diagnostics');
+    const diag = await resp.json();
+    updateDiagBadge('claude-status-badge', diag.claude);
+    updateDiagBadge('gemini-status-badge', diag.gemini);
+    updateDiagBadge('ollama-status-badge', diag.ollama);
+    updateDiagBadge('openrouter-status-badge', diag.openrouter);
+  } catch (e) {
+    console.error("Failed to load environment health checks:", e);
+  }
+}
+
+function updateDiagBadge(badgeId, health) {
+  const badge = document.getElementById(badgeId);
+  if (!badge) return;
+  const isOk = health.installed || health.status === "Online" || health.status === "Configured";
+  if (isOk) {
+    badge.className = 'status-dot online';
+    badge.title = `${health.status} — ${health.info}`;
+  } else {
+    badge.className = 'status-dot offline';
+    badge.title = `${health.status} — ${health.info}`;
+  }
+}
+
+function applyConfigToForm(cfg) {
+  const cl = cfg.claude    || {};
+  const gm = cfg.gemini    || {};
+  const ol = cfg.ollama    || {};
+  const or = cfg.openrouter || {};
+
+  document.getElementById('max-exchanges').value     = cfg.max_exchanges !== undefined ? cfg.max_exchanges : 1;
+  document.getElementById('max-token-budget').value  = cfg.max_token_budget !== undefined ? cfg.max_token_budget : 100000;
+  document.getElementById('context-limit').value     = cfg.context_limit !== undefined ? cfg.context_limit : 20;
+  document.getElementById('claude-enabled').checked  = !!cl.enabled;
+  document.getElementById('claude-model').value      = cl.model || 'claude-sonnet-4-6';
+  document.getElementById('gemini-enabled').checked  = !!gm.enabled;
+  document.getElementById('gemini-model').value      = gm.model || 'gemini-3.5-flash-high';
+  document.getElementById('ollama-enabled').checked  = !!ol.enabled;
+  document.getElementById('ollama-host').value       = ol.host  || 'http://localhost:11434';
+  document.getElementById('ollama-model').value      = ol.model || 'llama3.2';
+  document.getElementById('or-enabled').checked      = !!or.enabled;
+  document.getElementById('or-key').value            = or.api_key || '';
+  document.getElementById('or-model').value          = or.model || '';
+}
+
+function renderAiList(cfg) {
+  const el = document.getElementById('ai-list');
+  el.innerHTML = '';
+  const rows = [
+    { key: 'claude',      label: '@claude',      hint: '' },
+    { key: 'gemini',      label: '@gemini',       hint: '' },
+    { key: 'ollama',      label: '@ollama:model', hint: '' },
+    { key: 'openrouter',  label: '@openrouter/…', hint: '' },
+  ];
+  rows.forEach(({key, label, hint}) => {
+    const d = document.createElement('div');
+    const enabled = cfg[key]?.enabled;
+    d.className = 'ai-chip' + (enabled ? '' : ' disabled');
+    d.textContent = label + (hint ? ' ' + hint : '');
+    el.appendChild(d);
+  });
+}
+
+async function saveSettings() {
+  const cfg = {
+    max_exchanges: parseInt(document.getElementById('max-exchanges').value, 10) || 0,
+    max_token_budget: parseInt(document.getElementById('max-token-budget').value, 10) || 100000,
+    context_limit: parseInt(document.getElementById('context-limit').value, 10) || 20,
+    claude: {
+      enabled: document.getElementById('claude-enabled').checked,
+      model:   document.getElementById('claude-model').value,
+    },
+    gemini: {
+      enabled: document.getElementById('gemini-enabled').checked,
+      model:   document.getElementById('gemini-model').value,
+    },
+    ollama: {
+      enabled: document.getElementById('ollama-enabled').checked,
+      host:    document.getElementById('ollama-host').value.trim(),
+      model:   document.getElementById('ollama-model').value.trim(),
+    },
+    openrouter: {
+      enabled: document.getElementById('or-enabled').checked,
+      api_key: document.getElementById('or-key').value.trim(),
+      model:   document.getElementById('or-model').value.trim(),
+    },
+  };
+  await fetch('/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(cfg),
+  });
+  currentCfg = cfg;
+  renderAiList(cfg);
+  await loadDiagnostics(); // recheck diagnostics upon saving
+  const msg = document.getElementById('save-msg');
+  msg.textContent = '✓ Settings Saved';
+  setTimeout(() => { msg.textContent = ''; }, 2500);
+}
+
+async function detectOllama() {
+  const host = document.getElementById('ollama-host').value.trim() || 'http://localhost:11434';
+  const el   = document.getElementById('ollama-detected');
+  el.textContent = 'Checking…';
+  const resp = await fetch('/ollama/models');
+  const data = await resp.json();
+  if (!data.online) {
+    el.innerHTML = '<span style="color:var(--red)">Ollama not reachable</span>';
+    return;
+  }
+  if (data.models.length === 0) {
+    el.innerHTML = '<span>Online — no models pulled yet</span>';
+    return;
+  }
+  el.innerHTML = `<span>Found: </span>${data.models.slice(0,6).map(m =>
+    `<span style="cursor:pointer;text-decoration:underline" onclick="pickModel('${m}')">${m}</span>`
+  ).join(', ')}`;
+}
+
+function pickModel(name) {
+  document.getElementById('ollama-model').value = name;
+}
+
+function openSettings() {
+  loadDiagnostics();
+  document.getElementById('settings-overlay').classList.add('open');
+  document.getElementById('settings-drawer').classList.add('open');
+}
+
+function closeSettings() {
+  document.getElementById('settings-overlay').classList.remove('open');
+  document.getElementById('settings-drawer').classList.remove('open');
+}
+
+/* ── Helpers ───────────────────────────────────────── */
+function scrollBottom() { msgsEl.scrollTop = msgsEl.scrollHeight; }
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/* ── Keyboard ──────────────────────────────────────── */
+document.getElementById('username-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') join();
+});
+const inp = document.getElementById('msg-input');
+inp.addEventListener('keydown', e => {
+  if ((e.key === 'Enter' || e.keyCode === 13 || e.which === 13) && !e.shiftKey) {
+    e.preventDefault();
+    sendMsg();
+  }
+});
+inp.addEventListener('input', () => {
+  inp.style.height = 'auto';
+  inp.style.height = Math.min(inp.scrollHeight, 120) + 'px';
+});
+
+function leaveChat() {
+  localStorage.removeItem('multichat_username');
+  sessionStorage.removeItem('multichat_session_token');
+  if (ws) {
+    ws.close();
+  }
+  location.reload();
+}
+
+// Auto-join if username is already saved in localStorage
+document.addEventListener('DOMContentLoaded', () => {
+  const savedName = localStorage.getItem('multichat_username');
+  if (savedName) {
+    document.getElementById('username-input').value = savedName;
+    join();
+  }
+});
+</script>
+</body>
+</html>

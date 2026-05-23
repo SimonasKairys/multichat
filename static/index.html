@@ -484,7 +484,7 @@
     </div>
     <div id="messages"></div>
     <div id="input-bar">
-      <textarea id="msg-input" rows="1" placeholder="Message… @claude @agy @ollama:model @openrouter/model" onkeydown="if ((event.key === 'Enter' || event.keyCode === 13 || event.which === 13) && !event.shiftKey) { event.preventDefault(); sendMsg(); }"></textarea>
+      <textarea id="msg-input" rows="1" placeholder="Message… @claude @agy @ollama @openrouter" onkeydown="if ((event.key === 'Enter' || event.keyCode === 13 || event.which === 13) && !event.shiftKey) { event.preventDefault(); sendMsg(); }"></textarea>
       <button id="send-btn" onclick="sendMsg()">Send</button>
     </div>
   </div>
@@ -1144,8 +1144,8 @@ function renderAiList(cfg) {
   const rows = [
     { key: 'claude',      label: '@claude',      hint: '' },
     { key: 'agy',         label: '@agy',          hint: '' },
-    { key: 'ollama',      label: '@ollama:model', hint: '' },
-    { key: 'openrouter',  label: '@openrouter/…', hint: '' },
+    { key: 'ollama',      label: '@ollama',      hint: '' },
+    { key: 'openrouter',  label: '@openrouter',  hint: '' },
   ];
   rows.forEach(({key, label, hint}) => {
     const d = document.createElement('div');

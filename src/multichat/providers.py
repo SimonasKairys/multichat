@@ -20,7 +20,7 @@ SYSTEM_PROMPT = (
 def _get_chain_instruction(context: list[dict], current_depth: int, max_exchanges: int) -> str:
     instr = f"\n[AI-to-AI Exchange Tracking: Max limit is {max_exchanges}. Current exchange depth is {current_depth} of {max_exchanges}."
     if current_depth >= max_exchanges:
-        instr += " This is the FINAL exchange in this turn; DO NOT mention any other AI models (@claude, @gemini, @ollama, @openrouter, etc.) as no further triggers will execute. Wrap up the conversation."
+        instr += " This is the FINAL exchange in this turn; DO NOT mention any other AI models (@claude, @agy, @ollama, @openrouter, etc.) as no further triggers will execute. Wrap up the conversation."
     else:
         instr += f" You have {max_exchanges - current_depth} exchanges remaining before the chain stops. You may mention other models if needed."
     instr += "]"
@@ -135,40 +135,94 @@ class ClaudeCLIProvider:
                 await asyncio.sleep(0.01)
             yield {"type": "meta", "model": res["model"], "in_tokens": res["in_tokens"], "out_tokens": res["out_tokens"]}
 
-class GeminiCLIProvider:
-    def __init__(self, model: str):
-        self.model = model
+class AgyCLIProvider:
+    # Map AGY internal model placeholders to human-readable names
+    _MODEL_MAP = {
+        "MODEL_PLACEHOLDER_M26": "Gemini 3.5 Flash (Medium)",
+        "MODEL_PLACEHOLDER_M132": "Gemini 3.5 Flash (Medium)",
+        "MODEL_PLACEHOLDER_M27": "Gemini 3.5 Flash (High)",
+        "MODEL_PLACEHOLDER_M133": "Gemini 3.5 Flash (High)",
+        "MODEL_PLACEHOLDER_M24": "Gemini 3.1 Pro (Low)",
+        "MODEL_PLACEHOLDER_M124": "Gemini 3.1 Pro (Low)",
+        "MODEL_PLACEHOLDER_M25": "Gemini 3.1 Pro (High)",
+        "MODEL_PLACEHOLDER_M125": "Gemini 3.1 Pro (High)",
+        "MODEL_PLACEHOLDER_M20": "Claude Sonnet 4.6 (Thinking)",
+        "MODEL_PLACEHOLDER_M120": "Claude Sonnet 4.6 (Thinking)",
+        "MODEL_PLACEHOLDER_M21": "Claude Opus 4.6 (Thinking)",
+        "MODEL_PLACEHOLDER_M121": "Claude Opus 4.6 (Thinking)",
+        "MODEL_PLACEHOLDER_M30": "GPT-OSS 120B (Medium)",
+        "MODEL_PLACEHOLDER_M130": "GPT-OSS 120B (Medium)",
+    }
+
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def _detect_model_raw() -> str:
+        """Read the active model placeholder from AGY state file."""
+        from pathlib import Path
+        state_path = Path.home() / ".gemini" / "antigravity" / "antigravity_state.pbtxt"
+        try:
+            if state_path.exists():
+                text = state_path.read_text()
+                for line in text.splitlines():
+                    if "last_selected_agent_model:" in line:
+                        return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        return "MODEL_PLACEHOLDER_M27"
+
+    @staticmethod
+    def _detect_model() -> str:
+        """Read the active model from AGY state file."""
+        try:
+            placeholder = AgyCLIProvider._detect_model_raw()
+            return AgyCLIProvider._MODEL_MAP.get(placeholder, f"agy ({placeholder})")
+        except Exception:
+            pass
+        return "agy"
+
+    @staticmethod
+    def _write_model(placeholder: str) -> bool:
+        """Write the active model placeholder to AGY state file."""
+        from pathlib import Path
+        state_path = Path.home() / ".gemini" / "antigravity" / "antigravity_state.pbtxt"
+        try:
+            if state_path.exists():
+                text = state_path.read_text()
+                lines = text.splitlines()
+                updated = False
+                for i, line in enumerate(lines):
+                    if "last_selected_agent_model:" in line:
+                        lines[i] = f"last_selected_agent_model: {placeholder}"
+                        updated = True
+                        break
+                if not updated:
+                    lines.append(f"last_selected_agent_model: {placeholder}")
+                state_path.write_text("\n".join(lines) + "\n")
+                return True
+        except Exception:
+            pass
+        return False
 
     async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1) -> dict:
         prompt = _build_context_text(context)
+        detected_model = self._detect_model()
         args = [
-            "gemini",
-            "--skip-trust",
+            "agy",
+            "--dangerously-skip-permissions",
             "-p", f"Respond to the latest message above. Be concise.{_get_chain_instruction(context, current_depth, max_exchanges)}",
-            "--output-format", "json",
         ]
-        if self.model:
-            args += ["-m", self.model]
         try:
-            raw = await _run_cli(*args, stdin_text=prompt, cwd=cwd or "/tmp")
-            data = json.loads(raw)
-            text = data.get("response", "")
-            model_name = self.model
-            in_tok = out_tok = 0
-            for mname, mdata in data.get("stats", {}).get("models", {}).items():
-                if "main" in mdata.get("roles", {}):
-                    model_name = mname
-                    tokens = mdata.get("tokens", {})
-                    in_tok  = tokens.get("input", 0)
-                    out_tok = tokens.get("candidates", 0)
-                    break
-            return {"text": text, "model": model_name, "in_tokens": in_tok, "out_tokens": out_tok}
+            text = await _run_cli(*args, stdin_text=prompt, cwd=cwd or "/tmp")
+            text = text.strip()
+            return {"text": text, "model": detected_model, "in_tokens": 0, "out_tokens": 0}
         except asyncio.TimeoutError:
-            return _err(self.model, "Timed out after 120 s.")
+            return _err("agy", "Timed out after 120 s.")
         except FileNotFoundError:
-            return _err(self.model, "'gemini' CLI not found.")
+            return _err("agy", "'agy' CLI not found.")
         except Exception as e:
-            return _err(self.model, str(e))
+            return _err("agy", str(e))
 
     async def respond_stream(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1):
         res = await self.respond(context, cwd, current_depth, max_exchanges)
@@ -342,19 +396,11 @@ def get_provider(mention: str):
             model = pc.get("model", "claude-sonnet-4-6")
         return ClaudeCLIProvider(model)
 
-    if name == "gemini" or name.startswith("gemini:") or name.startswith("gemini-"):
-        pg = cfg.get("gemini", {})
-        if not pg.get("enabled"):
+    if name == "agy":
+        pa = cfg.get("agy", {})
+        if not pa.get("enabled"):
             return None
-        if name.startswith("gemini:"):
-            model = name.split(":", 1)[1]
-            if not model:
-                model = pg.get("model", "gemini-3.5-flash-high")
-        elif name.startswith("gemini-"):
-            model = name
-        else:
-            model = pg.get("model", "gemini-3.5-flash-high")
-        return GeminiCLIProvider(model)
+        return AgyCLIProvider()
 
     if name == "ollama" or name.startswith("ollama:"):
         po = cfg.get("ollama", {})

@@ -9,6 +9,7 @@ import httpx
 from . import config as cfg_module
 from . import database as db
 from .providers import parse_mentions, get_provider
+from . import providers
 from .ws import manager
 from .core import WORKSPACE_ROOT, MAX_FILE_BYTES, trigger_mentions, _setup_workspace, _scan_workspace
 
@@ -45,6 +46,9 @@ async def save_config(body: dict, request: Request):
         if body["openrouter"].get("api_key") == "********":
             body["openrouter"]["api_key"] = old_cfg["openrouter"].get("api_key", "")
             
+    if "agy" in body and "model" in body["agy"]:
+        providers.AgyCLIProvider._write_model(body["agy"]["model"])
+
     cfg_module.save(body)
     return {"ok": True}
 
@@ -116,7 +120,7 @@ async def apply_workspace_file(body: dict):
 @app.get("/api/health/diagnostics")
 async def get_diagnostics():
     claude_installed = shutil.which("claude") is not None
-    gemini_installed = shutil.which("gemini") is not None
+    agy_installed = shutil.which("agy") is not None
     
     ollama_online = False
     ollama_models = []
@@ -142,10 +146,12 @@ async def get_diagnostics():
             "status": "Available" if claude_installed else "Not Installed",
             "info": "Uses your local Claude CLI subscription."
         },
-        "gemini": {
-            "installed": gemini_installed,
-            "status": "Available" if gemini_installed else "Not Installed",
-            "info": "Uses your local Gemini CLI subscription."
+        "agy": {
+            "installed": agy_installed,
+            "status": "Available" if agy_installed else "Not Installed",
+            "active_model": providers.AgyCLIProvider._detect_model() if agy_installed else "N/A",
+            "active_placeholder": providers.AgyCLIProvider._detect_model_raw() if agy_installed else "N/A",
+            "info": "Uses your local Agy CLI subscription."
         },
         "ollama": {
             "installed": ollama_online,

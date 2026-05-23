@@ -13,9 +13,9 @@ DEFAULTS: dict = {
         "enabled": True,
         "model": "claude-sonnet-4-6",
     },
-    "gemini": {
+    "agy": {
         "enabled": True,
-        "model": "gemini-3.5-flash-high",
+        "model": "MODEL_PLACEHOLDER_M27",
     },
     "ollama": {
         "enabled": False,

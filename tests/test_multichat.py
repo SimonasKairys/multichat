@@ -29,7 +29,7 @@ def test_sqlite_wal_mode(setup_temp_db):
 def test_worm_cryptographic_chaining(setup_temp_db):
     # Add a sequence of messages
     db.add_message("user", "Hello World", "user")
-    db.add_message("@gemini", "Hello User, this is Gemini.", "llm", {"model": "gemini-3.1-pro-preview"})
+    db.add_message("@agy", "Hello User, this is Agy.", "llm", {"model": "agy"})
     db.add_message("user", "Perform validation.", "user")
     
     # Verify integrity of log chain
@@ -41,7 +41,7 @@ def test_worm_cryptographic_chaining(setup_temp_db):
     # Tamper with the database to simulate an adversarial breach
     with sqlite3.connect(setup_temp_db) as conn:
         # Update text of the second message
-        conn.execute("UPDATE messages SET text = 'Tampered Response' WHERE sender = '@gemini'")
+        conn.execute("UPDATE messages SET text = 'Tampered Response' WHERE sender = '@agy'")
         conn.commit()
 
     # Re-verify and ensure breach is successfully detected
@@ -56,12 +56,57 @@ def test_diagnostics_endpoint():
     assert resp.status_code == 200
     data = resp.json()
     assert "claude" in data
-    assert "gemini" in data
+    assert "agy" in data
     assert "ollama" in data
     assert "openrouter" in data
-    for provider in ("claude", "gemini", "ollama", "openrouter"):
+    for provider in ("claude", "agy", "ollama", "openrouter"):
         assert "status" in data[provider]
         assert "installed" in data[provider]
+
+def test_agy_model_configuration(setup_temp_db, monkeypatch, tmp_path):
+    from pathlib import Path
+    
+    # Mock home directory state path in AgyCLIProvider
+    dummy_home = tmp_path / "mock_home"
+    dummy_home.mkdir()
+    state_dir = dummy_home / ".gemini" / "antigravity"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_file = state_dir / "antigravity_state.pbtxt"
+    state_file.write_text("last_selected_agent_model: MODEL_PLACEHOLDER_M27\n")
+    
+    # Patch Path.home() inside AgyCLIProvider
+    monkeypatch.setattr(Path, "home", lambda: dummy_home)
+    
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    
+    # 1. Verify get diagnostics returns raw active placeholder and model name
+    resp = client.get("/api/health/diagnostics")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["agy"]["active_model"] == "Gemini 3.5 Flash (High)"
+    assert data["agy"]["active_placeholder"] == "MODEL_PLACEHOLDER_M27"
+    
+    # 2. Verify saving new model placeholder updates state file
+    config_payload = {
+        "max_exchanges": 1,
+        "max_token_budget": 100000,
+        "context_limit": 20,
+        "claude": {"enabled": True, "model": "claude-sonnet-4-6"},
+        "agy": {"enabled": True, "model": "MODEL_PLACEHOLDER_M26"},
+        "ollama": {"enabled": False, "host": "http://localhost:11434", "model": "llama3.2"},
+        "openrouter": {"enabled": False, "api_key": "", "model": ""}
+    }
+    
+    resp_save = client.post("/config", json=config_payload)
+    assert resp_save.status_code == 200
+    
+    # Verify the state file got updated successfully
+    updated_state = state_file.read_text()
+    assert "last_selected_agent_model: MODEL_PLACEHOLDER_M26" in updated_state
+    
+    # Verify diagnostics now returns updated model
+    resp2 = client.get("/api/health/diagnostics")
+    assert resp2.json()["agy"]["active_model"] == "Gemini 3.5 Flash (Medium)"
 
 def test_context_limit_configuration(setup_temp_db):
     # Add 5 dummy messages to temporary test DB

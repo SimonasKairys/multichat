@@ -53,6 +53,4 @@ def load() -> dict:
 
 def save(cfg: dict) -> None:
     clean_cfg = copy.deepcopy(cfg)
-    if "openrouter" in clean_cfg and "api_key" in clean_cfg["openrouter"]:
-        clean_cfg["openrouter"]["api_key"] = ""
     CONFIG_PATH.write_text(json.dumps(clean_cfg, indent=2))

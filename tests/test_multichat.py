@@ -108,6 +108,53 @@ def test_agy_model_configuration(setup_temp_db, monkeypatch, tmp_path):
     resp2 = client.get("/api/health/diagnostics")
     assert resp2.json()["agy"]["active_model"] == "Gemini 3.5 Flash (Medium)"
 
+def test_openrouter_api_key_persistence(setup_temp_db, monkeypatch, tmp_path):
+    import src.multichat.config as cfg_module
+    
+    # Mock CONFIG_PATH to a temporary file
+    temp_config = tmp_path / "config.json"
+    monkeypatch.setattr(cfg_module, "CONFIG_PATH", temp_config)
+    
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    
+    # 1. Post configuration with an OpenRouter API key
+    payload = {
+        "max_exchanges": 1,
+        "max_token_budget": 100000,
+        "context_limit": 20,
+        "claude": {"enabled": True, "model": "claude-sonnet-4-6"},
+        "agy": {"enabled": True, "model": "MODEL_PLACEHOLDER_M27"},
+        "ollama": {"enabled": False, "host": "http://localhost:11434", "model": "llama3.2"},
+        "openrouter": {"enabled": True, "api_key": "sk-or-test-key-12345", "model": "x-ai/grok-4.3"}
+    }
+    
+    resp_save = client.post("/config", json=payload)
+    assert resp_save.status_code == 200
+    
+    # 2. Load config via GET /config and verify the key is masked
+    resp_get = client.get("/config")
+    assert resp_get.status_code == 200
+    get_data = resp_get.json()
+    assert get_data["openrouter"]["api_key"] == "********"
+    assert get_data["openrouter"]["model"] == "x-ai/grok-4.3"
+    
+    # 3. Post config again with the masked key and verify the key is preserved in the file
+    payload2 = {
+        "max_exchanges": 1,
+        "max_token_budget": 100000,
+        "context_limit": 20,
+        "claude": {"enabled": True, "model": "claude-sonnet-4-6"},
+        "agy": {"enabled": True, "model": "MODEL_PLACEHOLDER_M27"},
+        "ollama": {"enabled": False, "host": "http://localhost:11434", "model": "llama3.2"},
+        "openrouter": {"enabled": True, "api_key": "********", "model": "x-ai/grok-4.3"}
+    }
+    resp_save2 = client.post("/config", json=payload2)
+    assert resp_save2.status_code == 200
+    
+    # Check that the actual config file still contains the original key
+    actual_cfg = json.loads(temp_config.read_text())
+    assert actual_cfg["openrouter"]["api_key"] == "sk-or-test-key-12345"
+
 def test_context_limit_configuration(setup_temp_db):
     # Add 5 dummy messages to temporary test DB
     for i in range(1, 6):

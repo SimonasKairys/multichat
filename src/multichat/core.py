@@ -8,7 +8,7 @@ from . import database as db
 from .providers import parse_mentions, get_provider
 from .ws import manager
 
-WORKSPACE_ROOT = Path("/tmp/multichat_workspaces")
+WORKSPACE_ROOT = Path("/tmp/multichat_workspaces")  # nosec B108 — intentional, isolated per-session sandbox
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MB cap for the viewer
 

@@ -1,9 +1,14 @@
 import json
 import shutil
 import sqlite3
+import time
+from collections import deque
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, PlainTextResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import httpx
 
 from . import config as cfg_module
@@ -13,7 +18,15 @@ from . import providers
 from .ws import manager
 from .core import WORKSPACE_ROOT, MAX_FILE_BYTES, trigger_mentions, _setup_workspace, _scan_workspace
 
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="MultiChat")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Per-user WebSocket message rate limit: max messages per window.
+_WS_RATE_WINDOW = 60   # seconds
+_WS_RATE_MAX    = 20   # messages per window
+_ws_buckets: dict[str, deque] = {}
 db.init_db()
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
@@ -183,7 +196,8 @@ def get_audit_verify():
     return db.verify_log_chain()
 
 @app.post("/api/audit/cross_validate")
-async def post_audit_cross_validate(data: dict):
+@limiter.limit("5/minute")
+async def post_audit_cross_validate(request: Request, data: dict):
     msg_id = data.get("message_id")
     auditor_mention = data.get("auditor_mention")
     if not msg_id or not auditor_mention:
@@ -279,6 +293,16 @@ async def ws_endpoint(ws: WebSocket, username: str):
             text = data.get("text", "").strip()
             if not text:
                 continue
+
+            # Per-user rate limit: drop LLM triggers if user exceeds _WS_RATE_MAX msgs/_WS_RATE_WINDOW s.
+            now = time.monotonic()
+            bucket = _ws_buckets.setdefault(username, deque())
+            while bucket and now - bucket[0] > _WS_RATE_WINDOW:
+                bucket.popleft()
+            if len(bucket) >= _WS_RATE_MAX:
+                await ws.send_json({"type": "system", "text": f"⚠️ Rate limit: max {_WS_RATE_MAX} messages per {_WS_RATE_WINDOW}s. Slow down."})
+                continue
+            bucket.append(now)
 
             msg = db.add_message(username, text, "user")
             await manager.broadcast(msg)

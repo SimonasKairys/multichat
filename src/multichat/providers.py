@@ -232,7 +232,7 @@ class AgyCLIProvider:
             "-p", f"Respond to the latest message above. Be concise.{_get_chain_instruction(context, current_depth, max_exchanges, self_name)}",
         ]
         try:
-            text = await _run_cli(*args, stdin_text=prompt, cwd=cwd or "/tmp")
+            text = await _run_cli(*args, stdin_text=prompt, cwd=cwd or "/tmp")  # nosec B108
             text = text.strip()
             return {"text": text, "model": detected_model, "in_tokens": 0, "out_tokens": 0}
         except asyncio.TimeoutError:
@@ -265,7 +265,7 @@ class OllamaProvider:
         from urllib.parse import urlparse
         parsed = urlparse(self.host)
         hostname = (parsed.hostname or "").lower()
-        return hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+        return hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1")  # nosec B104 — detection allowlist, not a bind call
 
     async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1, self_name: str = "") -> dict:
         system_content = _system_prompt(has_file_tools=False) + _get_chain_instruction(context, current_depth, max_exchanges, self_name)

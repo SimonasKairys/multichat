@@ -12,6 +12,8 @@
 
   <!-- Import marked.js for Markdown parsing -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.5/marked.min.js"></script>
+  <!-- DOMPurify to sanitize marked output before innerHTML injection -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
 
   <!-- Import Prism.js for high-fidelity syntax highlighting -->
   <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css" rel="stylesheet" />
@@ -750,10 +752,10 @@ function renderMsg(msg) {
     auditHtml = ` · <span class="audit-btn" onclick="triggerAudit('${esc(msg.id)}')">🔬 Verify</span>`;
   }
   
-  // Safe Markdown parsing
   let formattedText = "";
   if (window.marked) {
-    formattedText = marked.parse(msg.text);
+    const raw = marked.parse(msg.text);
+    formattedText = window.DOMPurify ? DOMPurify.sanitize(raw) : raw;
   } else {
     formattedText = `<p>${esc(msg.text)}</p>`;
   }
@@ -799,7 +801,8 @@ function appendStreamChunk(id, text) {
   const contentEl = div.querySelector('.msg-content');
   if (contentEl) {
     if (window.marked) {
-      contentEl.innerHTML = marked.parse(streamTexts[id]);
+      const raw = marked.parse(streamTexts[id]);
+      contentEl.innerHTML = window.DOMPurify ? DOMPurify.sanitize(raw) : raw;
     } else {
       contentEl.innerHTML = `<p>${esc(streamTexts[id])}</p>`;
     }
@@ -1208,9 +1211,18 @@ async function detectOllama() {
     el.innerHTML = '<span>Online — no models pulled yet</span>';
     return;
   }
-  el.innerHTML = `<span>Found: </span>${data.models.slice(0,6).map(m =>
-    `<span style="cursor:pointer;text-decoration:underline" onclick="pickModel('${m}')">${m}</span>`
-  ).join(', ')}`;
+  const modelSpans = data.models.slice(0, 6).map(m => {
+    const span = document.createElement('span');
+    span.style.cssText = 'cursor:pointer;text-decoration:underline';
+    span.textContent = m;
+    span.addEventListener('click', () => pickModel(m));
+    return span;
+  });
+  el.innerHTML = '<span>Found: </span>';
+  modelSpans.forEach((span, i) => {
+    if (i > 0) el.appendChild(document.createTextNode(', '));
+    el.appendChild(span);
+  });
 }
 
 function pickModel(name) {

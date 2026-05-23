@@ -31,7 +31,7 @@ def test_worm_cryptographic_chaining(setup_temp_db):
     db.add_message("user", "Hello World", "user")
     db.add_message("@agy", "Hello User, this is Agy.", "llm", {"model": "agy"})
     db.add_message("user", "Perform validation.", "user")
-    
+
     # Verify integrity of log chain
     verification = db.verify_log_chain()
     assert verification["valid"] is True
@@ -65,7 +65,7 @@ def test_diagnostics_endpoint():
 
 def test_agy_model_configuration(setup_temp_db, monkeypatch, tmp_path):
     from pathlib import Path
-    
+
     # Mock home directory state path in AgyCLIProvider
     dummy_home = tmp_path / "mock_home"
     dummy_home.mkdir()
@@ -73,19 +73,19 @@ def test_agy_model_configuration(setup_temp_db, monkeypatch, tmp_path):
     state_dir.mkdir(parents=True, exist_ok=True)
     state_file = state_dir / "antigravity_state.pbtxt"
     state_file.write_text("last_selected_agent_model: MODEL_PLACEHOLDER_M27\n")
-    
+
     # Patch Path.home() inside AgyCLIProvider
     monkeypatch.setattr(Path, "home", lambda: dummy_home)
-    
+
     client = TestClient(app, client=("127.0.0.1", 50000))
-    
+
     # 1. Verify get diagnostics returns raw active placeholder and model name
     resp = client.get("/api/health/diagnostics")
     assert resp.status_code == 200
     data = resp.json()
     assert data["agy"]["active_model"] == "Gemini 3.5 Flash (High)"
     assert data["agy"]["active_placeholder"] == "MODEL_PLACEHOLDER_M27"
-    
+
     # 2. Verify saving new model placeholder updates state file
     config_payload = {
         "max_exchanges": 1,
@@ -96,27 +96,27 @@ def test_agy_model_configuration(setup_temp_db, monkeypatch, tmp_path):
         "ollama": {"enabled": False, "host": "http://localhost:11434", "model": "llama3.2"},
         "openrouter": {"enabled": False, "api_key": "", "model": ""}
     }
-    
+
     resp_save = client.post("/config", json=config_payload)
     assert resp_save.status_code == 200
-    
+
     # Verify the state file got updated successfully
     updated_state = state_file.read_text()
     assert "last_selected_agent_model: MODEL_PLACEHOLDER_M26" in updated_state
-    
+
     # Verify diagnostics now returns updated model
     resp2 = client.get("/api/health/diagnostics")
     assert resp2.json()["agy"]["active_model"] == "Gemini 3.5 Flash (Medium)"
 
 def test_openrouter_api_key_persistence(setup_temp_db, monkeypatch, tmp_path):
     import src.multichat.config as cfg_module
-    
+
     # Mock CONFIG_PATH to a temporary file
     temp_config = tmp_path / "config.json"
     monkeypatch.setattr(cfg_module, "CONFIG_PATH", temp_config)
-    
+
     client = TestClient(app, client=("127.0.0.1", 50000))
-    
+
     # 1. Post configuration with an OpenRouter API key
     payload = {
         "max_exchanges": 1,
@@ -127,17 +127,17 @@ def test_openrouter_api_key_persistence(setup_temp_db, monkeypatch, tmp_path):
         "ollama": {"enabled": False, "host": "http://localhost:11434", "model": "llama3.2"},
         "openrouter": {"enabled": True, "api_key": "sk-or-test-key-12345", "model": "x-ai/grok-4.3"}
     }
-    
+
     resp_save = client.post("/config", json=payload)
     assert resp_save.status_code == 200
-    
+
     # 2. Load config via GET /config and verify the key is masked
     resp_get = client.get("/config")
     assert resp_get.status_code == 200
     get_data = resp_get.json()
     assert get_data["openrouter"]["api_key"] == "********"
     assert get_data["openrouter"]["model"] == "x-ai/grok-4.3"
-    
+
     # 3. Post config again with the masked key and verify the key is preserved in the file
     payload2 = {
         "max_exchanges": 1,
@@ -150,7 +150,7 @@ def test_openrouter_api_key_persistence(setup_temp_db, monkeypatch, tmp_path):
     }
     resp_save2 = client.post("/config", json=payload2)
     assert resp_save2.status_code == 200
-    
+
     # Check that the actual config file still contains the original key
     actual_cfg = json.loads(temp_config.read_text())
     assert actual_cfg["openrouter"]["api_key"] == "sk-or-test-key-12345"
@@ -159,10 +159,10 @@ def test_context_limit_configuration(setup_temp_db):
     # Add 5 dummy messages to temporary test DB
     for i in range(1, 6):
         db.add_message("user", f"Message {i}", "user")
-        
+
     # By default, checking context with limit=20 should return all 5 messages
     assert len(db.get_context(20)) == 5
-    
+
     # Restricting context limit to 2 should return only the last 2 messages (WORM chain sliding window)
     assert len(db.get_context(2)) == 2
     context = db.get_context(2)
@@ -179,11 +179,11 @@ def test_workspace_apply_and_traversal_boundaries(tmp_path, monkeypatch):
     ws_id = "test_workspace_123"
     ws_dir = WORKSPACE_ROOT / ws_id
     ws_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Create valid file in workspace
     valid_file = ws_dir / "app_config.py"
     valid_file.write_text("DEBUG = True", encoding="utf-8")
-    
+
     client = TestClient(app)
 
     # 1. Traversal Boundary Attempt (Adversarial LLM trying to write to /etc/passwd or outside project root)
@@ -220,7 +220,7 @@ def anyio_backend():
 async def test_simulated_stream_generators():
     # Verify that CLI generators yield chunks and finalize with metadata
     prov = providers.ClaudeCLIProvider("claude-haiku-4-5-20251001")
-    
+
     # Mock CLI response
     async def dummy_respond(context, cwd=None, current_depth=0, max_exchanges=1, self_name=""):
         return {
@@ -229,13 +229,13 @@ async def test_simulated_stream_generators():
             "in_tokens": 15,
             "out_tokens": 20
         }
-    
+
     prov.respond = dummy_respond
-    
+
     chunks = []
     async for chunk in prov.respond_stream([]):
         chunks.append(chunk)
-        
+
     assert len(chunks) > 0
     # Ensure text chunks are yielded first, followed by metadata block
     assert chunks[0]["type"] == "content"
@@ -281,7 +281,7 @@ async def test_stop_action_cancellation(setup_temp_db, monkeypatch):
     # Check that the message was saved in the database as stopped
     messages = db.get_context(10)
     assert len(messages) > 0
-    
+
     # The last message should be from @slow and contain [Stopped] or Stopped by user
     last_msg = messages[-1]
     assert last_msg["sender"] == "@slow"
@@ -351,7 +351,7 @@ async def test_token_budget_halts_all_branches(setup_temp_db, monkeypatch):
             called_providers.append(self.name)
             # Yield content chunk
             yield {"type": "content", "text": f"Response from {self.name}. Mentions @second" if self.name == "first" else f"Response from {self.name}"}
-            
+
             # Yield metadata chunk — budget tracks only out_tokens
             if self.name == "first":
                 # 30 output tokens (still within 50 budget)

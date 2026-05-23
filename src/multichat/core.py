@@ -123,7 +123,7 @@ async def trigger_mentions(mentions: list[str], seen: set[str], current_depth: i
                 full_text = "*Response stopped by user.*"
             else:
                 full_text += " *[Stopped]*"
-            
+
             # Spawn a task to save the partial response to the database and broadcast stream_end
             async def finalize_stopped():
                 files = _scan_workspace(ws_dir, copied_files)
@@ -153,7 +153,7 @@ async def trigger_mentions(mentions: list[str], seen: set[str], current_depth: i
         is_local_ollama = isinstance(provider, OllamaProvider) and provider.is_local
         tokens_spent = result_meta.get("out_tokens", 0) if not is_local_ollama else 0
         state["cumulative_tokens"] += tokens_spent
-        
+
         if state["cumulative_tokens"] > max_token_budget:
             alert_text = (
                 f"⚠️ **[Zero-Trust Cost Governance Alert]** AI-to-AI exchange chain terminated. "

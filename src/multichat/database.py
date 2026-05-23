@@ -102,13 +102,13 @@ def verify_log_chain() -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM messages ORDER BY rowid ASC").fetchall()
-        
+
     expected_prev_hash = None
     corrupted_messages = []
-    
+
     for r in rows:
         d = dict(r)
-        
+
         if d.get("prev_hash") != expected_prev_hash:
             corrupted_messages.append({
                 "id": d["id"],
@@ -116,10 +116,10 @@ def verify_log_chain() -> dict:
                 "timestamp": d["timestamp"],
                 "error": f"Sequence discontinuity: expected prev_hash '{expected_prev_hash or 'None'}', got '{d.get('prev_hash') or 'None'}'"
             })
-            
+
         payload = "|".join([d.get("prev_hash") or "", d["sender"], d["text"], d["timestamp"], d["type"]])
         calculated_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        
+
         if d.get("hash") != calculated_hash:
             corrupted_messages.append({
                 "id": d["id"],
@@ -127,9 +127,9 @@ def verify_log_chain() -> dict:
                 "timestamp": d["timestamp"],
                 "error": f"SHA-256 mismatch: calculated '{calculated_hash}', recorded '{d.get('hash')}'"
             })
-            
+
         expected_prev_hash = d.get("hash")
-        
+
     return {
         "valid": len(corrupted_messages) == 0,
         "total_messages": len(rows),

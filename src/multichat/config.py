@@ -42,11 +42,11 @@ def load() -> dict:
                     data[key].setdefault(subkey, subval)
             else:
                 data.setdefault(key, val)
-        
+
         env_key = os.environ.get("OPENROUTER_API_KEY")
         if env_key:
             data.setdefault("openrouter", {})["api_key"] = env_key
-            
+
         return data
     except Exception:
         return copy.deepcopy(DEFAULTS)

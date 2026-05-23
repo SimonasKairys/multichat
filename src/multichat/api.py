@@ -40,12 +40,12 @@ async def save_config(body: dict, request: Request):
     client_host = request.client.host if request.client else None
     if client_host not in ("127.0.0.1", "::1", "localhost"):
         raise HTTPException(status_code=403, detail="Forbidden: Settings can only be modified from localhost.")
-        
+
     old_cfg = cfg_module.load()
     if "openrouter" in body and "openrouter" in old_cfg:
         if body["openrouter"].get("api_key") == "********":
             body["openrouter"]["api_key"] = old_cfg["openrouter"].get("api_key", "")
-            
+
     if "agy" in body and "model" in body["agy"]:
         providers.AgyCLIProvider._write_model(body["agy"]["model"])
 
@@ -93,25 +93,25 @@ async def apply_workspace_file(body: dict):
     path = body.get("path")
     if not workspace or not path:
         raise HTTPException(400, "Missing workspace or path")
-    
+
     ws_dir = (WORKSPACE_ROOT / workspace).resolve()
     if not ws_dir.is_dir() or WORKSPACE_ROOT.resolve() not in ws_dir.parents:
         raise HTTPException(404, "workspace not found")
-        
+
     src_file = (ws_dir / path).resolve()
     if ws_dir not in src_file.parents:
         raise HTTPException(400, "invalid path")
-        
+
     if not src_file.is_file():
         raise HTTPException(404, "file not found")
-        
+
     dest_file = (PROJECT_ROOT / path).resolve()
     if PROJECT_ROOT.resolve() not in dest_file.parents and dest_file != PROJECT_ROOT.resolve():
         raise HTTPException(400, "Invalid destination path")
-        
+
     dest_file.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src_file, dest_file)
-    
+
     sys_msg = db.add_message("system", f"Applied workspace changes: {path}", "system")
     await manager.broadcast(sys_msg)
     await manager.broadcast({"type": "file_applied", "path": path})
@@ -121,7 +121,7 @@ async def apply_workspace_file(body: dict):
 async def get_diagnostics():
     claude_installed = shutil.which("claude") is not None
     agy_installed = shutil.which("agy") is not None
-    
+
     ollama_online = False
     ollama_models = []
     cfg = cfg_module.load()
@@ -134,12 +134,12 @@ async def get_diagnostics():
                 ollama_models = [m["name"] for m in resp.json().get("models", [])]
     except Exception:
         pass
-        
+
     openrouter_configured = False
     openrouter_key = cfg.get("openrouter", {}).get("api_key", "")
     if openrouter_key and openrouter_key != "":
         openrouter_configured = True
-        
+
     return {
         "claude": {
             "installed": claude_installed,
@@ -188,7 +188,7 @@ async def post_audit_cross_validate(data: dict):
     auditor_mention = data.get("auditor_mention")
     if not msg_id or not auditor_mention:
         raise HTTPException(status_code=400, detail="Missing message_id or auditor_mention")
-        
+
     auditor_mention = auditor_mention.lower().strip().lstrip("@")
 
     with sqlite3.connect(db.DB_PATH) as conn:
@@ -243,7 +243,7 @@ async def post_audit_cross_validate(data: dict):
 @app.websocket("/ws/{username}")
 async def ws_endpoint(ws: WebSocket, username: str):
     query_token = ws.query_params.get("token")
-    
+
     if username in manager.active_connections:
         existing_token = manager.active_tokens.get(username)
         if existing_token and query_token == existing_token:

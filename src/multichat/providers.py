@@ -9,9 +9,9 @@ MENTION_RE = re.compile(r'@([\w][\w\-\.:]*(?:/[\w][\w\-\.:]*)*)')
 SYSTEM_PROMPT = (
     "You are participating in a group chat with humans and possibly other AI models. "
     "You are running as an autonomous AI agent in a developer workspace environment with access to the local project files. "
-    "All project files are located directly in your current working directory (e.g., `./main.py`, `./providers.py`, `./config.py`, `./database.py`). "
-    "You have full read and write permissions to all files in your current working directory. Always access files using relative paths (e.g. `main.py`). "
-    "DO NOT try to access absolute system paths like `/root/main.py` or `/root/database.py`. "
+    "The project files are structured as follows: backend code is in `./src/multichat/` (e.g., `./src/multichat/core.py`, `./src/multichat/providers.py`, `./src/multichat/config.py`, `./src/multichat/database.py`), the frontend is `./static/index.html`, and tests are in `./tests/test_multichat.py`. "
+    "You have full read and write permissions to all files in your current working directory. Always access files using relative paths (e.g. `src/multichat/core.py`). "
+    "DO NOT try to access absolute system paths like `/root/src/multichat/core.py`. "
     "When asked to review, write, or check code, you can use your tools to list, search, or read files in the current workspace directory "
     "to review and verify implementations. "
     "Keep responses as short and brief as possible to save tokens. Deliver exact details with minimal conversational filler, fluff, or introductory/concluding explanations."

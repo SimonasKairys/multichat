@@ -987,14 +987,15 @@ function closeAuditModalIfBg(e) {
 async function runSelectedAudit(providerName) {
   if (!activeAuditMsgId) return;
   const target = providerName;
+  const msgId = activeAuditMsgId;
   closeAuditModal();
   appendSystem(`Initiating independent Zero-Trust audit of message using @${target}...`);
-  
+
   try {
     const resp = await fetch('/api/audit/cross_validate', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message_id: activeAuditMsgId, auditor_mention: target})
+      body: JSON.stringify({message_id: msgId, auditor_mention: target})
     });
     if (!resp.ok) {
       const err = await resp.text();

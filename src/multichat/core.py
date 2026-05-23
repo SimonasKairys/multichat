@@ -105,7 +105,7 @@ async def trigger_mentions(mentions: list[str], seen: set[str], current_depth: i
         result_meta = {"model": mention, "in_tokens": 0, "out_tokens": 0}
 
         try:
-            async for chunk in provider.respond_stream(context, cwd=str(ws_dir), current_depth=current_depth, max_exchanges=max_exchanges):
+            async for chunk in provider.respond_stream(context, cwd=str(ws_dir), current_depth=current_depth, max_exchanges=max_exchanges, self_name=mention):
                 if chunk["type"] == "content":
                     text_delta = chunk["text"]
                     full_text += text_delta

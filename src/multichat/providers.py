@@ -6,32 +6,50 @@ from . import config as cfg_module
 
 MENTION_RE = re.compile(r'@([\w][\w\-\.:]*(?:/[\w][\w\-\.:]*)*)')
 
-SYSTEM_PROMPT = (
+_BASE_PROMPT = (
     "You are participating in a group chat with humans and possibly other AI models. "
-    "You are running as an autonomous AI agent in a developer workspace environment with access to the local project files. "
-    "The project files are structured as follows: backend code is in `./src/multichat/` (e.g., `./src/multichat/core.py`, `./src/multichat/providers.py`, `./src/multichat/config.py`, `./src/multichat/database.py`), the frontend is `./static/index.html`, and tests are in `./tests/test_multichat.py`. "
-    "You have full read and write permissions to all files in your current working directory. Always access files using relative paths (e.g. `src/multichat/core.py`). "
-    "DO NOT try to access absolute system paths like `/root/src/multichat/core.py`. "
-    "When asked to review, write, or check code, you can use your tools to list, search, or read files in the current workspace directory "
-    "to review and verify implementations. "
     "Keep responses as short and brief as possible to save tokens. Deliver exact details with minimal conversational filler, fluff, or introductory/concluding explanations."
 )
 
-def _get_chain_instruction(context: list[dict], current_depth: int, max_exchanges: int) -> str:
+_FILE_TOOLS_PROMPT = (
+    " You are running as an autonomous AI agent in a developer workspace environment with access to the local project files. "
+    "The project files are structured as follows: backend code is in `./src/multichat/` (e.g., `./src/multichat/core.py`, `./src/multichat/providers.py`, `./src/multichat/config.py`, `./src/multichat/database.py`), the frontend is `./static/index.html`, and tests are in `./tests/test_multichat.py`. "
+    "You have full read and write permissions to all files in your current working directory. Always access files using relative paths (e.g. `src/multichat/core.py`). "
+    "DO NOT try to access absolute system paths like `/root/src/multichat/core.py`. "
+    "When asked to review, write, or check code, you can use your tools to list, search, or read files in the current workspace directory to review and verify implementations."
+)
+
+_NO_TOOLS_PROMPT = (
+    " You do NOT have file system access, code execution, or any external tools in this chat — you can only read the messages in this conversation and reply with text. "
+    "If a user asks you to read, review, or describe a file, you MUST say you cannot access files rather than fabricate contents. Do NOT invent file contents, function names, or implementation details you have not been shown directly in the conversation."
+)
+
+def _system_prompt(has_file_tools: bool) -> str:
+    return _BASE_PROMPT + (_FILE_TOOLS_PROMPT if has_file_tools else _NO_TOOLS_PROMPT)
+
+SYSTEM_PROMPT = _BASE_PROMPT + _FILE_TOOLS_PROMPT
+
+def _get_chain_instruction(context: list[dict], current_depth: int, max_exchanges: int, self_name: str = "") -> str:
     instr = f"\n[AI-to-AI Exchange Tracking: Max limit is {max_exchanges}. Current exchange depth is {current_depth} of {max_exchanges}."
     if current_depth >= max_exchanges:
         instr += " This is the FINAL exchange in this turn; DO NOT mention any other AI models (@claude, @agy, @ollama, @openrouter, etc.) as no further triggers will execute. Wrap up the conversation."
     else:
         instr += f" You have {max_exchanges - current_depth} exchanges remaining before the chain stops. You may mention other models if needed."
     instr += "]"
-    
+    if self_name:
+        instr += (
+            f"\n[Your identity: You ARE @{self_name}. The handle @{self_name} refers to YOU, not some other system or assistant. "
+            f"Do NOT report on @{self_name}'s status, do NOT describe @{self_name} in the third person, do NOT say things like '@{self_name} inactive' or '@{self_name} unavailable'. "
+            f"When you see @{self_name} in a message, treat it as someone addressing you directly. Just respond to the actual content of their message (greeting, question, request) conversationally as yourself.]"
+        )
+
     last_sender = None
     for m in reversed(context):
         if m["type"] == "llm" and m["text"].startswith("Error"):
             continue
         last_sender = m["sender"]
         break
-        
+
     if last_sender:
         if not last_sender.startswith("@"):
             last_sender = f"@{last_sender}"
@@ -92,7 +110,7 @@ class ClaudeCLIProvider:
     def __init__(self, model: str):
         self.model = model
 
-    async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1) -> dict:
+    async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1, self_name: str = "") -> dict:
         prompt = _build_context_text(context) + "\n\nRespond to the latest message above."
         try:
             raw = await _run_cli(
@@ -100,7 +118,7 @@ class ClaudeCLIProvider:
                 "--no-session-persistence",
                 "--output-format", "json",
                 "--model", self.model,
-                "--system-prompt", SYSTEM_PROMPT + _get_chain_instruction(context, current_depth, max_exchanges),
+                "--system-prompt", SYSTEM_PROMPT + _get_chain_instruction(context, current_depth, max_exchanges, self_name),
                 stdin_text=prompt,
                 cwd=cwd,
             )
@@ -123,8 +141,8 @@ class ClaudeCLIProvider:
         except Exception as e:
             return _err(self.model, str(e))
 
-    async def respond_stream(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1):
-        res = await self.respond(context, cwd, current_depth, max_exchanges)
+    async def respond_stream(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1, self_name: str = ""):
+        res = await self.respond(context, cwd, current_depth, max_exchanges, self_name)
         if res["text"].startswith("Error"):
             yield {"type": "error", "text": res["text"]}
         else:
@@ -205,13 +223,13 @@ class AgyCLIProvider:
             pass
         return False
 
-    async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1) -> dict:
+    async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1, self_name: str = "") -> dict:
         prompt = _build_context_text(context)
         detected_model = self._detect_model()
         args = [
             "agy",
             "--dangerously-skip-permissions",
-            "-p", f"Respond to the latest message above. Be concise.{_get_chain_instruction(context, current_depth, max_exchanges)}",
+            "-p", f"Respond to the latest message above. Be concise.{_get_chain_instruction(context, current_depth, max_exchanges, self_name)}",
         ]
         try:
             text = await _run_cli(*args, stdin_text=prompt, cwd=cwd or "/tmp")
@@ -224,8 +242,8 @@ class AgyCLIProvider:
         except Exception as e:
             return _err("agy", str(e))
 
-    async def respond_stream(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1):
-        res = await self.respond(context, cwd, current_depth, max_exchanges)
+    async def respond_stream(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1, self_name: str = ""):
+        res = await self.respond(context, cwd, current_depth, max_exchanges, self_name)
         if res["text"].startswith("Error"):
             yield {"type": "error", "text": res["text"]}
         else:
@@ -249,8 +267,8 @@ class OllamaProvider:
         hostname = (parsed.hostname or "").lower()
         return hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
 
-    async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1) -> dict:
-        system_content = SYSTEM_PROMPT + _get_chain_instruction(context, current_depth, max_exchanges)
+    async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1, self_name: str = "") -> dict:
+        system_content = _system_prompt(has_file_tools=False) + _get_chain_instruction(context, current_depth, max_exchanges, self_name)
         messages = [{"role": "system", "content": system_content}]
         for m in context:
             role = "user" if m["type"] == "user" else "assistant"
@@ -274,8 +292,8 @@ class OllamaProvider:
         except Exception as e:
             return _err(self.model, str(e))
 
-    async def respond_stream(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1):
-        system_content = SYSTEM_PROMPT + _get_chain_instruction(context, current_depth, max_exchanges)
+    async def respond_stream(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1, self_name: str = ""):
+        system_content = _system_prompt(has_file_tools=False) + _get_chain_instruction(context, current_depth, max_exchanges, self_name)
         messages = [{"role": "system", "content": system_content}]
         for m in context:
             role = "user" if m["type"] == "user" else "assistant"
@@ -311,8 +329,8 @@ class OpenRouterProvider:
         self.api_key = api_key
         self.model = model
 
-    async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1) -> dict:
-        system_content = SYSTEM_PROMPT + _get_chain_instruction(context, current_depth, max_exchanges)
+    async def respond(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1, self_name: str = "") -> dict:
+        system_content = _system_prompt(has_file_tools=False) + _get_chain_instruction(context, current_depth, max_exchanges, self_name)
         messages = [{"role": "system", "content": system_content}]
         for m in context:
             role = "user" if m["type"] == "user" else "assistant"
@@ -338,8 +356,8 @@ class OpenRouterProvider:
         except Exception as e:
             return _err(self.model, str(e))
 
-    async def respond_stream(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1):
-        system_content = SYSTEM_PROMPT + _get_chain_instruction(context, current_depth, max_exchanges)
+    async def respond_stream(self, context: list[dict], cwd: str | None = None, current_depth: int = 0, max_exchanges: int = 1, self_name: str = ""):
+        system_content = _system_prompt(has_file_tools=False) + _get_chain_instruction(context, current_depth, max_exchanges, self_name)
         messages = [{"role": "system", "content": system_content}]
         for m in context:
             role = "user" if m["type"] == "user" else "assistant"

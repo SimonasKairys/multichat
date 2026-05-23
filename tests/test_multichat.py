@@ -222,7 +222,7 @@ async def test_simulated_stream_generators():
     prov = providers.ClaudeCLIProvider("claude-haiku-4-5-20251001")
     
     # Mock CLI response
-    async def dummy_respond(context, cwd=None, current_depth=0, max_exchanges=1):
+    async def dummy_respond(context, cwd=None, current_depth=0, max_exchanges=1, self_name=""):
         return {
             "text": "Simulated message response from Claude.",
             "model": "claude-haiku-4-5-20251001",
@@ -252,7 +252,7 @@ async def test_stop_action_cancellation(setup_temp_db, monkeypatch):
 
     # Mock get_provider to return a slow provider that sleeps
     class SlowProvider:
-        async def respond_stream(self, context, cwd=None, current_depth=0, max_exchanges=1):
+        async def respond_stream(self, context, cwd=None, current_depth=0, max_exchanges=1, self_name=""):
             yield {"type": "content", "text": "Start"}
             await asyncio.sleep(5)  # simulate long generation
             yield {"type": "content", "text": "End"}
@@ -306,7 +306,7 @@ async def test_exchange_limit_halts_all_branches(setup_temp_db, monkeypatch):
         def __init__(self, name):
             self.name = name
 
-        async def respond_stream(self, context, cwd=None, current_depth=0, max_exchanges=1):
+        async def respond_stream(self, context, cwd=None, current_depth=0, max_exchanges=1, self_name=""):
             called_providers.append(self.name)
             if self.name == "first":
                 yield {"type": "content", "text": "Let's ask @second to help."}
@@ -347,7 +347,7 @@ async def test_token_budget_halts_all_branches(setup_temp_db, monkeypatch):
         def __init__(self, name):
             self.name = name
 
-        async def respond_stream(self, context, cwd=None, current_depth=0, max_exchanges=1):
+        async def respond_stream(self, context, cwd=None, current_depth=0, max_exchanges=1, self_name=""):
             called_providers.append(self.name)
             # Yield content chunk
             yield {"type": "content", "text": f"Response from {self.name}. Mentions @second" if self.name == "first" else f"Response from {self.name}"}

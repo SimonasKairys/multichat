@@ -59,7 +59,7 @@ def _setup_workspace() -> tuple[str, Path, set[str]]:
     if configured_root:
         project_root = Path(configured_root)
     else:
-        project_root = Path(__file__).parent.parent.parent
+        project_root = Path.cwd()
     for item in project_root.iterdir():
         if item.name in _SKIP_NAMES:
             continue

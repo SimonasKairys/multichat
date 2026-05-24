@@ -34,7 +34,7 @@ STATIC_INDEX = _MULTICHAT_ROOT / "static" / "index.html"
 
 def _get_project_root() -> Path:
     configured = cfg_module.load().get("project_root", "")
-    return Path(configured) if configured else _MULTICHAT_ROOT
+    return Path(configured) if configured else Path.cwd()
 
 @app.get("/")
 async def index():

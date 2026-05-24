@@ -21,7 +21,7 @@ from .core import WORKSPACE_ROOT, MAX_FILE_BYTES, trigger_mentions, _setup_works
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="MultiChat")
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 
 # Per-user WebSocket message rate limit: max messages per window.
 _WS_RATE_WINDOW = 60   # seconds
@@ -202,7 +202,7 @@ def get_audit_verify():
 
 @app.post("/api/audit/cross_validate")
 @limiter.limit("5/minute")
-async def post_audit_cross_validate(request: Request, data: dict):
+async def post_audit_cross_validate(_request: Request, data: dict):
     msg_id = data.get("message_id")
     auditor_mention = data.get("auditor_mention")
     if not msg_id or not auditor_mention:
@@ -277,7 +277,7 @@ async def ws_endpoint(ws: WebSocket, username: str):
                 n += 1
             username = f"{username}_{n}"
 
-    manager.active_tokens[username] = query_token
+    manager.active_tokens[username] = query_token or ""
     await manager.connect(username, ws)
     sys_msg = db.add_message("system", f"{username} joined", "system")
     await manager.broadcast(sys_msg)

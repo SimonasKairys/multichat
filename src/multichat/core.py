@@ -12,6 +12,8 @@ WORKSPACE_ROOT = Path("/tmp/multichat_workspaces")  # nosec B108 — intentional
 WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MB cap for the viewer
 
+_SCAN_SKIP_TOP = frozenset({".antigravitycli", "__pycache__"})
+
 def _scan_workspace(ws_dir: Path, copied_files: set[str] | None = None) -> list[dict]:
     """Return [{path, size}] for files created inside ws_dir; remove dir if empty."""
     if not ws_dir.exists():
@@ -20,9 +22,18 @@ def _scan_workspace(ws_dir: Path, copied_files: set[str] | None = None) -> list[
         copied_files = set()
     files = []
     for p in sorted(ws_dir.rglob("*")):
+        # Symlinks may point outside the workspace (e.g. agy CLI puts a
+        # symlink in .antigravitycli/ pointing to ~/.gemini/...). Reporting
+        # those would lead to a path-traversal rejection when the user
+        # tries to open or apply the file.
+        if p.is_symlink():
+            continue
         if p.is_file():
             rel = p.relative_to(ws_dir).as_posix()
             if rel in copied_files:
+                continue
+            top = rel.split("/", 1)[0]
+            if top in _SCAN_SKIP_TOP:
                 continue
             files.append({"path": rel, "size": p.stat().st_size})
     if not files:

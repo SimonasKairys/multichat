@@ -202,7 +202,7 @@ def get_audit_verify():
 
 @app.post("/api/audit/cross_validate")
 @limiter.limit("5/minute")
-async def post_audit_cross_validate(_request: Request, data: dict):
+async def post_audit_cross_validate(_request: Request, data: dict):  # pyright: ignore[reportUnusedParameter]
     msg_id = data.get("message_id")
     auditor_mention = data.get("auditor_mention")
     if not msg_id or not auditor_mention:

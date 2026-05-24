@@ -59,7 +59,11 @@ def _setup_workspace() -> tuple[str, Path, set[str]]:
     if configured_root:
         project_root = Path(configured_root)
     else:
-        project_root = Path.cwd()
+        # Parent of the multichat installation folder. When multichat is
+        # dropped into another project (project/multichat/), the parent
+        # is that project — and the multichat folder itself is skipped
+        # via _SKIP_NAMES.
+        project_root = Path(__file__).parent.parent.parent.parent
     for item in project_root.iterdir():
         if item.name in _SKIP_NAMES:
             continue

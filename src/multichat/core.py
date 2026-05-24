@@ -40,6 +40,7 @@ def _scan_workspace(ws_dir: Path, copied_files: set[str] | None = None) -> list[
 
 _SKIP_NAMES = frozenset({
     ".git", "data", "__pycache__", ".venv", "venv", ".pytest_cache", "config.json", ".env",
+    "node_modules", "multichat",
 })
 
 def _setup_workspace() -> tuple[str, Path, set[str]]:
@@ -53,7 +54,12 @@ def _setup_workspace() -> tuple[str, Path, set[str]]:
         pass
 
     copied_files: set[str] = set()
-    project_root = Path(__file__).parent.parent.parent
+    cfg = cfg_module.load()
+    configured_root = cfg.get("project_root", "")
+    if configured_root:
+        project_root = Path(configured_root)
+    else:
+        project_root = Path(__file__).parent.parent.parent
     for item in project_root.iterdir():
         if item.name in _SKIP_NAMES:
             continue

@@ -13,9 +13,8 @@ _BASE_PROMPT = (
 
 _FILE_TOOLS_PROMPT = (
     " You are running as an autonomous AI agent in a developer workspace environment with access to the local project files. "
-    "The project files are structured as follows: backend code is in `./src/multichat/` (e.g., `./src/multichat/core.py`, `./src/multichat/providers.py`, `./src/multichat/config.py`, `./src/multichat/database.py`), the frontend is `./static/index.html`, and tests are in `./tests/test_multichat.py`. "
-    "You have full read and write permissions to all files in your current working directory. Always access files using relative paths (e.g. `src/multichat/core.py`). "
-    "DO NOT try to access absolute system paths like `/root/src/multichat/core.py`. "
+    "You have full read and write permissions to all files in your current working directory. Always access files using relative paths. "
+    "DO NOT try to access absolute system paths. "
     "When asked to review, write, or check code, you can use your tools to list, search, or read files in the current workspace directory to review and verify implementations."
 )
 

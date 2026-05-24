@@ -29,8 +29,12 @@ _WS_RATE_MAX    = 20   # messages per window
 _ws_buckets: dict[str, deque] = {}
 db.init_db()
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-STATIC_INDEX = PROJECT_ROOT / "static" / "index.html"
+_MULTICHAT_ROOT = Path(__file__).parent.parent.parent
+STATIC_INDEX = _MULTICHAT_ROOT / "static" / "index.html"
+
+def _get_project_root() -> Path:
+    configured = cfg_module.load().get("project_root", "")
+    return Path(configured) if configured else _MULTICHAT_ROOT
 
 @app.get("/")
 async def index():
@@ -118,8 +122,9 @@ async def apply_workspace_file(body: dict):
     if not src_file.is_file():
         raise HTTPException(404, "file not found")
 
-    dest_file = (PROJECT_ROOT / path).resolve()
-    if PROJECT_ROOT.resolve() not in dest_file.parents and dest_file != PROJECT_ROOT.resolve():
+    project_root = _get_project_root()
+    dest_file = (project_root / path).resolve()
+    if project_root.resolve() not in dest_file.parents and dest_file != project_root.resolve():
         raise HTTPException(400, "Invalid destination path")
 
     dest_file.parent.mkdir(parents=True, exist_ok=True)

@@ -80,6 +80,36 @@ fn compose_call(
     }
 }
 
+/// Condenses a failed child's stderr into something that fits in a chat transcript.
+///
+/// A Node-based CLI answers a routine auth failure with a multi-line stack trace; the
+/// whole thing used to be pasted into the transcript verbatim, burying the one line
+/// that says what went wrong. Keeps the leading message lines, drops stack frames
+/// (`at ...` / `file:///...`), and caps the result.
+fn summarize_stderr(stderr: &str) -> String {
+    const MAX_LINES: usize = 3;
+    const MAX_CHARS: usize = 300;
+
+    let kept: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with("at ") && !line.starts_with("file:///"))
+        .take(MAX_LINES)
+        .collect();
+
+    let joined = if kept.is_empty() {
+        stderr.trim().to_string()
+    } else {
+        kept.join(" ")
+    };
+
+    match joined.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &joined[..cut]),
+        None => joined,
+    }
+}
+
 #[async_trait]
 impl Provider for LocalBinaryProvider {
     async fn send(&self, system: Option<&str>, prompt: &str) -> Result<Reply> {
@@ -108,7 +138,7 @@ impl Provider for LocalBinaryProvider {
                 "{} exited with {}: {}",
                 self.binary_path,
                 output.status,
-                stderr.trim()
+                summarize_stderr(&stderr)
             ));
         }
 
@@ -197,5 +227,37 @@ mod tests {
         let (flag, prompt) = compose_call(Some("--system-prompt"), None, "hi");
         assert!(flag.is_none());
         assert_eq!(prompt, "hi");
+    }
+
+    #[test]
+    fn stderr_summary_keeps_the_message_and_drops_the_stack_trace() {
+        // Verbatim shape of a real `gemini` auth failure, which used to be pasted
+        // into the transcript in full.
+        let stderr = "Error authenticating: IneligibleTierError: This client is no \
+                      longer supported.\n\
+                      \x20   at throwIneligibleOrProjectIdError \
+                      (file:///home/u/.nvm/node_modules/@google/gemini-cli/chunk.js:273372:11)\n\
+                      \x20   at _doSetupUser (file:///home/u/.nvm/chunk.js:273361:5)\n\
+                      \x20   at process.processTicksAndRejections (node:internal/process:95:5)";
+
+        let summary = summarize_stderr(stderr);
+        assert!(summary.starts_with("Error authenticating: IneligibleTierError"));
+        assert!(!summary.contains("at throwIneligibleOrProjectIdError"));
+        assert!(!summary.contains("file:///"));
+        assert!(summary.chars().count() <= 301);
+    }
+
+    #[test]
+    fn stderr_summary_falls_back_when_everything_looks_like_a_frame() {
+        // All lines filtered out must not yield an empty, useless error.
+        let summary = summarize_stderr("at one\nat two");
+        assert!(!summary.is_empty());
+    }
+
+    #[test]
+    fn stderr_summary_caps_a_single_enormous_line() {
+        let summary = summarize_stderr(&"x".repeat(5000));
+        assert!(summary.chars().count() <= 301);
+        assert!(summary.ends_with('…'));
     }
 }

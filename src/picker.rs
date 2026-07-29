@@ -214,12 +214,21 @@ impl PickerState {
         let Some(row) = self.current_row() else {
             return;
         };
-        if self.selections[row.candidate].enabled {
-            self.flash = None;
-            self.commander = Some(row.candidate);
-        } else {
-            self.flash = Some("tick this connection before making it commander".into());
+        let option = &self.candidates[row.candidate].transports[row.transport];
+        if let Availability::Unavailable(reason) = &option.availability {
+            self.flash = Some(reason.clone());
+            return;
         }
+        self.flash = None;
+
+        // Promoting a row implies connecting it. Requiring `space` first only ever
+        // produced a flash telling the user to press `space` — an extra step in front
+        // of an unambiguous intent. Choosing a commander on a different transport of
+        // the same connection also switches to that transport.
+        let sel = &mut self.selections[row.candidate];
+        sel.enabled = true;
+        sel.chosen = row.transport;
+        self.commander = Some(row.candidate);
     }
 
     /// Finalises the picker into a `connections`/`commander` pair to persist, or
@@ -351,16 +360,31 @@ mod tests {
     }
 
     #[test]
-    fn commander_requires_a_ticked_row() {
+    fn promoting_an_unticked_row_connects_it_too() {
+        // `c` on an available but unticked row used to refuse and tell the user to
+        // press `space` first. Choosing a commander is unambiguous, so it now ticks.
         let candidates = vec![candidate_single("ollama:llama3")];
         let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
-        picker.set_commander();
-        assert!(picker.flash.is_some());
-        assert!(!picker.is_commander(0, 0));
+        assert!(!picker.is_checked(0, 0));
 
-        picker.toggle();
         picker.set_commander();
+        assert!(picker.flash.is_none());
         assert!(picker.is_commander(0, 0));
+        assert!(picker.is_checked(0, 0));
+    }
+
+    #[test]
+    fn an_unavailable_row_still_cannot_become_commander() {
+        // The tick-on-promote shortcut must not become a way to select something
+        // construction would immediately drop.
+        let candidates = vec![candidate_dual("anthropic", false)];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down();
+
+        picker.set_commander();
+        assert_eq!(picker.flash.as_deref(), Some("no key stored"));
+        assert!(!picker.is_commander(0, 1));
+        assert!(!picker.is_checked(0, 1));
     }
 
     #[test]

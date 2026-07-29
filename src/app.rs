@@ -137,11 +137,17 @@ impl App {
             .join("\n")
     }
 
+    /// The chat input's title bar. It names the commander and, crucially, advertises
+    /// `Ctrl+O`: without it there is nothing on the chat screen to suggest the
+    /// connection set or the commander can be changed without restarting.
     pub fn status_line(&self) -> String {
         if self.busy {
             format!("{} · working… (Esc to quit)", self.primary)
         } else {
-            format!("{} · Enter to send, Esc to quit", self.primary)
+            format!(
+                "{} · Enter send · Ctrl+O connections · Esc quit",
+                self.primary
+            )
         }
     }
 }
@@ -209,7 +215,7 @@ mod tests {
         assert!(app.busy);
         app.apply(Event::TurnComplete);
         assert!(!app.busy);
-        assert!(app.status_line().contains("Enter to send"));
+        assert!(app.status_line().contains("Ctrl+O"));
     }
 
     #[test]

@@ -117,7 +117,29 @@ impl Provider for OllamaProvider {
     }
 
     fn is_remote(&self) -> bool {
-        false
+        !is_loopback_host(&self.host)
+    }
+}
+
+/// True only when `host` is a URL whose host component resolves to loopback:
+/// `127.0.0.0/8`, `::1`, or the literal name `localhost`. `ollama_host` is
+/// user-writable and unvalidated, so anything this cannot positively identify as
+/// loopback — including a host that fails to parse — is treated as remote. Failing
+/// open here is exactly the bug finding 1.2 in `docs/AUDIT-2026-07-29.md` describes:
+/// a garbage or non-loopback host must never pass `--classified` as "local".
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(host) else {
+        return false;
+    };
+    match url.host_str() {
+        Some(h) if h.eq_ignore_ascii_case("localhost") => true,
+        Some(h) => h
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
     }
 }
 
@@ -136,5 +158,33 @@ mod tests {
     fn trailing_slashes_do_not_double_up_in_urls() {
         let p = OllamaProvider::new("http://127.0.0.1:11434/", "llama3", reqwest::Client::new());
         assert_eq!(p.base(), "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn loopback_hosts_are_not_remote() {
+        assert!(is_loopback_host("http://127.0.0.1:11434"));
+        assert!(is_loopback_host("http://127.5.5.5:11434"));
+        assert!(is_loopback_host("http://localhost:11434"));
+        assert!(is_loopback_host("http://LOCALHOST:11434"));
+        assert!(is_loopback_host("http://[::1]:11434"));
+    }
+
+    #[test]
+    fn a_non_loopback_ollama_host_reports_remote_and_is_refused_under_classified() {
+        let p = OllamaProvider::new(
+            "http://192.168.1.192:11434",
+            "llama3",
+            reqwest::Client::new(),
+        );
+        assert!(p.is_remote(), "a LAN host must never be treated as local");
+        assert!(!is_loopback_host("http://192.168.1.192:11434"));
+        assert!(!is_loopback_host("http://example.com:11434"));
+    }
+
+    #[test]
+    fn an_unparseable_host_fails_closed_as_remote() {
+        // Garbage config must never read as "local" and slip past --classified.
+        assert!(!is_loopback_host("not a url at all"));
+        assert!(!is_loopback_host(""));
     }
 }

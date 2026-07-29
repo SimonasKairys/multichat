@@ -105,6 +105,19 @@ impl App {
                 text,
             }),
             Event::TurnComplete => self.busy = false,
+            Event::Reconfigured { primary, roster } => {
+                self.primary = primary.clone();
+                self.transcript.push(Line {
+                    speaker: Speaker::System,
+                    text: format!("connections updated — commander: {primary}"),
+                });
+                if !roster.is_empty() {
+                    self.transcript.push(Line {
+                        speaker: Speaker::System,
+                        text: format!("swarm: {}", roster.join(", ")),
+                    });
+                }
+            }
         }
     }
 
@@ -205,6 +218,22 @@ mod tests {
         app.apply(Event::Error("rate limited".into()));
         assert!(app.body().contains("! rate limited"));
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn reconfigured_updates_the_primary_and_status_line() {
+        let mut app = app();
+        app.apply(Event::Reconfigured {
+            primary: "anthropic:claude-opus-5".into(),
+            roster: vec!["anthropic:claude-opus-5".into(), "ollama:llama3".into()],
+        });
+        assert_eq!(app.primary, "anthropic:claude-opus-5");
+        assert!(app.status_line().contains("anthropic:claude-opus-5"));
+        assert!(app.body().contains("commander: anthropic:claude-opus-5"));
+        assert!(
+            app.body()
+                .contains("swarm: anthropic:claude-opus-5, ollama:llama3")
+        );
     }
 
     #[test]

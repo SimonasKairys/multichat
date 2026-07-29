@@ -127,6 +127,33 @@ pub fn builtin_endpoint(provider: &str) -> Option<CloudEndpoint> {
     Some(e)
 }
 
+/// Which transport carries a connection's traffic. `Api` and `Cli` are the only two
+/// today; Ollama has no choice to make, so its `ConnectionSpec::transport` is `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    Cli,
+    Api,
+}
+
+/// A user's decision about one candidate connection the picker showed them: whether
+/// to connect it, and — when the candidate offers more than one — which transport.
+///
+/// One `ConnectionSpec` covers every transport of a given connection id (e.g.
+/// `"anthropic"` covers both its `claude` CLI and its HTTP API); `transport` says
+/// which is currently in effect, so ticking the API row and ticking the CLI row are
+/// mutually exclusive by construction rather than by extra bookkeeping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConnectionSpec {
+    pub enabled: bool,
+    pub transport: Option<Transport>,
+    /// Resolved CLI path, when `transport == Some(Cli)`. Overrides auto-detection.
+    pub path: Option<String>,
+    /// Model override; when absent, the endpoint's (or CLI's) default is used.
+    pub model: Option<String>,
+}
+
 /// Persisted user settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -139,6 +166,13 @@ pub struct Settings {
     pub custom_endpoints: std::collections::BTreeMap<String, CloudEndpoint>,
     /// Local CLI tools that can act as providers, keyed by name.
     pub local_binaries: std::collections::BTreeMap<String, LocalBinarySpec>,
+    /// The user's picker selections, keyed by connection id. Empty on an old config
+    /// file or a fresh install — that absence is what triggers "first run" behaviour
+    /// (everything available pre-ticked) rather than "connect nothing".
+    pub connections: std::collections::BTreeMap<String, ConnectionSpec>,
+    /// The connection id chosen as commander. `None` falls back to the first enabled
+    /// connection.
+    pub commander: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +180,11 @@ pub struct LocalBinarySpec {
     pub path: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// The flag this CLI uses to accept a system prompt, e.g. `--system-prompt` for
+    /// `claude`. `None` means the CLI has no such flag (e.g. `gemini`), so the system
+    /// text is folded into the prompt instead — see `LocalBinaryProvider::send`.
+    #[serde(default)]
+    pub system_arg: Option<String>,
 }
 
 impl Default for Settings {
@@ -155,6 +194,8 @@ impl Default for Settings {
             default_provider: "ollama".into(),
             custom_endpoints: Default::default(),
             local_binaries: Default::default(),
+            connections: Default::default(),
+            commander: None,
         }
     }
 }
@@ -263,6 +304,19 @@ mod tests {
             Settings::load(&paths).unwrap().default_provider,
             "anthropic"
         );
+    }
+
+    #[test]
+    fn an_old_config_file_with_no_connections_key_still_parses() {
+        // Pre-picker config.json files never wrote `connections` or `commander`. The
+        // struct-level `#[serde(default)]` must keep them loadable rather than
+        // rejecting the file outright.
+        let settings: Settings =
+            serde_json::from_str(r#"{"ollama_host": "http://127.0.0.1:11434"}"#)
+                .expect("an old config file must still parse");
+        assert!(settings.connections.is_empty());
+        assert!(settings.commander.is_none());
+        assert_eq!(settings.ollama_host, "http://127.0.0.1:11434");
     }
 
     #[test]

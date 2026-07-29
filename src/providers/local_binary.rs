@@ -21,6 +21,10 @@ pub struct LocalBinaryProvider {
     binary_path: String,
     args: Vec<String>,
     model: String,
+    /// The flag this CLI accepts for a system prompt (e.g. `--system-prompt`), or
+    /// `None` when it has no such flag and the system text must be folded into the
+    /// prompt instead.
+    system_arg: Option<String>,
 }
 
 impl LocalBinaryProvider {
@@ -29,6 +33,7 @@ impl LocalBinaryProvider {
         binary_path: impl Into<String>,
         args: Vec<String>,
         model: impl Into<String>,
+        system_arg: Option<String>,
     ) -> Result<Self> {
         let binary_path = binary_path.into();
         let name = name.into();
@@ -50,21 +55,46 @@ impl LocalBinaryProvider {
             binary_path,
             args,
             model: model.into(),
+            system_arg,
         })
+    }
+}
+
+/// Decides how the system prompt reaches the child process: as a dedicated
+/// `--flag <text>` pair when the CLI supports one, or folded into the prompt text
+/// (separated by a blank line) when it does not — the only channel a CLI with no
+/// system flag offers. Kept pure so both branches are unit-testable without spawning
+/// a process.
+fn compose_call(
+    system_arg: Option<&str>,
+    system: Option<&str>,
+    prompt: &str,
+) -> (Option<(String, String)>, String) {
+    match (system_arg, system) {
+        (_, None) => (None, prompt.to_string()),
+        (Some(flag), Some(system)) => (
+            Some((flag.to_string(), system.to_string())),
+            prompt.to_string(),
+        ),
+        (None, Some(system)) => (None, format!("{system}\n\n{prompt}")),
     }
 }
 
 #[async_trait]
 impl Provider for LocalBinaryProvider {
     async fn send(&self, system: Option<&str>, prompt: &str) -> Result<Reply> {
+        let (system_flag, effective_prompt) =
+            compose_call(self.system_arg.as_deref(), system, prompt);
+
         // Arguments are passed as an argv vector, never through a shell, so prompt
-        // content cannot inject additional commands.
+        // content (and the folded system text above) cannot inject additional
+        // commands.
         let mut command = Command::new(&self.binary_path);
         command.args(&self.args);
-        if let Some(system) = system {
-            command.arg("--system").arg(system);
+        if let Some((flag, value)) = &system_flag {
+            command.arg(flag).arg(value);
         }
-        command.arg(prompt);
+        command.arg(effective_prompt);
         command.kill_on_drop(true);
 
         let output = command
@@ -118,26 +148,54 @@ mod tests {
 
     #[test]
     fn rejects_a_nonexistent_path() {
-        let err = LocalBinaryProvider::new("fake", "./definitely/not/here/binary", vec![], "m")
-            .unwrap_err()
-            .to_string();
+        let err =
+            LocalBinaryProvider::new("fake", "./definitely/not/here/binary", vec![], "m", None)
+                .unwrap_err()
+                .to_string();
         assert!(err.contains("does not exist"), "unexpected error: {err}");
     }
 
     #[test]
     fn rejects_an_empty_path() {
-        assert!(LocalBinaryProvider::new("fake", "  ", vec![], "m").is_err());
+        assert!(LocalBinaryProvider::new("fake", "  ", vec![], "m", None).is_err());
     }
 
     #[test]
     fn bare_command_names_are_allowed_and_resolved_by_path() {
         // `gh` may not be installed in CI, but a bare name is a legitimate config.
-        assert!(LocalBinaryProvider::new("gh", "gh", vec!["copilot".into()], "m").is_ok());
+        assert!(LocalBinaryProvider::new("gh", "gh", vec!["copilot".into()], "m", None).is_ok());
     }
 
     #[test]
     fn cli_tools_count_as_remote_for_classified_mode() {
-        let p = LocalBinaryProvider::new("gh", "gh", vec![], "copilot").unwrap();
+        let p = LocalBinaryProvider::new("gh", "gh", vec![], "copilot", None).unwrap();
         assert!(p.is_remote());
+    }
+
+    #[test]
+    fn a_cli_with_a_system_flag_gets_a_dedicated_argument_pair() {
+        // This is the `claude` shape: `--system-prompt <text>` plus the prompt.
+        let (flag, prompt) = compose_call(Some("--system-prompt"), Some("be terse"), "hi");
+        assert_eq!(
+            flag,
+            Some(("--system-prompt".to_string(), "be terse".to_string()))
+        );
+        assert_eq!(prompt, "hi");
+    }
+
+    #[test]
+    fn a_cli_with_no_system_flag_folds_the_system_text_into_the_prompt() {
+        // This is the `gemini` shape: no system channel at all, so the swarm ledger
+        // and delegation protocol end up in the user message.
+        let (flag, prompt) = compose_call(None, Some("be terse"), "hi");
+        assert!(flag.is_none());
+        assert_eq!(prompt, "be terse\n\nhi");
+    }
+
+    #[test]
+    fn no_system_text_leaves_the_prompt_untouched_regardless_of_flag_support() {
+        let (flag, prompt) = compose_call(Some("--system-prompt"), None, "hi");
+        assert!(flag.is_none());
+        assert_eq!(prompt, "hi");
     }
 }

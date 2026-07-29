@@ -10,6 +10,7 @@ pub mod app;
 pub mod audit;
 pub mod config;
 pub mod orchestrator;
+pub mod picker;
 pub mod providers;
 pub mod security;
 pub mod skills;
@@ -130,15 +131,41 @@ fn auth(service: &str, delete: bool, settings: &Settings) -> Result<()> {
 }
 
 async fn list_models(settings: &Settings, classified: bool) -> Result<()> {
-    let registry = Registry::build(settings, None, classified).await?;
-    println!("Reachable models:");
-    for label in registry.labels() {
-        let marker = if label == registry.primary() {
-            "*"
-        } else {
-            " "
-        };
-        println!("  {marker} {label}");
+    // Discovery, not construction: this must show every reachable model, including
+    // ones the picker has not enabled, distinguishing the two — not just the
+    // filtered set `Registry::build` would actually connect.
+    let candidates = crate::orchestrator::discover_candidates(settings, classified).await;
+    let first_run = settings.connections.is_empty();
+
+    println!("Reachable models ([x] connected, [ ] available but not connected):");
+    let mut any = false;
+    for candidate in &candidates {
+        for option in &candidate.transports {
+            if !option.availability.is_available() {
+                continue;
+            }
+            any = true;
+            let label = crate::orchestrator::candidate_label(candidate, option, settings);
+            let enabled = first_run
+                || settings
+                    .connections
+                    .get(&candidate.id)
+                    .is_some_and(|c| c.enabled && c.transport == option.transport);
+            let checkbox = if enabled { "[x]" } else { "[ ]" };
+            // Only the row actually enabled with this transport can be the
+            // commander — a vendor with both a CLI and an API row must not show
+            // "(commander)" on both just because the id matches.
+            let commander =
+                if enabled && settings.commander.as_deref() == Some(candidate.id.as_str()) {
+                    "  (commander)"
+                } else {
+                    ""
+                };
+            println!("  {checkbox} {label}{commander}");
+        }
+    }
+    if !any {
+        println!("  (none)");
     }
     Ok(())
 }
@@ -156,18 +183,38 @@ async fn chat(
     model: Option<&str>,
     classified: bool,
 ) -> Result<()> {
-    let registry = Registry::build(settings, model, classified).await?;
+    let mut settings = settings.clone();
+
+    // `-m <label>` bypasses the picker entirely (scripted / non-interactive use),
+    // using the saved connection set with `<label>` forced as commander. Otherwise
+    // the picker opens first and its choice is what gets connected.
+    if model.is_none() {
+        match ui::pick_connections(&mut settings, classified).await? {
+            true => settings.save(paths)?,
+            false => return Ok(()), // user quit from the picker
+        }
+    }
+
+    let registry = Registry::build(&settings, model, classified).await?;
     let primary = registry.primary().to_string();
     let roster = registry.labels();
 
     let (command_tx, command_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::channel(64);
 
-    let orchestrator = Orchestrator::new(registry, paths, event_tx)?;
+    let orchestrator = Orchestrator::new(registry, paths, classified, event_tx)?;
     let worker = tokio::spawn(orchestrator.run(command_rx));
 
     let app = App::new(primary, &roster);
-    let result = ui::run(app, command_tx, event_rx).await;
+    let result = ui::run(
+        app,
+        command_tx,
+        event_rx,
+        settings,
+        paths.clone(),
+        classified,
+    )
+    .await;
 
     // Let the orchestrator finish its shutdown audit entry before the process exits.
     let _ = worker.await;

@@ -1,12 +1,12 @@
 [package]
-name = "multichat"
+name = "simon"
 version = "0.1.0"
 edition = "2024"
 description = "Zero-trust terminal chat for local and cloud LLMs"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "multichat"
+name = "simon"
 path = "src/main.rs"
 
 [dependencies]

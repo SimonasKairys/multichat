@@ -111,7 +111,7 @@ impl Registry {
 
         if providers.is_empty() {
             return Err(anyhow!(
-                "no models are reachable.{} Start Ollama, or run `multichat auth anthropic` \
+                "no models are reachable.{} Start Ollama, or run `simon auth anthropic` \
                  to store a cloud key.",
                 if classified {
                     " Classified mode permits local models only."

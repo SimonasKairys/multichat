@@ -1,4 +1,4 @@
-# multichat
+# simon
 
 A terminal chat client for local and cloud LLMs, with multiple models able to delegate
 work to each other in one session.
@@ -16,18 +16,18 @@ Requires a recent stable Rust toolchain (see `rust-toolchain.toml`).
 
 ```sh
 cargo build --release
-./target/release/multichat --help
+./target/release/simon --help
 ```
 
 ## Use
 
 ```sh
-multichat models                 # list every model this machine can reach
-multichat auth anthropic         # store an API key (prompts; never pass it as an argument)
-multichat chat                   # start the TUI with the first available model
-multichat chat -m ollama:llama3  # pick a commander explicitly
-multichat chat --classified      # local models only, no network egress
-multichat audit                  # verify the audit log's hash chain
+simon models                 # list every model this machine can reach
+simon auth anthropic         # store an API key (prompts; never pass it as an argument)
+simon chat                   # start the TUI with the first available model
+simon chat -m ollama:llama3  # pick a commander explicitly
+simon chat --classified      # local models only, no network egress
+simon audit                  # verify the audit log's hash chain
 ```
 
 `-m` accepts a full label (`ollama:llama3`), a bare model name (`llama3`), or a provider
@@ -50,7 +50,7 @@ endpoint.
 
 ### Configuration
 
-`config.json` lives in the platform data directory (override with `MULTICHAT_DATA_DIR`):
+`config.json` lives in the platform data directory (override with `SIMON_DATA_DIR`):
 
 ```json
 {
@@ -97,7 +97,7 @@ Be precise about what exists. This table is the source of truth; the numbered fi
 - **Tamper-evident audit log** — a chain of JSON entries, each carrying a keyed
   `Blake2s256` MAC over the previous entry. The key lives in the OS keyring, so writing
   the log file is not enough to forge it. Recovers the chain head across restarts.
-  `multichat audit` verifies the whole file.
+  `simon audit` verifies the whole file.
 - **`--classified`** — refuses any provider whose traffic leaves the machine, and
   requires memory locking to succeed rather than warning.
 - **Memory locking** — `mlockall` on Linux; per-allocation `mlock`/`VirtualLock` for
@@ -147,6 +147,9 @@ cargo audit
 CI runs all of the above on Linux, Windows, and macOS, plus the unsafe-boundary check.
 
 ## History
+
+**On the name:** the command, package, and on-disk state are all `simon`. The git
+repository is still called `multichat`, after the Python project that used to live here.
 
 The repository previously held a Python/FastAPI implementation, replaced by this Rust
 one in commit `9a51fc6`. That version is recoverable at commit `06c6c76`.

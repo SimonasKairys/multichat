@@ -1613,34 +1613,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "multichat"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "anyhow",
- "argon2",
- "async-trait",
- "blake2",
- "clap",
- "crossterm 0.28.1",
- "directories",
- "futures",
- "keyring",
- "libc",
- "ratatui",
- "reqwest",
- "rpassword",
- "secrecy",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "windows-sys 0.59.0",
- "zeroize",
-]
-
-[[package]]
 name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2657,6 +2629,34 @@ checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
  "errno",
  "libc",
+]
+
+[[package]]
+name = "simon"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "argon2",
+ "async-trait",
+ "blake2",
+ "clap",
+ "crossterm 0.28.1",
+ "directories",
+ "futures",
+ "keyring",
+ "libc",
+ "ratatui",
+ "reqwest",
+ "rpassword",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

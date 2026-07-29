@@ -1,4 +1,4 @@
-//! multichat — zero-trust terminal chat for local and cloud models.
+//! simon — zero-trust terminal chat for local and cloud models.
 //!
 //! `unsafe` is denied crate-wide. The single audited exception is `src/security.rs`,
 //! which wraps the platform memory-locking syscalls; a CI job rejects that override if it
@@ -28,7 +28,7 @@ use crate::orchestrator::{Orchestrator, Registry};
 use crate::security::Hardening;
 
 #[derive(Parser)]
-#[command(name = "multichat", author, version, about, long_about = None)]
+#[command(name = "simon", author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,

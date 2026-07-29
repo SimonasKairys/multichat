@@ -12,6 +12,12 @@
 > the current tree builds clean, passes 65 tests, is clippy- and `cargo audit`-clean, and
 > the binary has been run. Current status: `README.md` → "Security posture" and
 > `docs/progress/22_status.md`.
+>
+> One resolution differs from what this document assumed. The "Name mismatch" finding was
+> settled in favour of **`simon`**, not `multichat`: the package, binary, data directory,
+> keyring namespace, and `SIMON_DATA_DIR` all use it. The git repository is still named
+> `multichat`. References to `multichat` below describe the state at `9a51fc6` and the
+> deleted Python package, and are left as written.
 
 ---
 

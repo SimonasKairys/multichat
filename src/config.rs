@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 /// Keyring service namespace. Kept distinct per credential kind so an API key can
 /// never be read back through the audit-key entry or vice versa.
-const KEYRING_PREFIX: &str = "multichat";
+const KEYRING_PREFIX: &str = "simon";
 const DEFAULT_KEYRING_USER: &str = "default";
 
 /// Resolved on-disk locations. Every module that persists state takes its path from
@@ -27,13 +27,13 @@ pub struct Paths {
 impl Paths {
     /// Resolves the per-user application directories, creating them if absent.
     pub fn resolve() -> Result<Self> {
-        let dirs = ProjectDirs::from("", "", "multichat")
+        let dirs = ProjectDirs::from("", "", "simon")
             .context("could not determine a home directory for this user")?;
         Self::from_data_dir(dirs.data_dir().to_path_buf())
     }
 
     /// Builds paths rooted at an explicit directory. Used by tests and by
-    /// `MULTICHAT_DATA_DIR` overrides.
+    /// `SIMON_DATA_DIR` overrides.
     pub fn from_data_dir(data_dir: PathBuf) -> Result<Self> {
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("failed to create data directory {}", data_dir.display()))?;
@@ -52,9 +52,9 @@ impl Paths {
         })
     }
 
-    /// Honours `MULTICHAT_DATA_DIR` when set, otherwise the platform default.
+    /// Honours `SIMON_DATA_DIR` when set, otherwise the platform default.
     pub fn resolve_with_env() -> Result<Self> {
-        match std::env::var_os("MULTICHAT_DATA_DIR") {
+        match std::env::var_os("SIMON_DATA_DIR") {
             Some(dir) => Self::from_data_dir(PathBuf::from(dir)),
             None => Self::resolve(),
         }

@@ -134,7 +134,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     let history = Paragraph::new(app.body())
         .wrap(Wrap { trim: false })
         .scroll((app.scroll, 0))
-        .block(Block::default().title(" multichat ").borders(Borders::ALL));
+        .block(Block::default().title(" simon ").borders(Borders::ALL));
     frame.render_widget(history, chunks[0]);
 
     let style = if app.busy {

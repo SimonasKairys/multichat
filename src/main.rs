@@ -108,7 +108,7 @@ fn auth(service: &str, delete: bool, settings: &Settings) -> Result<()> {
 
     if settings.endpoint(service).is_none() {
         bail!(
-            "unknown provider `{service}`. Built-in providers: anthropic, openai, \
+            "unknown provider `{service}`. Built-in providers: anthropic, openai, google, \
              openrouter, groq. Add others under `custom_endpoints` in config.json."
         );
     }

@@ -282,7 +282,7 @@ async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate
 fn discover_vendors(settings: &Settings, classified: bool) -> Vec<Candidate> {
     let cli_tools = detect_cli_tools(settings);
 
-    let mut ids: Vec<String> = ["anthropic", "openai", "openrouter", "groq"]
+    let mut ids: Vec<String> = ["anthropic", "openai", "google", "openrouter", "groq"]
         .iter()
         .map(|s| s.to_string())
         .chain(settings.custom_endpoints.keys().cloned())

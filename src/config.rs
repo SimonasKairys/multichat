@@ -112,6 +112,14 @@ pub fn builtin_endpoint(provider: &str) -> Option<CloudEndpoint> {
             base_url: "https://api.openai.com/v1".into(),
             default_model: "gpt-4o".into(),
         },
+        // Google's OpenAI-compatible surface, so this needs no new `Api` variant.
+        // Shares the `google` connection id with the `gemini` CLI (see
+        // `cli_vendor_id`), which gives the picker paired "via CLI" / "via API" rows.
+        "google" | "gemini" => CloudEndpoint {
+            api: Api::OpenAiCompatible,
+            base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+            default_model: "gemini-2.5-pro".into(),
+        },
         "openrouter" => CloudEndpoint {
             api: Api::OpenAiCompatible,
             base_url: "https://openrouter.ai/api/v1".into(),

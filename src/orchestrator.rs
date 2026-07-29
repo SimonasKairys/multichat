@@ -131,20 +131,23 @@ fn cli_vendor_id(binary_name: &str) -> String {
     match binary_name {
         "claude" => "anthropic".to_string(),
         "gemini" => "google".to_string(),
+        // `agy` (Antigravity) deliberately gets its own id rather than sharing
+        // `google`: it is a gateway that serves Gemini, Claude and gpt-oss models
+        // alike, so pairing it with the Gemini API row would misrepresent it.
         other => other.to_string(),
     }
 }
 
 /// Args and system-prompt flag for a CLI this build knows how to auto-detect.
-/// Verified against `--help` output on this machine for `claude` and `gemini`:
-/// `claude` takes `--system-prompt <prompt>`; `gemini` has no system flag at all, so
-/// its system text is folded into the prompt (see `LocalBinaryProvider::send`). The
-/// other two (`codex`, `llm`) are unverified best guesses treated the same as
-/// `gemini` until someone confirms their real flags.
+/// Verified against `--help` and a live call on this machine:
+/// `claude` takes `--system-prompt <prompt>`; `agy` (Antigravity) has `-p` but no
+/// system flag at all, so its system text is folded into the prompt (see
+/// `LocalBinaryProvider::send`). `codex` and `llm` are unverified best guesses,
+/// treated the same as `agy` until someone confirms their real flags.
 fn known_cli_default(binary_name: &str) -> (Vec<String>, Option<String>) {
     match binary_name {
         "claude" => (vec!["-p".into()], Some("--system-prompt".into())),
-        "gemini" => (vec!["-p".into()], None),
+        "agy" => (vec!["-p".into()], None),
         _ => (Vec::new(), None),
     }
 }
@@ -153,7 +156,11 @@ fn known_cli_default(binary_name: &str) -> (Vec<String>, Option<String>) {
 /// explicitly in `local_binaries` (which always wins), plus anything from the known
 /// list found on `PATH`.
 fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
-    const KNOWN: &[&str] = &["claude", "gemini", "codex", "llm"];
+    // `gemini` is deliberately absent: Google retired free Code Assist for
+    // individuals on that CLI's OAuth login, so auto-detecting it only ever produced
+    // a row that failed on first use. `agy` is its replacement. A user who still has
+    // a working `gemini` can add it under `local_binaries`, which always wins.
+    const KNOWN: &[&str] = &["claude", "agy", "codex", "llm"];
     let mut found = Vec::new();
     let mut configured = std::collections::BTreeSet::new();
 
@@ -992,6 +999,18 @@ mod tests {
         assert_eq!(cli_vendor_id("claude"), "anthropic");
         assert_eq!(cli_vendor_id("gemini"), "google");
         assert_eq!(cli_vendor_id("codex"), "codex");
+        // `agy` is a multi-vendor gateway, so it stands alone rather than folding
+        // into `google` the way the old `gemini` CLI did.
+        assert_eq!(cli_vendor_id("agy"), "agy");
+    }
+
+    #[test]
+    fn agy_is_auto_detected_with_print_mode_and_no_system_flag() {
+        let (args, system_arg) = known_cli_default("agy");
+        assert_eq!(args, vec!["-p".to_string()]);
+        // Verified against `agy --help` on this machine: there is no system-prompt
+        // flag, so the system text has to be folded into the prompt.
+        assert!(system_arg.is_none());
     }
 
     #[tokio::test]

@@ -2,15 +2,26 @@
 
 **Location:** `docs/progress/`
 
+> **`22_status.md` is authoritative.** Files `01`–`14` are plans written before the code
+> existed; several describe features that were never built. Where a plan and `22` (or the
+> README's "Security posture" section) disagree, `22` is correct. Do not read a numbered
+> file as a statement of what the code does today.
+
 ## Rules
 1. **Size Limit**: Each file MUST be NO MORE than 500 characters (symbols).
 2. **Structure**: Split logs logically by topic (e.g., plan, steps, implemented features, errors).
 3. **Format**: Markdown. Can contain references to code, schemas, and file links.
-4. **Maintenance**: Create new files sequentially (e.g., `05_ui_update.md`) rather than appending to old ones to avoid exceeding the character limit.
-5. **Verification**: Every single change or step must be explicitly verified (e.g., via `cargo check`, `cargo test`, or manual verification) before proceeding to the next step.
+4. **Maintenance**: Create new files sequentially rather than appending to old ones.
+5. **Verification**: Every change must be verified (`cargo test`, `cargo clippy`, or a
+   manual run) *before* it is recorded here. Record what was actually verified — "cargo
+   check passes" is not evidence that a feature works, only that it type-checks.
+6. **No completion claims without a caller.** A module that compiles but is never called
+   is scaffolding, not a feature. Say so.
 
 ## Current Files
-- `01_plan_overview.md`: High-level architecture and zero-trust goals.
-- `02_plan_steps.md`: Step-by-step development roadmap.
-- `03_implemented.md`: Record of successfully completed work.
-- `04_mistakes_errors.md`: Debugging logs, encountered issues, and their fixes.
+- `01`–`02`: plan and roadmap.
+- `03`–`04`: early implementation notes and error log.
+- `05`–`14`: architecture and security decisions (aspirational; see the note above).
+- `15`–`21`: per-step implementation records, corrected after the audit.
+- `22_status.md`: **authoritative** implemented / not-implemented status.
+- `../AUDIT.md`: full audit of the initial Rust commit.

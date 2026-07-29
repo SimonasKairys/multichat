@@ -1,5 +1,5 @@
-# Final Architectural Decisions
-1. **History Storage**: Encrypted Vault (AES-256-GCM) unlocked via Master Password.
-2. **Data Firewall**: Activated via startup flag (e.g., `multichat --classified`). Strictly disables outbound network access.
-3. **Cross-Platform**: OS security abstraction (Linux/macOS `mlock`, Windows `VirtualLock`).
-4. **Updates**: Manual updates only via verified cryptographic hashes to prevent supply-chain attacks.
+# Architecture Decisions (corrected)
+1. **History**: encrypted vault (AES-256-GCM + Argon2id) — shipped.
+2. **Data firewall**: `--classified` shipped; refuses remote providers rather than filtering sockets.
+3. **Cross-platform**: Linux gets process-wide `mlockall`. macOS returns ENOSYS, Windows has no equivalent, so both lock key material per allocation. `--classified` refuses to start without the process-wide guarantee.
+4. **Updates**: manual only; no updater exists.

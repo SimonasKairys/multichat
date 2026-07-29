@@ -1,5 +1,6 @@
-# Implementation: Step 5 (TUI / Ratatui)
-- **Implemented**: `src/ui/mod.rs` sets up a robust `crossterm` raw mode terminal.
-- **Implemented**: `ratatui` event loop built to draw UI blocks and handle keyboard polling cleanly.
-- **Implemented**: Integrated into `main.rs` to spawn the terminal UI upon `multichat chat` command execution.
-- **Verified**: Builds successfully without unsafe memory warnings.
+# Step 5: TUI (corrected)
+- ratatui 0.29 / crossterm 0.28, `tokio::select!` over input and the orchestrator event channel.
+- **Fixed**: input reaches a model. The previous loop replied `Acknowledged: {msg}` from a hardcoded string and never called a provider.
+- `TerminalGuard` restores the terminal on drop, so a panic cannot strand the user in raw mode.
+- Per-model attribution, scrolling, busy state.
+- Verified: 7 tests.

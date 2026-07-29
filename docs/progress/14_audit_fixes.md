@@ -1,5 +1,5 @@
-# Audit Fixes Integration
-1. **Proxy Support**: SOCKS5 and HTTPS enterprise proxy support mandated for all outbound Cloud API requests.
-2. **Vault Security**: Auto-wipe/Anti-brute-force protocol implemented for the Master Password vault (5 attempts max or 24hr idle).
-3. **Audit Logging**: Local, append-only, cryptographically signed compliance log tracking session classifications and provider usage.
-4. **Stream Interceptor**: Buffer added to SSE parsing to intercept ReAct tool calls mid-stream.
+# Audit Fixes (corrected)
+1. **Proxy**: shipped. reqwest `socks` feature enabled, so `ALL_PROXY=socks5://…` works alongside `HTTP(S)_PROXY`.
+2. **Vault**: wipe after 5 failed unlocks or 24h idle — shipped. Caveat: the counter is in the protected file, so a copy resets it.
+3. **Audit log**: keyed Blake2s **MAC** chain, not a signature — the keyring holder can forge, so it proves local integrity only.
+4. **Stream interceptor**: NOT implemented; responses are non-streaming.

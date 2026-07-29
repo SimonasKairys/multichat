@@ -1,27 +1,52 @@
 [package]
-name = "simon"
+name = "multichat"
 version = "0.1.0"
 edition = "2024"
+description = "Zero-trust terminal chat for local and cloud LLMs"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "multichat"
+path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-ratatui = "0.26"
-crossterm = { version = "0.27", features = ["event-stream"] }
+tokio = { version = "1", features = ["full"] }
+ratatui = "0.30"
+crossterm = { version = "0.28", features = ["event-stream"] }
 clap = { version = "4.5", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-keyring = "2.3"
+reqwest = { version = "0.12", features = [
+    "json",
+    "rustls-tls",
+    "socks",
+], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Default feature `v1` enables the native store for each platform (Keychain, Windows
+# Credential Manager, Secret Service).
+keyring = "4"
 secrecy = "0.8"
-anyhow = "1.0"
-directories = "5.0"
-thiserror = "1.0"
+anyhow = "1"
+directories = "5"
+thiserror = "1"
 aes-gcm = "0.10"
 argon2 = "0.5"
-rand = "0.8"
 blake2 = "0.10"
-async-trait = "0.1.80"
+async-trait = "0.1"
 futures = "0.3"
+rpassword = "7"
+zeroize = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_System_Memory",
+    "Win32_Foundation",
+] }
+
+[dev-dependencies]
+tempfile = "3"

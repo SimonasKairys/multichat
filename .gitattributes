@@ -1,0 +1,12 @@
+# Normalise line endings in the repository to LF. Without this, files committed from
+# Windows land as CRLF and `cargo fmt --check` on the Linux CI runner can disagree with
+# a working tree that is clean locally.
+* text=auto eol=lf
+
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+
+Cargo.lock text eol=lf merge=binary

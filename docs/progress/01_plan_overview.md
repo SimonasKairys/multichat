@@ -1,10 +1,9 @@
-# Final Plan Overview
-Goal: `multichat`, zero-trust Rust terminal chat (TUI) for local/cloud models.
-Architecture: Modular providers (Ollama, Cloud, Subprocess).
-Security (Military Grade):
-- `mlock` swap protection.
-- Encrypted vault (master password).
-- TLS Certificate Pinning.
-- `seccomp` sandbox.
-- Air-gap routing for `[TOP SECRET]` chats.
-Ref: plan.md in artifacts.
+# Plan Overview (goals; `22_status.md` = what shipped)
+Goal: zero-trust Rust TUI chat for local/cloud models.
+Providers: Ollama, Cloud, Subprocess.
+Security goals:
+- `mlock` swap protection — shipped (Linux process-wide, per-alloc elsewhere).
+- Encrypted vault — shipped.
+- TLS cert pinning — NOT implemented (breaks on cert rotation).
+- `seccomp` sandbox — NOT implemented.
+- Air-gap via `--classified` — shipped.

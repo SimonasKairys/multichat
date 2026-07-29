@@ -1,3 +1,10 @@
-# Permissions Policy Update
-1. **Default Unlimited**: By default, ALL models have FULL read/write/execute permissions across the system. No read-only limits or path sandboxes are enforced initially.
-2. **Opt-in Restrictions**: The user can actively restrict these permissions (e.g., locking down to read-only or a specific chroot folder) when starting the chat session via CLI flags or TUI config.
+# Permissions Policy (corrected)
+
+The original text ("ALL models have FULL read/write/execute permissions") contradicted
+`01`/`05`/`07` and was never built.
+
+**Actual**: models have no filesystem or execution access. The only outward paths are the
+read-only, traversal-guarded skills dir and local CLI providers the user configures in
+`config.json`. Model output cannot add one.
+
+Future tool execution must be opt-in, never default-allow.

@@ -1,90 +1,153 @@
-use crate::app::{App, AppEvent};
-use anyhow::Result;
+//! Ratatui front end. Owns the terminal, forwards input to the orchestrator, and
+//! renders events coming back.
+
+use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{
+        DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyCode,
+        KeyEventKind, KeyModifiers,
+    },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, Paragraph},
-    Terminal,
+    style::{Color, Style},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
-use std::io;
+use std::io::{self, Stdout};
+use tokio::sync::mpsc;
 
-pub async fn run_tui() -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+use crate::app::App;
+use crate::orchestrator::{Command, Event};
 
-    let mut app = App::new();
-    let mut reader = crossterm::event::EventStream::new();
+/// Restores the terminal on drop, so a panic or an early `?` cannot leave the user in
+/// raw mode with no echo.
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed to enable raw mode")?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        Ok(Self { terminal })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            LeaveAlternateScreen,
+            DisableMouseCapture
+        );
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+/// Runs the TUI until the user quits or the orchestrator closes its event channel.
+pub async fn run(
+    mut app: App,
+    commands: mpsc::Sender<Command>,
+    mut events: mpsc::Receiver<Event>,
+) -> Result<()> {
+    let mut guard = TerminalGuard::enter()?;
+    let mut input = EventStream::new();
 
     loop {
-        terminal.draw(|f| {
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(3)].as_ref())
-                .split(f.size());
-
-            let history_text = app.messages.join("\n");
-            let history_block = Paragraph::new(history_text)
-                .block(Block::default().title("Multichat History").borders(Borders::ALL));
-            f.render_widget(history_block, chunks[0]);
-
-            let input_text = format!("> {}", app.input);
-            let input_block = Paragraph::new(input_text)
-                .block(Block::default().title("Input (Press Enter to send, Esc to quit)").borders(Borders::ALL));
-            f.render_widget(input_block, chunks[1]);
-        })?;
+        guard.terminal.draw(|frame| draw(frame, &app))?;
 
         tokio::select! {
-            Some(Ok(evt)) = reader.next().fuse() => {
-                if let Event::Key(key) = evt {
-                    if key.kind == KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Esc => {
-                                break;
-                            }
-                            KeyCode::Char(c) => {
-                                app.handle_key_char(c);
-                            }
-                            KeyCode::Backspace => {
-                                app.handle_backspace();
-                            }
-                            KeyCode::Enter => {
-                                if let Some(msg) = app.submit_input() {
-                                    // Send to background swarm orchestrator (mocked here for now)
-                                    // Normally we would tx.send(AppEvent::UiInput(msg)) and await it.
-                                    app.add_agent_response(&format!("Acknowledged: {}", msg));
-                                }
-                            }
-                            _ => {}
-                        }
+            maybe_term = input.next() => {
+                match maybe_term {
+                    Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => {
+                        handle_key(&mut app, key.code, key.modifiers, &commands).await;
                     }
+                    // Ignore resize/mouse/focus events; the next draw picks up the size.
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        app.apply(Event::Error(format!("input error: {e}")));
+                    }
+                    None => break,
                 }
             }
-            Some(app_event) = app.ui_rx.recv() => {
-                match app_event {
-                    AppEvent::AgentResponse(msg) => app.add_agent_response(&msg),
-                    AppEvent::Quit => break,
-                    _ => {}
+            maybe_event = events.recv() => {
+                match maybe_event {
+                    Some(event) => app.apply(event),
+                    // Orchestrator shut down; nothing more can arrive.
+                    None => break,
                 }
             }
         }
+
+        if app.should_quit {
+            break;
+        }
     }
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
+    let _ = commands.send(Command::Shutdown).await;
     Ok(())
+}
+
+async fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    commands: &mpsc::Sender<Command>,
+) {
+    match code {
+        KeyCode::Esc => app.should_quit = true,
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.should_quit = true;
+        }
+        KeyCode::Enter => {
+            if let Some(prompt) = app.submit() {
+                // A full channel means the orchestrator is backed up; report rather
+                // than silently dropping the user's message.
+                if commands.send(Command::Prompt(prompt)).await.is_err() {
+                    app.apply(Event::Error("orchestrator is not running".into()));
+                    app.busy = false;
+                }
+            }
+        }
+        KeyCode::Backspace => app.backspace(),
+        KeyCode::PageUp => app.scroll_up(),
+        KeyCode::PageDown => app.scroll_down(),
+        KeyCode::Char(c) => app.push_char(c),
+        _ => {}
+    }
+}
+
+fn draw(frame: &mut ratatui::Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(frame.area());
+
+    let history = Paragraph::new(app.body())
+        .wrap(Wrap { trim: false })
+        .scroll((app.scroll, 0))
+        .block(Block::default().title(" multichat ").borders(Borders::ALL));
+    frame.render_widget(history, chunks[0]);
+
+    let style = if app.busy {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+    let input = Paragraph::new(format!("> {}", app.input))
+        .style(style)
+        .block(
+            Block::default()
+                .title(format!(" {} ", app.status_line()))
+                .borders(Borders::ALL),
+        );
+    frame.render_widget(input, chunks[1]);
 }

@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Build release
+        run: cargo build --release
+
+  unsafe-boundary:
+    name: unsafe confined to security.rs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The crate root sets `#![deny(unsafe_code)]`. `forbid` is not usable there
+      # because the FFI in security.rs needs a local override, and `forbid` is by
+      # design not overridable. This job supplies the missing half of the guarantee:
+      # the override may exist in exactly one audited file.
+      # Matches the attribute form as a fixed string, so prose in a doc comment that
+      # merely mentions the override does not trip the job.
+      - name: Reject unsafe_code overrides outside src/security.rs
+        run: |
+          offenders=$(grep -rlnF '#![allow(unsafe_code)]' src/ | grep -v '^src/security.rs$' || true)
+          if [ -n "$offenders" ]; then
+            echo "unsafe_code is allowed outside the audited module:"
+            echo "$offenders"
+            exit 1
+          fi
+          echo "OK: unsafe_code override confined to src/security.rs"
+
+  progress-doc-limit:
+    name: progress docs within 500 chars
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # docs/progress/README.md rule 1 caps each log at 500 characters. It was being
+      # enforced by nobody, so it drifted.
+      - name: Check character limits
+        run: |
+          status=0
+          for f in docs/progress/*.md; do
+            [ "$(basename "$f")" = "README.md" ] && continue
+            n=$(wc -m < "$f")
+            if [ "$n" -gt 500 ]; then
+              echo "$f is $n characters (limit 500)"
+              status=1
+            fi
+          done
+          exit $status
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Advisory scan
+        run: cargo audit --deny warnings

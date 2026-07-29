@@ -1,5 +1,6 @@
-# Implementation: Step 2 (Encrypted Vault)
-- **Implemented**: `src/vault.rs` uses AES-256-GCM for encryption.
-- **Implemented**: `Argon2` handles secure Key Derivation from a Master Password.
-- **Implemented**: Appends 12-byte cryptographically secure nonce to the vault payload.
-- **Verified**: Fixed compiler error with `SaltString`, now `cargo check` fully passes.
+# Step 2: Encrypted Vault (corrected)
+- AES-256-GCM, Argon2id.
+- **Fixed**: the salt is generated and stored in the file header. It was previously a caller argument that was never persisted, so a saved vault could not be reopened.
+- Magic/version/salt bound as AEAD associated data; wipe after 5 wrong passwords or 24h idle; atomic writes.
+- **Limit**: the attempt counter lives in the protected file, so a copy resets it.
+- Verified: 7 tests.

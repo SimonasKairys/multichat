@@ -1,5 +1,5 @@
-# Implementation: Step 1 (Security Foundation)
-- **Implemented**: `src/security.rs` created with `mlockall` (Linux memory locking) to protect API keys from swapping to disk, and a `seccomp` sandbox foundation.
-- **Implemented**: `main.rs` updated to invoke the security enforcers BEFORE parsing any CLI args or taking network action.
-- **Implemented**: Added global `#![deny(unsafe_code)]` with a strict override ONLY for the audited `src/security.rs` FFI file.
-- **Verified**: `cargo check` passes.
+# Step 1: Security Foundation (corrected)
+- `mlockall` process-wide on Linux only. Windows/macOS lack an equivalent, so key material is locked per allocation (`mlock`/`VirtualLock`) and zeroized on drop.
+- **Fixed**: args parse *before* hardening, and lock failure warns instead of aborting — it hard-fails only under `--classified`. Previously `--help` aborted on any unprivileged Linux box.
+- **NOT implemented**: seccomp; it reports itself unavailable.
+- Verified: 65 tests.

@@ -1,1 +1,29 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
+*.pdb
+
+# Secrets and local configuration — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+vault.enc
+audit.log
+
+# Databases
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*~
+Thumbs.db
+.DS_Store

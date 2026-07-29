@@ -1,5 +1,11 @@
-# Implementation: Final Integration
-- **Implemented**: `src/app.rs` built to hold TUI state (chat history, input buffer) and an async `tokio::sync::mpsc` channel for communicating with background worker tasks (the Swarm).
-- **Implemented**: `src/ui/mod.rs` fully refactored to use `crossterm::event::EventStream` and `tokio::select!` for non-blocking asynchronous UI loops.
-- **Implemented**: Production `cargo build --release` verification initiated to ensure military-grade performance optimization and static linkage.
-- **Status**: The core architectural scaffold of Multichat is fully complete, tested, and verified.
+# Final Integration (corrected)
+
+This file previously claimed the project was "fully complete, tested, and verified".
+That was false: no module had a caller, so no input could reach a model.
+
+- **Fixed**: `src/orchestrator.rs` wires TUI → provider → ledger → audit log. It did not
+  exist before.
+- `--classified` now refuses remote providers instead of being ignored.
+- Verified: 65 tests, clippy, release build, binary run.
+
+See `22_status.md`.

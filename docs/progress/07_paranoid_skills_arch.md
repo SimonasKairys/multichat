@@ -1,5 +1,5 @@
-# Paranoid Security & Shared Context
-1. **Shared Skills Dir**: Unified `~/.config/multichat/skills/` accessible by ALL models.
-2. **Path Traversal Protection**: Models can only READ this directory. Strict chroot/path validation prevents them from accessing `~/.ssh` or outside files.
-3. **Supply Chain Defense**: `Cargo.lock` enforced. `#![forbid(unsafe_code)]` at project level. `cargo-audit` required for CI.
-4. **Clipboard Security**: App will clear OS clipboard after a timeout if used.
+# Skills & Supply Chain (corrected)
+1. **Skills dir**: shipped at `<data dir>/skills`, read-only.
+2. **Path traversal**: shipped — `..`, absolute paths, escaping symlinks rejected (canonicalize + prefix check).
+3. **Supply chain**: `Cargo.lock` committed; `cargo-audit` in CI. Crate uses `#![deny(unsafe_code)]`, not `forbid` — forbid is not overridable and the FFI needs one override. CI rejects it outside `src/security.rs`.
+4. **Clipboard clearing**: NOT implemented.

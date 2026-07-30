@@ -96,10 +96,6 @@ impl App {
                 speaker: Speaker::System,
                 text: format!("{from} delegated to {to}"),
             }),
-            Event::Status(text) => self.transcript.push(Line {
-                speaker: Speaker::System,
-                text,
-            }),
             Event::Error(text) => self.transcript.push(Line {
                 speaker: Speaker::Error,
                 text,

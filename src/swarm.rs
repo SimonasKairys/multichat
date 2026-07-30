@@ -7,6 +7,11 @@ pub enum TaskStatus {
     Todo,
     InProgress,
     Done,
+    /// The sub-agent call errored out (transport failure, non-zero exit, timeout, …).
+    /// Distinct from `InProgress` so a dead task doesn't sit on the blackboard looking
+    /// like it is still being worked — other models read this ledger as fact and would
+    /// otherwise wait forever on something that already failed.
+    Failed,
 }
 
 impl TaskStatus {
@@ -15,6 +20,7 @@ impl TaskStatus {
             TaskStatus::Todo => "[TODO]",
             TaskStatus::InProgress => "[IN_PROGRESS]",
             TaskStatus::Done => "[DONE]",
+            TaskStatus::Failed => "[FAILED]",
         }
     }
 }
@@ -25,6 +31,10 @@ pub struct Task {
     pub description: String,
     pub assigned_to: Option<String>,
     pub status: TaskStatus,
+    /// The sub-agent's reply on success, or the error text on failure. `None` until
+    /// the delegation resolves. Rendered in the ledger so the delegating model can see
+    /// what came back — or, for a failure, why it failed and whether to retry.
+    pub result: Option<String>,
 }
 
 /// A delegation request parsed out of a model's plain-text reply.
@@ -32,6 +42,42 @@ pub struct Task {
 pub struct Delegation {
     pub target: String,
     pub prompt: String,
+}
+
+/// Ceiling on a stored task result, in characters. The ledger is re-injected into
+/// *every* prompt for the rest of the session, so an unbounded sub-agent reply
+/// (a full file dump, say) would make every subsequent turn's system prompt grow by
+/// that much. 2000 chars is enough for a useful summary or error message without
+/// letting one delegation dominate the token budget of every turn that follows.
+const MAX_RESULT_CHARS: usize = 2000;
+
+/// How many of the most recent tasks get rendered in the system prompt. The ledger
+/// never forgets a task (older ones may still matter for the transcript), but
+/// rendering all of them into every prompt would make the system prompt grow without
+/// bound over a long session. Older tasks are elided rather than dropped — see
+/// `system_prompt`.
+const MAX_RENDERED_TASKS: usize = 20;
+
+/// How many skills may be loaded into the ledger at once. Same reasoning as
+/// `MAX_RESULT_CHARS`: the ledger is re-injected into every prompt for the rest of
+/// the session, so an unbounded number of loaded skills would make every subsequent
+/// turn's system prompt grow without bound. Loading a skill past this cap evicts the
+/// oldest — see `record_skill`.
+const MAX_LOADED_SKILLS: usize = 3;
+
+/// Ceiling on a single loaded skill's content, in characters. Skill files may be up
+/// to 256KB (`skills::MAX_SKILL_BYTES`); injecting one in full into every prompt for
+/// the rest of the session would dominate the token budget of every turn that
+/// follows. 4000 chars is enough for a skill's actual instructions without that.
+const MAX_SKILL_CONTENT_CHARS: usize = 4000;
+
+/// A skill a model has loaded into context via `ACTION: read_skill(...)`. Kept
+/// separate from `Task` because loading a skill is not a delegation — there is no
+/// sub-agent, no status, just content the model asked to see.
+#[derive(Debug, Clone)]
+pub struct LoadedSkill {
+    pub name: String,
+    pub content: String,
 }
 
 #[derive(Debug, Default)]
@@ -42,6 +88,9 @@ pub struct SwarmLedger {
     budgets: BTreeMap<String, String>,
     /// Labels of every model currently reachable.
     roster: Vec<String>,
+    /// Skills loaded via `ACTION: read_skill(...)`, oldest first. Capped at
+    /// `MAX_LOADED_SKILLS`; see `record_skill`.
+    loaded_skills: Vec<LoadedSkill>,
 }
 
 impl SwarmLedger {
@@ -72,6 +121,7 @@ impl SwarmLedger {
             description: description.to_string(),
             assigned_to: None,
             status: TaskStatus::Todo,
+            result: None,
         });
         id
     }
@@ -80,6 +130,58 @@ impl SwarmLedger {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
             task.status = status;
         }
+    }
+
+    /// Records a delegation's outcome — the sub-agent's reply on success, or the
+    /// error text on failure — so it becomes visible to the delegating model. The
+    /// ledger is only re-rendered into the *next* prompt sent to any model, so the
+    /// result does not reach the delegator within the same turn it was requested in;
+    /// see `system_prompt`'s protocol text.
+    pub fn record_result(&mut self, id: usize, result: &str) {
+        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+            // Truncate on a char boundary, not a byte index — `result` may contain
+            // multi-byte UTF-8, and slicing mid-character panics. Mirrors
+            // `local_binary::summarize_stderr`.
+            let truncated = match result.char_indices().nth(MAX_RESULT_CHARS) {
+                Some((cut, _)) => format!("{}…", &result[..cut]),
+                None => result.to_string(),
+            };
+            task.result = Some(truncated);
+        }
+    }
+
+    pub fn loaded_skills(&self) -> &[LoadedSkill] {
+        &self.loaded_skills
+    }
+
+    /// Records a skill's content after a successful `ACTION: read_skill(...)`, so it
+    /// becomes visible to the requesting model. Same next-turn timing as
+    /// `record_result`: the ledger is only re-rendered into the *next* prompt.
+    ///
+    /// Re-requesting an already-loaded skill refreshes its content in place rather
+    /// than adding a second entry — the name is the identity here, not the request.
+    /// Otherwise, loading past `MAX_LOADED_SKILLS` evicts the oldest entry to make
+    /// room, the same bound-the-ledger reasoning as `MAX_RENDERED_TASKS`.
+    pub fn record_skill(&mut self, name: &str, content: &str) {
+        // Truncate on a char boundary, not a byte index — mirrors `record_result`
+        // and `local_binary::summarize_stderr`, for the same reason: `content` may
+        // contain multi-byte UTF-8, and slicing mid-character panics.
+        let truncated = match content.char_indices().nth(MAX_SKILL_CONTENT_CHARS) {
+            Some((cut, _)) => format!("{}…", &content[..cut]),
+            None => content.to_string(),
+        };
+
+        if let Some(existing) = self.loaded_skills.iter_mut().find(|s| s.name == name) {
+            existing.content = truncated;
+            return;
+        }
+        if self.loaded_skills.len() >= MAX_LOADED_SKILLS {
+            self.loaded_skills.remove(0);
+        }
+        self.loaded_skills.push(LoadedSkill {
+            name: name.to_string(),
+            content: truncated,
+        });
     }
 
     pub fn assign_task(&mut self, id: usize, model_label: &str) {
@@ -121,7 +223,19 @@ impl SwarmLedger {
         if self.tasks.is_empty() {
             out.push_str("No active tasks.\n");
         } else {
-            for task in &self.tasks {
+            // The ledger keeps every task for the whole session and is re-injected into
+            // every prompt, so rendering all of them would make each turn's system
+            // prompt grow without bound. Show only the most recent `MAX_RENDERED_TASKS`
+            // and say so, rather than silently dropping the older ones (they still
+            // exist in `self.tasks` for anything that inspects the ledger directly).
+            let total = self.tasks.len();
+            let start = total.saturating_sub(MAX_RENDERED_TASKS);
+            if start > 0 {
+                out.push_str(&format!(
+                    "(...{start} earlier task(s) elided; showing the {MAX_RENDERED_TASKS} most recent...)\n"
+                ));
+            }
+            for task in &self.tasks[start..] {
                 let assignee = task.assigned_to.as_deref().unwrap_or("unassigned");
                 out.push_str(&format!(
                     "- {} Task #{}: {} (assigned: {})\n",
@@ -130,6 +244,22 @@ impl SwarmLedger {
                     task.description,
                     assignee
                 ));
+                if let Some(result) = &task.result {
+                    // Indent continuation lines so a multi-line result nests under its
+                    // task instead of producing bare lines that read as separate ledger
+                    // entries.
+                    let indented = result.replace('\n', "\n    ");
+                    out.push_str(&format!("    result: {indented}\n"));
+                }
+            }
+        }
+
+        out.push_str("\n### Loaded skills\n");
+        if self.loaded_skills.is_empty() {
+            out.push_str("No skills have been loaded into context yet.\n");
+        } else {
+            for skill in &self.loaded_skills {
+                out.push_str(&format!("#### {}\n{}\n", skill.name, skill.content));
             }
         }
 
@@ -139,8 +269,23 @@ impl SwarmLedger {
              emit a line of exactly this form:\n\
              `ACTION: delegate_task(<model label>, <prompt>)`\n\
              Use a label from the list above. Check the budgets first and prefer a model \
-             with capacity; local models have no quota. Emit nothing after the line — the \
-             result will be returned to you.\n",
+             with capacity; local models have no quota. Emit nothing after the line. The \
+             result (or, on failure, the error) is recorded in this ledger under the task \
+             and becomes visible to you on your NEXT turn — not this one, since this reply \
+             is already on its way out when the sub-agent runs.\n",
+        );
+
+        out.push_str(
+            "\n### Skills protocol\n\
+             If this prompt has an \"Available skills\" section, it names every skill file \
+             on disk with a one-line description, if it has one. To load a skill's full \
+             contents into context, emit a line of exactly this form:\n\
+             `ACTION: read_skill(<name>)`\n\
+             Use a name exactly as it appears in that Available skills section. Emit \
+             nothing after the line. Like a delegation result, the content (or, on \
+             failure, the error) becomes visible to you on your NEXT turn, not this one. \
+             At most 3 skills are kept loaded at once and each is size-capped; loading \
+             another past the cap evicts the oldest loaded skill.\n",
         );
 
         out
@@ -175,6 +320,34 @@ impl SwarmLedger {
                 continue;
             }
             found.push(Delegation { target, prompt });
+        }
+
+        found
+    }
+
+    /// Extracts every `ACTION: read_skill(name)` line from a reply. Sibling of
+    /// `parse_delegations`, following the same conventions: strip a wrapping
+    /// backtick, tolerate a quoted argument, and silently ignore a line that does
+    /// not parse rather than erroring the whole reply out — this runs on arbitrary
+    /// model output, so malformed input is an expected case, not exceptional.
+    pub fn parse_read_skill(reply: &str) -> Vec<String> {
+        const MARKER: &str = "ACTION: read_skill(";
+        let mut found = Vec::new();
+
+        for line in reply.lines() {
+            let line = line.trim().trim_start_matches('`').trim_end_matches('`');
+            let Some(start) = line.find(MARKER) else {
+                continue;
+            };
+            let rest = &line[start + MARKER.len()..];
+            let Some(close) = rest.find(')') else {
+                continue;
+            };
+            let name = rest[..close].trim().trim_matches(['"', '\'']).to_string();
+            if name.is_empty() {
+                continue;
+            }
+            found.push(name);
         }
 
         found
@@ -217,6 +390,86 @@ mod tests {
         let text = ledger.system_prompt();
         assert!(text.contains("- ollama:llama3"));
         assert!(text.contains("anthropic:claude-opus-5: 42 requests left"));
+    }
+
+    #[test]
+    fn a_recorded_result_is_rendered_beneath_its_task() {
+        let mut ledger = SwarmLedger::new();
+        let id = ledger.add_task("summarise the diff");
+        ledger.assign_task(id, "ollama:llama3");
+        ledger.record_result(id, "the diff adds a timeout");
+        ledger.update_status(id, TaskStatus::Done);
+
+        let text = ledger.system_prompt();
+        assert!(text.contains("[DONE] Task #1: summarise the diff"));
+        assert!(text.contains("result: the diff adds a timeout"));
+    }
+
+    #[test]
+    fn a_failed_task_records_the_error_as_its_result_and_tags_failed() {
+        // A failure with no explanation is useless to whoever must act on it — the
+        // delegating model needs to see WHY, not just that the task stalled.
+        let mut ledger = SwarmLedger::new();
+        let id = ledger.add_task("call an unreachable model");
+        ledger.assign_task(id, "agy:gemini-3-pro");
+        ledger.update_status(id, TaskStatus::Failed);
+        ledger.record_result(id, "agy:gemini-3-pro: connection refused");
+
+        let text = ledger.system_prompt();
+        assert!(text.contains("[FAILED] Task #1: call an unreachable model"));
+        assert!(text.contains("result: agy:gemini-3-pro: connection refused"));
+    }
+
+    #[test]
+    fn a_result_is_truncated_on_a_char_boundary_not_a_byte_index() {
+        // Multi-byte UTF-8 near the cap must not panic on a mid-character slice.
+        let mut ledger = SwarmLedger::new();
+        let id = ledger.add_task("translate");
+        let long_result = "é".repeat(MAX_RESULT_CHARS + 10);
+        ledger.record_result(id, &long_result);
+
+        let task = ledger.tasks().iter().find(|t| t.id == id).unwrap();
+        let result = task.result.as_ref().unwrap();
+        assert!(result.ends_with('…'));
+        // MAX_RESULT_CHARS kept chars, plus the ellipsis marker.
+        assert_eq!(result.chars().count(), MAX_RESULT_CHARS + 1);
+    }
+
+    #[test]
+    fn results_that_fit_under_the_cap_are_stored_verbatim() {
+        let mut ledger = SwarmLedger::new();
+        let id = ledger.add_task("short task");
+        ledger.record_result(id, "fine");
+        let task = ledger.tasks().iter().find(|t| t.id == id).unwrap();
+        assert_eq!(task.result.as_deref(), Some("fine"));
+    }
+
+    #[test]
+    fn only_the_most_recent_tasks_are_rendered_and_older_ones_are_noted_as_elided() {
+        let mut ledger = SwarmLedger::new();
+        for i in 0..(MAX_RENDERED_TASKS + 5) {
+            ledger.add_task(&format!("task {i}"));
+        }
+        let text = ledger.system_prompt();
+
+        // The oldest task (added first) must not appear...
+        assert!(!text.contains("Task #1:"));
+        // ...but the ledger says so, rather than silently dropping it.
+        assert!(text.contains("5 earlier task(s) elided"));
+        // The most recent task must still be there.
+        let last_id = MAX_RENDERED_TASKS + 5;
+        assert!(text.contains(&format!("Task #{last_id}:")));
+    }
+
+    #[test]
+    fn the_delegation_protocol_text_does_not_promise_a_same_turn_result() {
+        // This block used to claim "the result will be returned to you," which was
+        // false: `run_delegations` only writes the result into the ledger, which is
+        // re-rendered on the NEXT prompt. The protocol text must not promise
+        // something the code does not do.
+        let text = SwarmLedger::new().system_prompt();
+        assert!(!text.contains("the result will be returned to you"));
+        assert!(text.contains("NEXT turn"));
     }
 
     #[test]
@@ -266,5 +519,99 @@ mod tests {
         assert!(SwarmLedger::parse_delegations("ACTION: delegate_task(no-comma)").is_empty());
         assert!(SwarmLedger::parse_delegations("ACTION: delegate_task(a, )").is_empty());
         assert!(SwarmLedger::parse_delegations("ACTION: delegate_task(, prompt)").is_empty());
+    }
+
+    #[test]
+    fn parses_a_simple_read_skill_request() {
+        let found =
+            SwarmLedger::parse_read_skill("I need more detail.\nACTION: read_skill(notes.md)");
+        assert_eq!(found, vec!["notes.md".to_string()]);
+    }
+
+    #[test]
+    fn read_skill_tolerates_backticks_and_quotes() {
+        let found = SwarmLedger::parse_read_skill("`ACTION: read_skill(\"notes.md\")`");
+        assert_eq!(found, vec!["notes.md".to_string()]);
+    }
+
+    #[test]
+    fn finds_multiple_read_skill_requests() {
+        let found = SwarmLedger::parse_read_skill(
+            "ACTION: read_skill(a.md)\nsome prose\nACTION: read_skill(b.md)",
+        );
+        assert_eq!(found, vec!["a.md".to_string(), "b.md".to_string()]);
+    }
+
+    #[test]
+    fn ignores_malformed_or_absent_read_skill_markers() {
+        assert!(SwarmLedger::parse_read_skill("just a normal reply").is_empty());
+        assert!(SwarmLedger::parse_read_skill("ACTION: read_skill(").is_empty());
+        assert!(SwarmLedger::parse_read_skill("ACTION: read_skill()").is_empty());
+        assert!(SwarmLedger::parse_read_skill("ACTION: read_skill(   )").is_empty());
+    }
+
+    #[test]
+    fn a_loaded_skill_is_rendered_in_the_loaded_skills_section() {
+        let mut ledger = SwarmLedger::new();
+        ledger.record_skill("notes.md", "be terse and cite sources");
+        let text = ledger.system_prompt();
+        assert!(text.contains("### Loaded skills"));
+        assert!(text.contains("#### notes.md"));
+        assert!(text.contains("be terse and cite sources"));
+    }
+
+    #[test]
+    fn re_requesting_a_loaded_skill_refreshes_it_in_place_rather_than_duplicating() {
+        let mut ledger = SwarmLedger::new();
+        ledger.record_skill("notes.md", "first version");
+        ledger.record_skill("notes.md", "second version");
+        assert_eq!(ledger.loaded_skills().len(), 1);
+        assert_eq!(ledger.loaded_skills()[0].content, "second version");
+    }
+
+    #[test]
+    fn loading_past_the_cap_evicts_the_oldest_loaded_skill() {
+        let mut ledger = SwarmLedger::new();
+        ledger.record_skill("a.md", "a");
+        ledger.record_skill("b.md", "b");
+        ledger.record_skill("c.md", "c");
+        // Cap is MAX_LOADED_SKILLS == 3; this fourth load must evict "a.md".
+        ledger.record_skill("d.md", "d");
+
+        let names: Vec<&str> = ledger
+            .loaded_skills()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["b.md", "c.md", "d.md"]);
+    }
+
+    #[test]
+    fn a_loaded_skills_content_is_truncated_on_a_char_boundary_not_a_byte_index() {
+        // Mirrors the same guard on `record_result`: multi-byte UTF-8 near the cap
+        // must not panic on a mid-character slice.
+        let mut ledger = SwarmLedger::new();
+        let long_content = "é".repeat(MAX_SKILL_CONTENT_CHARS + 10);
+        ledger.record_skill("big.md", &long_content);
+
+        let content = &ledger.loaded_skills()[0].content;
+        assert!(content.ends_with('…'));
+        assert_eq!(content.chars().count(), MAX_SKILL_CONTENT_CHARS + 1);
+    }
+
+    #[test]
+    fn skill_content_under_the_cap_is_stored_verbatim() {
+        let mut ledger = SwarmLedger::new();
+        ledger.record_skill("small.md", "short and sweet");
+        assert_eq!(ledger.loaded_skills()[0].content, "short and sweet");
+    }
+
+    #[test]
+    fn the_skills_protocol_text_does_not_promise_a_same_turn_result() {
+        // Same requirement as the delegation protocol text: must describe the real
+        // next-turn timing, not promise something the code doesn't do.
+        let text = SwarmLedger::new().system_prompt();
+        assert!(text.contains("ACTION: read_skill"));
+        assert!(text.contains("NEXT turn"));
     }
 }

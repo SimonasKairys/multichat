@@ -8,12 +8,19 @@
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use std::path::Path;
+use std::time::Duration;
 use tokio::process::Command;
 
 use crate::providers::{Provider, RateLimit, Reply};
 
 /// Ceiling on captured output, so a runaway child cannot exhaust memory.
 const MAX_OUTPUT_BYTES: usize = 1 << 20;
+
+/// Ceiling on how long a subprocess call may run. Matches the 300s HTTP timeout in
+/// `providers::http_client` (`src/providers/mod.rs`) so both transports fail on the
+/// same clock — a CLI tool should not be allowed to hang the session indefinitely
+/// just because it has no network timeout of its own.
+const CLI_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 pub struct LocalBinaryProvider {
@@ -110,9 +117,17 @@ fn summarize_stderr(stderr: &str) -> String {
     }
 }
 
-#[async_trait]
-impl Provider for LocalBinaryProvider {
-    async fn send(&self, system: Option<&str>, prompt: &str) -> Result<Reply> {
+impl LocalBinaryProvider {
+    /// Does the actual work of `Provider::send`, parameterised on the timeout so a
+    /// test can use a short one instead of waiting out `CLI_TIMEOUT` for real —
+    /// mirrors why `compose_call` and `summarize_stderr` above are free functions
+    /// rather than inlined into `send`.
+    async fn send_with_timeout(
+        &self,
+        system: Option<&str>,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<Reply> {
         let (system_flag, effective_prompt) =
             compose_call(self.system_arg.as_deref(), system, prompt);
 
@@ -127,10 +142,22 @@ impl Provider for LocalBinaryProvider {
         command.arg(effective_prompt);
         command.kill_on_drop(true);
 
-        let output = command
-            .output()
-            .await
-            .with_context(|| format!("failed to run {}", self.binary_path))?;
+        // `kill_on_drop(true)` only reaps the child when *something* drops the future
+        // that owns it. Without a timeout, nothing ever did — `command.output().await`
+        // would sit forever on a wedged CLI, permanently freezing the session. Wrapping
+        // it in `tokio::time::timeout` gives the future a reason to drop: on elapse,
+        // `timeout` drops the inner `output()` future, which drops the child handle,
+        // which is what actually kills the process.
+        let output = match tokio::time::timeout(timeout, command.output()).await {
+            Ok(result) => result.with_context(|| format!("failed to run {}", self.binary_path))?,
+            Err(_) => {
+                return Err(anyhow!(
+                    "{} timed out after {}s",
+                    self.binary_path,
+                    timeout.as_secs()
+                ));
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -155,6 +182,13 @@ impl Provider for LocalBinaryProvider {
             rate_limit: RateLimit::default(),
         })
     }
+}
+
+#[async_trait]
+impl Provider for LocalBinaryProvider {
+    async fn send(&self, system: Option<&str>, prompt: &str) -> Result<Reply> {
+        self.send_with_timeout(system, prompt, CLI_TIMEOUT).await
+    }
 
     fn model_name(&self) -> &str {
         &self.model
@@ -162,6 +196,25 @@ impl Provider for LocalBinaryProvider {
 
     fn provider_name(&self) -> &str {
         &self.name
+    }
+
+    /// The default `Provider::label` renders `provider:model`, but for a CLI harness
+    /// `provider_name()` is the binary name and `model_name()` defaults to that same
+    /// binary name (see `LocalBinaryProvider::new` callers), so the default would
+    /// render `claude:claude`, `agy:agy`, `codex:codex` — a harness name is not a
+    /// model name. When the user configured a real model (`agy` with `gemini-3-pro`),
+    /// keep the `binary:model` form so the model is still visible.
+    ///
+    /// IMPORTANT: `orchestrator::candidate_label` computes this same string
+    /// independently, for the picker and for `resolve_commander`, before any provider
+    /// exists to call this method on. The two MUST stay in sync — see the comment
+    /// there — or a saved commander for a CLI connection silently stops resolving.
+    fn label(&self) -> String {
+        if self.name == self.model {
+            self.name.clone()
+        } else {
+            format!("{}:{}", self.name, self.model)
+        }
     }
 
     /// A CLI tool may well call a cloud API internally, and we cannot see whether it
@@ -200,6 +253,23 @@ mod tests {
     fn cli_tools_count_as_remote_for_classified_mode() {
         let p = LocalBinaryProvider::new("gh", "gh", vec![], "copilot", None).unwrap();
         assert!(p.is_remote());
+    }
+
+    #[test]
+    fn a_harness_whose_model_defaults_to_the_binary_name_labels_as_just_the_binary() {
+        // `claude`, `agy`, `codex` with no configured model all end up with
+        // model == name (see `construct_provider`'s CLI branch), which used to render
+        // as the meaningless `claude:claude`. A harness name is not a model name.
+        let p = LocalBinaryProvider::new("claude", "claude", vec![], "claude", None).unwrap();
+        assert_eq!(p.label(), "claude");
+    }
+
+    #[test]
+    fn a_configured_model_keeps_the_binary_colon_model_form() {
+        // `agy` is a multi-vendor gateway: the binary name alone doesn't say which
+        // model is behind it, so once the user configures one, keep showing both.
+        let p = LocalBinaryProvider::new("agy", "agy", vec![], "gemini-3-pro", None).unwrap();
+        assert_eq!(p.label(), "agy:gemini-3-pro");
     }
 
     #[test]
@@ -259,5 +329,41 @@ mod tests {
         let summary = summarize_stderr(&"x".repeat(5000));
         assert!(summary.chars().count() <= 301);
         assert!(summary.ends_with('…'));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wedged_child_times_out_instead_of_hanging_forever() {
+        // Regression guard for Fix 3: `command.output().await` had no timeout, so a
+        // CLI that never exits (an interactive auth prompt, a genuinely wedged
+        // process) froze the session permanently. `/bin/sleep 5` stands in for that;
+        // a 50ms timeout is used instead of the real `CLI_TIMEOUT` so the test itself
+        // doesn't hang.
+        //
+        // Unix-only: `/bin/sleep` does not exist on Windows, and
+        // `LocalBinaryProvider::new` rejects a path that does not exist on disk
+        // (see `rejects_a_nonexistent_path`), so this would fail construction, not
+        // just the assertions, on the `windows-latest` CI runner.
+        let p = LocalBinaryProvider::new("slow", "/bin/sleep", vec![], "slow", None).unwrap();
+        let err = p
+            .send_with_timeout(None, "5", Duration::from_millis(50))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/bin/sleep"), "unexpected error: {err}");
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_child_that_finishes_within_the_timeout_still_succeeds() {
+        // Unix-only: depends on `/bin/echo`, a Unix path that `LocalBinaryProvider::new`
+        // would reject as nonexistent on Windows.
+        let p = LocalBinaryProvider::new("echoer", "/bin/echo", vec![], "echoer", None).unwrap();
+        let reply = p
+            .send_with_timeout(None, "hello", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "hello");
     }
 }

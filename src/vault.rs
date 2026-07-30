@@ -1,4 +1,8 @@
-//! Encrypted at-rest storage for chat history and other sensitive local state.
+//! Encrypted at-rest storage for sensitive local state.
+//!
+//! Implemented and unit-tested below, but nothing in the running application
+//! constructs an [`EncryptedVault`] yet — see the "Security posture" section of
+//! `README.md` for the current status of this module.
 //!
 //! File layout (all integers big-endian):
 //!

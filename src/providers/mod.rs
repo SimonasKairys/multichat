@@ -79,15 +79,6 @@ pub struct Reply {
     pub rate_limit: RateLimit,
 }
 
-impl Reply {
-    pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            rate_limit: RateLimit::default(),
-        }
-    }
-}
-
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Sends a prompt with an optional system prompt and returns the reply.

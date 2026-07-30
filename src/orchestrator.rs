@@ -50,8 +50,6 @@ pub enum Event {
     Reply { label: String, text: String },
     /// A delegation was dispatched.
     Delegated { from: String, to: String },
-    /// Informational status line.
-    Status(String),
     /// Something went wrong; the session continues.
     Error(String),
     /// The orchestrator has finished handling a turn.
@@ -416,7 +414,18 @@ pub fn candidate_label(
                 .get(&candidate.id)
                 .and_then(|c| c.model.clone())
                 .unwrap_or_else(|| binary.clone());
-            format!("{binary}:{model}")
+            // Mirrors `LocalBinaryProvider::label` exactly: when no model was
+            // configured, `model` defaults to `binary` a few lines up, so this is the
+            // same "harness name is not a model name" collapse. IMPORTANT: these two
+            // implementations must stay in sync — `resolve_commander` recomputes this
+            // string with `candidate_label` and looks it up against labels that real
+            // providers registered via `label()`; if the two rules ever diverge, a
+            // saved commander for a CLI connection silently stops resolving.
+            if binary == model {
+                binary
+            } else {
+                format!("{binary}:{model}")
+            }
         }
     }
 }
@@ -727,12 +736,21 @@ impl Orchestrator {
     /// Assembles the system prompt: ledger blackboard plus any skills on disk.
     fn system_prompt(&self) -> String {
         let mut prompt = self.ledger.system_prompt();
-        if let Ok(names) = self.skills.list()
-            && !names.is_empty()
+        if let Ok(metas) = self.skills.list_with_descriptions()
+            && !metas.is_empty()
         {
             prompt.push_str("\n### Available skills (read-only)\n");
-            for name in names {
-                prompt.push_str(&format!("- {name}\n"));
+            for meta in metas {
+                // Bare filenames give a model no basis to judge relevance; the
+                // description (when the file has frontmatter for one) is what makes
+                // this list actionable. Fall back to just the name rather than
+                // printing "None" or an empty trailing dash.
+                match meta.description {
+                    Some(description) => {
+                        prompt.push_str(&format!("- {} — {}\n", meta.name, description));
+                    }
+                    None => prompt.push_str(&format!("- {}\n", meta.name)),
+                }
             }
         }
         prompt
@@ -851,6 +869,7 @@ impl Orchestrator {
         .await;
 
         self.run_delegations(&primary_label, &reply.text).await;
+        self.run_skill_reads(&reply.text).await;
     }
 
     /// Executes any `delegate_task` lines the primary emitted.
@@ -893,6 +912,12 @@ impl Orchestrator {
                     if let Some(budget) = reply.rate_limit.summary() {
                         self.ledger.update_budget(&target_label, &budget);
                     }
+                    // Record the reply on the task before flipping it to Done, so the
+                    // ledger shown to the delegating model on its next turn carries
+                    // the answer, not just a status tag. This is Fix 1: previously the
+                    // reply reached only the TUI (via Event::Reply below) and the
+                    // delegating model never saw it at all.
+                    self.ledger.record_result(task_id, &reply.text);
                     self.ledger
                         .update_status(task_id, crate::swarm::TaskStatus::Done);
                     let _ = self.audit.log(
@@ -909,7 +934,68 @@ impl Orchestrator {
                     let _ = self
                         .audit
                         .log("task.failed", &format!("task={task_id} error={e}"));
+                    // Record the error as the task's result and mark it Failed, not
+                    // just logged-and-dropped: without this a failed delegation sat at
+                    // [IN_PROGRESS] forever, indistinguishable from one still running,
+                    // on a blackboard every other model reads as fact. Recording the
+                    // error text (not just the status) lets the delegating model see
+                    // WHY it failed and decide whether to retry — a failure with no
+                    // explanation is useless to whoever has to act on it.
+                    self.ledger.record_result(task_id, &e.to_string());
+                    self.ledger
+                        .update_status(task_id, crate::swarm::TaskStatus::Failed);
                     self.emit(Event::Error(format!("{target_label}: {e}")))
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Executes any `read_skill` lines the primary emitted, mirroring
+    /// `run_delegations` in structure: parse every request out of the reply, resolve
+    /// each one, and never let a bad request take down the turn.
+    ///
+    /// Like sub-agent replies not being re-scanned for delegations, this is only
+    /// called on the primary's own reply — not on delegation replies — so the same
+    /// non-recursion guarantee holds here too.
+    async fn run_skill_reads(&mut self, reply_text: &str) {
+        let requests = SwarmLedger::parse_read_skill(reply_text);
+
+        // Mirrors `run_delegations` capping to `MAX_DELEGATIONS_PER_TURN`: the
+        // ledger already caps how many skills stay loaded (`MAX_LOADED_SKILLS`), but
+        // that caps storage, not effort per turn — without this, a reply with
+        // hundreds of `read_skill` lines would still trigger hundreds of filesystem
+        // reads, just to have all but the last few evicted immediately after.
+        for name in requests.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+            // `SkillsDir::read` already rejects `..`, absolute paths, and symlinks
+            // that escape the skills root (see `skills.rs`). Until now every caller
+            // passed it a name the application itself constructed. This is the first
+            // caller where `name` comes straight from model output — exactly the
+            // threat that hardening exists to stop, since a model's reply is
+            // effectively untrusted input (it may be echoing text from a delegated
+            // sub-agent, a fetched document, anything). Calling `resolve`/`read`
+            // rather than reimplementing the check here is what keeps that guarantee
+            // intact.
+            match self.skills.read(&name) {
+                Ok(content) => {
+                    // Skill files are user-authored local files, not model output —
+                    // the model only supplied the *name* being resolved above. So
+                    // injecting `content` into the system prompt is equivalent to
+                    // the user having written that text into a system prompt
+                    // themselves, which is why it is acceptable to do so at all;
+                    // this would be a very different call if a model could write a
+                    // skill file too.
+                    self.ledger.record_skill(&name, &content);
+                    let _ = self.audit.log(
+                        "skill.read",
+                        &format!("name={name} chars={}", content.len()),
+                    );
+                }
+                Err(e) => {
+                    let _ = self
+                        .audit
+                        .log("skill.read_failed", &format!("name={name} error={e}"));
+                    self.emit(Event::Error(format!("skill `{name}`: {e}")))
                         .await;
                 }
             }
@@ -945,6 +1031,29 @@ mod tests {
         }
         fn is_remote(&self) -> bool {
             self.remote
+        }
+    }
+
+    /// A provider that always errors, used to exercise the failed-delegation path
+    /// (Fix 2) without spawning a real subprocess or making a real request.
+    struct FailingProvider {
+        provider: String,
+        model: String,
+    }
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        async fn send(&self, _system: Option<&str>, _prompt: &str) -> Result<Reply> {
+            Err(anyhow!("simulated transport failure"))
+        }
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+        fn provider_name(&self) -> &str {
+            &self.provider
+        }
+        fn is_remote(&self) -> bool {
+            false
         }
     }
 
@@ -1013,12 +1122,20 @@ mod tests {
         assert!(system_arg.is_none());
     }
 
+    // Unix-only: both this test and its sibling below hardcode `/bin/echo`, which
+    // does not exist on Windows. `LocalBinaryProvider::new` rejects a path-like
+    // string that does not exist on disk (see `rejects_a_nonexistent_path` in
+    // `providers::local_binary`), so `Registry::build` would fail construction on
+    // `windows-latest` rather than exercising the label-resolution logic under test.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_saved_commander_resolves_even_when_the_connection_id_is_not_the_provider_label() {
         // `settings.commander` holds a connection id ("anthropic"), the same key the
         // picker writes. When that connection is backed by a CLI (the `claude`
-        // binary), the constructed provider's label is `claude:claude` —
-        // `provider_name()` is the binary name, not the vendor id — so a naive
+        // binary) with no model configured, the constructed provider's label is
+        // `claude` — `provider_name()` is the binary name, not the vendor id, and
+        // `LocalBinaryProvider::label` collapses `claude:claude` down to just `claude`
+        // since a harness name is not a model name (Fix 4) — so a naive
         // `match_label(&providers, "anthropic")` finds nothing and the commander
         // silently falls back to whatever label sorts first. This is the regression
         // `resolve_commander` exists to prevent.
@@ -1052,7 +1169,51 @@ mod tests {
         let registry = Registry::build(&settings, None, false)
             .await
             .expect("the claude CLI connection must construct");
-        assert_eq!(registry.primary(), "claude:claude");
+        assert_eq!(registry.primary(), "claude");
+    }
+
+    // Unix-only: hardcodes `/bin/echo`, which `LocalBinaryProvider::new` would reject
+    // as a nonexistent path on Windows — see the comment on the sibling test above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_saved_commander_with_a_configured_model_keeps_the_binary_colon_model_label() {
+        // Sibling of the test above, covering the branch it doesn't: when the user
+        // *did* configure a model (the `agy` multi-vendor gateway pointed at
+        // `gemini-3-pro`), the label must keep the `binary:model` form so the model
+        // stays visible. `candidate_label` and `LocalBinaryProvider::label` compute
+        // this independently and must agree, or this diverges from `resolve_commander`
+        // silently — see the comment on both.
+        let mut local_binaries = BTreeMap::new();
+        local_binaries.insert(
+            "agy".to_string(),
+            crate::config::LocalBinarySpec {
+                path: "/bin/echo".into(),
+                args: vec![],
+                system_arg: None,
+            },
+        );
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "agy".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Cli),
+                path: Some("/bin/echo".into()),
+                model: Some("gemini-3-pro".to_string()),
+            },
+        );
+        let settings = Settings {
+            ollama_host: "http://127.0.0.1:1".into(),
+            local_binaries,
+            connections,
+            commander: Some("agy".to_string()),
+            ..Default::default()
+        };
+
+        let registry = Registry::build(&settings, None, false)
+            .await
+            .expect("the agy CLI connection must construct");
+        assert_eq!(registry.primary(), "agy:gemini-3-pro");
     }
 
     #[tokio::test]
@@ -1188,6 +1349,175 @@ mod tests {
             .await;
 
         assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn a_failed_delegation_is_tagged_failed_not_left_in_progress_forever() {
+        // Regression guard for Fix 2: before this fix, the Err arm of run_delegations
+        // logged and emitted an Event::Error but never called update_status, so a
+        // failed task sat at [IN_PROGRESS] forever — indistinguishable from one still
+        // running, on a blackboard other models read as fact.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        let ok = StubProvider {
+            provider: "ollama".into(),
+            model: "llama3".into(),
+            remote: false,
+        };
+        providers.insert(ok.label(), Arc::new(ok));
+        let failing = FailingProvider {
+            provider: "ollama".into(),
+            model: "mistral".into(),
+        };
+        providers.insert(failing.label(), Arc::new(failing));
+        let reg = Registry {
+            providers,
+            primary: "ollama:llama3".to_string(),
+            applied: BTreeMap::new(),
+        };
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:mistral, do the thing)",
+        )
+        .await;
+
+        assert!(matches!(event_rx.try_recv(), Ok(Event::Delegated { .. })));
+        assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+
+        let task = &orch.ledger.tasks()[0];
+        assert_eq!(task.status, crate::swarm::TaskStatus::Failed);
+        // The error text is recorded as the result, so the delegating model can see
+        // WHY the task failed on its next turn.
+        assert!(
+            task.result
+                .as_deref()
+                .unwrap()
+                .contains("simulated transport failure")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_skill_request_loads_the_named_skill_into_the_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(
+            paths.skills_dir.join("notes.md"),
+            "be terse and cite sources",
+        )
+        .unwrap();
+
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        orch.run_skill_reads("ACTION: read_skill(notes.md)").await;
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a successful read must not emit Event::Error"
+        );
+        let loaded = orch.ledger.loaded_skills();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "notes.md");
+        assert_eq!(loaded[0].content, "be terse and cite sources");
+    }
+
+    #[tokio::test]
+    async fn a_read_skill_traversal_attempt_surfaces_as_an_error_not_a_crash() {
+        // This is the whole point of routing `read_skill` through the existing
+        // `SkillsDir::read`: the skill name here comes straight from model output,
+        // which is exactly the untrusted-input case `resolve`'s hardening (rejecting
+        // `..`, absolute paths, and escaping symlinks) was written for. A malicious
+        // or confused model must get an Event::Error, not a path outside the skills
+        // root and not a panic that takes down the turn.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        orch.run_skill_reads("ACTION: read_skill(../../../../etc/passwd)")
+            .await;
+
+        assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+        assert!(orch.ledger.loaded_skills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_skill_request_surfaces_as_an_error_not_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        orch.run_skill_reads("ACTION: read_skill(nope.md)").await;
+
+        assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+        assert!(orch.ledger.loaded_skills().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_system_prompt_renders_a_skills_description_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        std::fs::write(
+            paths.skills_dir.join("notes.md"),
+            "---\ndescription: Summarise long documents.\n---\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(paths.skills_dir.join("plain.md"), "no frontmatter here").unwrap();
+
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        let prompt = orch.system_prompt();
+        assert!(prompt.contains("- notes.md — Summarise long documents."));
+        assert!(prompt.contains("- plain.md\n"));
     }
 
     #[tokio::test]

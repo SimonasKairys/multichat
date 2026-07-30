@@ -99,11 +99,6 @@ impl LockedBuffer {
     pub fn as_slice(&self) -> &[u8] {
         &self.bytes
     }
-
-    /// Whether the pages were successfully pinned to RAM.
-    pub fn is_locked(&self) -> bool {
-        self.locked
-    }
 }
 
 impl Drop for LockedBuffer {

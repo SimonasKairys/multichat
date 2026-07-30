@@ -1,8 +1,11 @@
 //! Encrypted at-rest storage for sensitive local state.
 //!
-//! Implemented and unit-tested below, but nothing in the running application
-//! constructs an [`EncryptedVault`] yet — see the "Security posture" section of
-//! `README.md` for the current status of this module.
+//! The only thing this stores is the TUI transcript (`App::transcript` in
+//! `src/app.rs`), opted into with `simon chat --vault`. It hands the *user* their
+//! history back across sessions; it is not conversation memory for a model —
+//! `Orchestrator::handle_prompt` still sends no message history on any turn, vault or
+//! not. See the "Security posture" section of `README.md` for the full picture,
+//! including the self-destruct policy as a data-loss property.
 //!
 //! File layout (all integers big-endian):
 //!
@@ -50,6 +53,10 @@ const HEADER_FIXED_LEN: usize = 8 + 1 + 1 + 8 + 1; // magic..salt_len inclusive
 pub const MAX_ATTEMPTS: u8 = 5;
 /// Idle window after which the vault self-destructs on next open.
 pub const MAX_IDLE_SECS: u64 = 24 * 60 * 60;
+/// How close to `MAX_IDLE_SECS` counts as "close enough to warn the user about" at
+/// unlock time. Four hours gives someone who works in a normal daily rhythm a real
+/// chance to notice before a missed day silently wipes the transcript.
+pub const IDLE_WARNING_THRESHOLD_SECS: u64 = 4 * 60 * 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
@@ -285,6 +292,46 @@ impl EncryptedVault {
         }
         let _ = fs::remove_file(&self.path);
     }
+
+    /// Reads the plaintext header fields without decrypting anything, so `simon vault
+    /// status` never has to ask for (or fail without) a password.
+    ///
+    /// This is *why* `Header` itself stays private: exposing it whole would leak the
+    /// salt and body offset for no reason a caller outside this module needs. Returns
+    /// [`VaultError::Missing`] if there is no file yet, matching [`Self::load`].
+    pub fn status(&self) -> Result<VaultStatus, VaultError> {
+        let raw = match fs::read(&self.path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(VaultError::Missing),
+            Err(e) => return Err(VaultError::Corrupt(e.to_string())),
+        };
+        let header = Self::parse_header(&raw)?;
+        let idle_secs = now_secs().saturating_sub(header.last_unlock);
+        Ok(VaultStatus {
+            path: self.path.clone(),
+            failed_attempts: header.attempts,
+            idle_secs,
+            idle_secs_remaining: MAX_IDLE_SECS.saturating_sub(idle_secs),
+        })
+    }
+}
+
+/// Plaintext status, safe to display without a password.
+///
+/// The magic, version, salt and ciphertext are authenticated; `failed_attempts` and
+/// the timestamp `idle_secs`/`idle_secs_remaining` are derived from are not — see the
+/// module doc. That means these two fields are readable *and forgeable*: an attacker
+/// with file access can reset them, so treat this as diagnostic information, not as
+/// evidence of tampering (or its absence).
+#[derive(Debug, Clone)]
+pub struct VaultStatus {
+    pub path: PathBuf,
+    pub failed_attempts: u8,
+    pub idle_secs: u64,
+    /// Seconds until the next `load()` finds the vault past `MAX_IDLE_SECS` and
+    /// destroys it outright, before even checking a password. Zero means that has
+    /// already happened and the next open — right password or not — wipes it.
+    pub idle_secs_remaining: u64,
 }
 
 fn random_salt() -> Vec<u8> {
@@ -413,5 +460,91 @@ mod tests {
         vault.save(b"first", &pw).unwrap();
         vault.save(b"second", &pw).unwrap();
         assert_eq!(vault.load(&pw).unwrap(), b"second");
+    }
+
+    #[test]
+    fn a_truncated_file_is_reported_as_corrupt_not_silently_destroyed() {
+        // Corruption (bad magic, truncated header, unsupported version) must not
+        // trigger the self-destruct path — that is reserved for exhausted attempts
+        // or idle expiry. Conflating the two would delete a vault a user might
+        // otherwise be able to recover (e.g. from a backup of the file).
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"payload", &pw).unwrap();
+
+        let raw = fs::read(vault.path()).unwrap();
+        fs::write(vault.path(), &raw[..HEADER_FIXED_LEN - 1]).unwrap();
+
+        assert!(matches!(vault.load(&pw), Err(VaultError::Corrupt(_))));
+        assert!(
+            vault.exists(),
+            "corrupt files must be left alone, not destroyed automatically"
+        );
+    }
+
+    #[test]
+    fn status_reports_header_fields_without_needing_the_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"payload", &pw).unwrap();
+
+        // Note what is absent from this call: no `SecretString` argument exists to
+        // pass, which is the point — `status()`'s signature makes an unlock
+        // impossible to require by accident.
+        let status = vault.status().unwrap();
+        assert_eq!(status.path.as_path(), vault.path());
+        assert_eq!(status.failed_attempts, 0);
+        assert!(
+            status.idle_secs_remaining > MAX_IDLE_SECS - 60,
+            "a freshly saved vault should be nowhere near idle expiry"
+        );
+    }
+
+    #[test]
+    fn status_on_a_missing_vault_is_reported_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        assert!(matches!(vault.status(), Err(VaultError::Missing)));
+    }
+
+    #[test]
+    fn a_serialized_transcript_round_trips_through_the_vault() {
+        // The actual feature: the vault stores the TUI's `Vec<Line>` transcript, not
+        // arbitrary bytes. Encrypting and decrypting could "work" while the JSON
+        // underneath silently lost the model label on a `Speaker::Model` line, so
+        // this checks the full path, not just AES-GCM.
+        use crate::app::{Line, Speaker};
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("transcript password".to_string());
+
+        let transcript = vec![
+            Line {
+                speaker: Speaker::You,
+                text: "hello".into(),
+            },
+            Line {
+                speaker: Speaker::Model("anthropic:claude-opus-5".into()),
+                text: "hi there".into(),
+            },
+            Line {
+                speaker: Speaker::System,
+                text: "commander: anthropic:claude-opus-5".into(),
+            },
+        ];
+        let payload = serde_json::to_vec(&transcript).unwrap();
+        vault.save(&payload, &pw).unwrap();
+
+        let loaded = vault.load(&pw).unwrap();
+        let restored: Vec<Line> = serde_json::from_slice(&loaded).unwrap();
+
+        assert_eq!(restored.len(), transcript.len());
+        assert_eq!(restored[1].text, "hi there");
+        assert!(
+            matches!(&restored[1].speaker, Speaker::Model(m) if m == "anthropic:claude-opus-5")
+        );
     }
 }

@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 129 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 138 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -27,6 +27,9 @@ simon auth anthropic         # store an API key (prompts; never pass it as an ar
 simon chat                   # start the TUI with the first available model
 simon chat -m ollama:llama3  # pick a commander explicitly
 simon chat --classified      # local models only, no network egress
+simon chat --vault           # persist the transcript, encrypted, across sessions
+simon vault status           # vault path, failed attempts, time to idle self-destruct
+simon vault destroy          # permanently delete the vault (typed "yes" to confirm)
 simon audit                  # verify the audit log's hash chain
 ```
 
@@ -35,6 +38,15 @@ name (`anthropic`).
 
 In the TUI: type and press **Enter** to send, **PageUp/PageDown** to scroll, **Esc** or
 **Ctrl-C** to quit.
+
+`--vault` persists the TUI transcript — what you and the models said — to an encrypted
+file so it survives between runs of `simon chat --vault`. It is **not** conversation
+memory: no model ever receives the transcript or any prior turn as context, vault or
+not (see [Delegation](#delegation) — every prompt still goes out on its own). The vault
+only gives the *user* their own history back on screen. It is off by default and changes
+nothing about `simon chat` without the flag. See
+[Security posture](#security-posture) for what it protects against, its self-destruct
+policy, and what a crash costs you.
 
 ### Providers
 
@@ -128,8 +140,21 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   requires process-wide memory locking to succeed rather than warning.
 - **Process-wide memory locking on Linux** — `mlockall` at startup (`main.rs`), pinning
   the whole process into RAM so nothing is swapped to disk. The other half of this
-  claim, per-allocation `mlock`/`VirtualLock` of derived key material, exists too (see
-  below) but only runs inside the vault, which no code path currently reaches.
+  claim, per-allocation `mlock`/`VirtualLock` of derived key material, is genuinely live
+  too now: `simon chat --vault` runs `EncryptedVault::save`/`load`, both of which call
+  `derive_key`, which allocates the Argon2id output through `LockedBuffer::new` (see
+  `src/security.rs`) — not just exercised by `src/vault.rs`'s own tests.
+- **Encrypted transcript vault (`simon chat --vault`)** — the TUI transcript
+  (`App::transcript`: what you and the models said, nothing else) encrypted with
+  AES-256-GCM under an Argon2id-derived key, opt-in and off by default. The salt lives
+  in the file header and is bound as authenticated data, so tampering with it breaks
+  decryption. This is **user-visible history, not model memory** — no model ever
+  receives the transcript or any prior turn as context; every prompt is still sent
+  alone (see [Delegation](#delegation)). `simon vault status` reports the vault's path,
+  failed-attempt count, and time left before idle self-destruct without ever asking for
+  a password (those two fields are plaintext header data — see
+  [Known limits](#known-limits-of-what-is-implemented)). `simon vault destroy` deletes
+  it after a typed `yes`.
 - **Path-traversal protection** on the read-only skills directory: `..`, absolute paths,
   and symlinks escaping the root are all rejected. This is reachable from model output
   via `ACTION: read_skill(<name>)` (see [Skills](#skills)), not just from trusted
@@ -139,15 +164,6 @@ Be precise about what exists. This table is the source of truth; the numbered fi
 - **`unsafe` confined to one file** — `#![deny(unsafe_code)]` crate-wide with a single
   audited override in `src/security.rs`, enforced by a CI job that rejects the override
   anywhere else.
-
-### Implemented and unit-tested, but not reachable from the app
-
-- **Encrypted vault** — AES-256-GCM, Argon2id key derivation, salt persisted in the file
-  header and bound as authenticated data. Self-destructs after 5 consecutive wrong
-  passwords or 24 hours idle. The derived key is held in a buffer that is locked into RAM
-  per-allocation (`mlock`/`VirtualLock`) and zeroized on drop. All of this is real and
-  covered by tests in `src/vault.rs` — but no command in `simon` constructs an
-  `EncryptedVault`. Nothing currently opens a vault, and nothing is stored in one.
 
 ### Not implemented
 
@@ -160,17 +176,36 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   should be opt-in per endpoint.
 - **Process-wide memory locking on Windows and macOS.** Windows has no `mlockall`
   equivalent; macOS declares it but returns `ENOSYS`. The vault's per-allocation lock
-  (see above) would stand in for it on those platforms if the vault were wired up, but
-  today `--classified` on Windows/macOS simply refuses to start, since the process-wide
-  guarantee it requires is unavailable there.
+  (see above) stands in for it **only while the vault is deriving a key** — it protects
+  the vault's own key material on those platforms, not the process as a whole — so
+  `--classified` on Windows/macOS still simply refuses to start, since the process-wide
+  guarantee it requires is unavailable there regardless of `--vault`.
 - **Clipboard clearing.** The app does not touch the clipboard.
 
 ### Known limits of what is implemented
 
-- The vault's failed-attempt counter lives in the same file it protects. An attacker who
-  can copy the file can reset it by restoring their copy. This raises the cost of online
-  guessing; it is not a substitute for a TPM or secure enclave. (A property of the vault
-  code itself, which — see above — nothing in the app currently opens.)
+- **The vault's self-destruct is a data-loss feature, not just a security one.** 5
+  consecutive wrong passwords, or 24 hours since the vault was last opened, wipes the
+  saved transcript — permanently, with no recovery. The idle check in particular runs
+  **before** the password is even checked (`EncryptedVault::load`, `src/vault.rs`), so
+  typing the correct password after a 24-hour gap does not save it; the file is already
+  gone by the time the password would have been checked. `simon vault status` shows time
+  remaining before this happens, and `simon chat --vault` warns at unlock time if the
+  vault is within a few hours of it.
+- **Only a clean exit saves.** `simon chat --vault` serializes and encrypts the
+  transcript once, after the TUI loop returns normally — not after every turn, because
+  Argon2id key derivation is deliberately slow and running it per-message would stall
+  the UI. A crash, panic, or `kill -9` skips that save, so anything typed since the last
+  clean exit (or vault open, on the first run) is lost. This is a real trade-off, not an
+  oversight: continuous session-to-session use is safe, but do not rely on `--vault` as
+  a crash-safe log.
+- The vault's failed-attempt counter and last-unlock timestamp live in the same file
+  they protect and are deliberately excluded from the authenticated data (see
+  `src/vault.rs`), so they are plaintext and unauthenticated — an attacker who can copy
+  the file can reset both by restoring their copy. `simon vault status` reads them
+  without a password for exactly this reason: they were never tamper-proof to begin
+  with. This raises the cost of online guessing; it is not a substitute for a TPM or
+  secure enclave.
 - The audit log uses a MAC, not a signature. Anyone who can read the keyring key can
   forge entries, so it proves integrity against local tampering, not non-repudiation.
 - A local CLI tool is treated as remote for `--classified` purposes, because we cannot

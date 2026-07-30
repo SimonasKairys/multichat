@@ -69,6 +69,13 @@ pub async fn pick_connections(settings: &mut Settings, classified: bool) -> Resu
 /// `settings`/`classified` are only needed to reopen the picker mid-chat (Ctrl+O or
 /// `F2`); the initial picker (before this function is ever called) is handled by
 /// `pick_connections`.
+///
+/// Returns the final `App` on a clean exit, so a caller running `--vault` can save
+/// the last-seen transcript. `TerminalGuard::enter` is called inside this function
+/// and its `Drop` restores the terminal when the local `guard` variable goes out of
+/// scope at the `Ok`/`Err` return below — so by the time this `async fn` resolves,
+/// the caller can safely prompt or print (e.g. "vault saved") without corrupting a
+/// terminal that is still in raw mode / the alternate screen.
 pub async fn run(
     mut app: App,
     commands: mpsc::Sender<Command>,
@@ -76,7 +83,7 @@ pub async fn run(
     mut settings: Settings,
     paths: crate::config::Paths,
     classified: bool,
-) -> Result<()> {
+) -> Result<App> {
     let mut guard = TerminalGuard::enter()?;
     let mut input = EventStream::new();
 
@@ -116,7 +123,7 @@ pub async fn run(
     }
 
     let _ = commands.send(Command::Shutdown).await;
-    Ok(())
+    Ok(app)
 }
 
 /// `Ctrl+O` reopens the picker, with `F2` as an equivalent alternative. `Ctrl+O` is

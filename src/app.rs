@@ -1,9 +1,17 @@
 //! TUI state, kept free of I/O so it can be unit-tested.
 
+use serde::{Deserialize, Serialize};
+
 use crate::orchestrator::Event;
 
 /// Who produced a line in the transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` exist so `Line` (below) can round-trip through the vault
+/// as JSON — see `simon chat --vault` in `main.rs`. `Model` is the one tuple variant;
+/// serde's default externally-tagged representation carries the inner label through
+/// as `{"Model":"anthropic:claude-opus-5"}`, not just the discriminant, so it still
+/// distinguishes which model said what after a reload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Speaker {
     You,
     Model(String),
@@ -11,7 +19,7 @@ pub enum Speaker {
     Error,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Line {
     pub speaker: Speaker,
     pub text: String,
@@ -245,5 +253,48 @@ mod tests {
         assert_eq!(app.scroll, 0);
         app.scroll_down();
         assert_eq!(app.scroll, 1);
+    }
+
+    #[test]
+    fn speaker_round_trips_through_json_including_the_tuple_variant() {
+        // The vault stores the transcript as JSON. `Speaker::Model(String)` is the
+        // only variant carrying data, so it is the one most likely to lose the label
+        // if the derive ever stopped matching the hand-rolled format some other
+        // serializer might expect.
+        for speaker in [
+            Speaker::You,
+            Speaker::Model("anthropic:claude-opus-5".to_string()),
+            Speaker::System,
+            Speaker::Error,
+        ] {
+            let json = serde_json::to_string(&speaker).unwrap();
+            let back: Speaker = serde_json::from_str(&json).unwrap();
+            assert_eq!(speaker, back, "round trip through {json}");
+        }
+    }
+
+    #[test]
+    fn a_transcript_restored_from_json_renders_like_a_live_one() {
+        // This is exactly what the vault's load path does: deserialize a `Vec<Line>`
+        // and assign it straight into `App::transcript`. If `Line`/`Speaker` ever
+        // lost round-trip fidelity, this is the first thing that would catch it.
+        let mut app = app();
+        let saved = vec![
+            Line {
+                speaker: Speaker::You,
+                text: "hi".into(),
+            },
+            Line {
+                speaker: Speaker::Model("ollama:llama3".into()),
+                text: "hello".into(),
+            },
+        ];
+        let json = serde_json::to_vec(&saved).unwrap();
+        let restored: Vec<Line> = serde_json::from_slice(&json).unwrap();
+
+        app.transcript = restored;
+
+        assert!(app.body().contains("you › hi"));
+        assert!(app.body().contains("ollama:llama3 › hello"));
     }
 }

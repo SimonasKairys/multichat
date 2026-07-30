@@ -231,7 +231,8 @@ async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate
     if classified && remote {
         // Never even query a remote daemon under --classified: a garbage or
         // non-loopback `ollama_host` must not get to make an outbound request just
-        // to be told no. This is finding 1.2 in docs/AUDIT-2026-07-29.md.
+        // to be told no. This is finding 1.2 of the 2026-07-29 audit (doc removed
+        // as superseded; recoverable at commit `2e7984e`).
         return vec![Candidate {
             id: "ollama".into(),
             group: "OLLAMA".into(),

@@ -125,7 +125,8 @@ impl Provider for OllamaProvider {
 /// `127.0.0.0/8`, `::1`, or the literal name `localhost`. `ollama_host` is
 /// user-writable and unvalidated, so anything this cannot positively identify as
 /// loopback — including a host that fails to parse — is treated as remote. Failing
-/// open here is exactly the bug finding 1.2 in `docs/AUDIT-2026-07-29.md` describes:
+/// open here is exactly the bug finding 1.2 of the 2026-07-29 audit describes
+/// (doc removed as superseded; recoverable at commit `2e7984e`):
 /// a garbage or non-loopback host must never pass `--classified` as "local".
 pub(crate) fn is_loopback_host(host: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(host) else {

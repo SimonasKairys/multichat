@@ -24,4 +24,5 @@
 - `05`–`14`: architecture and security decisions (aspirational; see the note above).
 - `15`–`21`: per-step implementation records, corrected after the audit.
 - `22_status.md`: **authoritative** implemented / not-implemented status.
-- `../AUDIT.md`: full audit of the initial Rust commit.
+- `../AUDIT-2026-07-30.md`: the current audit. Earlier audits were removed as
+  superseded; recoverable at commit `2e7984e`.

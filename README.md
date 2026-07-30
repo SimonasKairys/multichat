@@ -229,8 +229,9 @@ repository is still called `multichat`, after the Python project that used to li
 
 The repository previously held a Python/FastAPI implementation, replaced by this Rust
 one in commit `9a51fc6`. That version is recoverable at commit `06c6c76`.
-`docs/AUDIT.md` records the audit of the initial Rust commit and the defects this
-version fixes.
+`docs/AUDIT-2026-07-30.md` is the current audit. The two earlier audits (of the
+initial Rust commit and of `2cca5da`) described trees that no longer exist and were
+removed as superseded; both are recoverable at commit `2e7984e`.
 
 ## License
 

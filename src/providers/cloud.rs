@@ -11,7 +11,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
 use crate::config::{Api, CloudEndpoint};
-use crate::providers::{Provider, RateLimit, Reply};
+use crate::providers::{Provider, RateLimit, Reply, truncate_error_detail};
 
 /// Anthropic requires this header on every request; it is an API-version pin, not a
 /// model version.
@@ -120,7 +120,7 @@ impl CloudProvider {
                     return Err(anyhow!(
                         "{} returned no text content (response: {})",
                         self.model,
-                        truncate(&body.to_string())
+                        truncate_error_detail(&body.to_string())
                     ));
                 }
                 Ok(text)
@@ -135,21 +135,12 @@ impl CloudProvider {
                     return Err(anyhow!(
                         "{} returned no message content (response: {})",
                         self.model,
-                        truncate(&body.to_string())
+                        truncate_error_detail(&body.to_string())
                     ));
                 }
                 Ok(text)
             }
         }
-    }
-}
-
-fn truncate(s: &str) -> String {
-    const LIMIT: usize = 300;
-    if s.len() <= LIMIT {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..LIMIT])
     }
 }
 
@@ -174,7 +165,7 @@ impl Provider for CloudProvider {
                 "{} returned {}: {}",
                 self.provider,
                 status,
-                truncate(detail.trim())
+                truncate_error_detail(detail.trim())
             ));
         }
 

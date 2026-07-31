@@ -100,6 +100,22 @@ pub trait Provider: Send + Sync {
     }
 }
 
+/// Ceiling on how much of a provider's error or response body gets embedded in an
+/// error message, in characters. Enough to identify what went wrong (auth failure vs
+/// bad model name) without pasting a whole response into the transcript.
+const MAX_ERROR_DETAIL_CHARS: usize = 300;
+
+/// Bounds provider-controlled text (error bodies, response JSON) before embedding it
+/// in an error message. Truncates on a char boundary, not a byte index — the text may
+/// contain multi-byte UTF-8, and slicing mid-character panics. Mirrors
+/// `swarm::record_result` and `local_binary::summarize_stderr`, for the same reason.
+pub(crate) fn truncate_error_detail(s: &str) -> String {
+    match s.char_indices().nth(MAX_ERROR_DETAIL_CHARS) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
+    }
+}
+
 /// Builds the shared HTTP client. `reqwest` picks up `HTTP_PROXY`/`HTTPS_PROXY` and,
 /// because the `socks` feature is enabled, `ALL_PROXY=socks5://…` as well.
 pub fn http_client() -> Result<reqwest::Client> {
@@ -155,5 +171,27 @@ mod tests {
     #[test]
     fn http_client_builds() {
         assert!(http_client().is_ok());
+    }
+
+    #[test]
+    fn error_detail_is_truncated_on_a_char_boundary_not_a_byte_index() {
+        // Mirrors the same guard on `swarm::record_result` and
+        // `local_binary::summarize_stderr`: one ASCII byte followed by 3-byte chars
+        // puts every char boundary at 1+3k, so byte 300 lands mid-character — the
+        // old byte-index slice in `cloud.rs` panicked on exactly this input.
+        //
+        // The count must exceed MAX_ERROR_DETAIL_CHARS, not just the old 300-*byte*
+        // limit: at 120 repeats this is 361 bytes but only 121 chars, so the
+        // char-based cap returns it verbatim and the truncation path never runs.
+        let s = format!("a{}", "€".repeat(MAX_ERROR_DETAIL_CHARS + 100));
+        let out = truncate_error_detail(&s);
+        assert!(out.ends_with('…'));
+        // MAX_ERROR_DETAIL_CHARS kept chars, plus the ellipsis marker.
+        assert_eq!(out.chars().count(), MAX_ERROR_DETAIL_CHARS + 1);
+    }
+
+    #[test]
+    fn error_detail_under_the_cap_passes_through_verbatim() {
+        assert_eq!(truncate_error_detail("bad api key"), "bad api key");
     }
 }

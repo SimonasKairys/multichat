@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::providers::{Provider, RateLimit, Reply};
+use crate::providers::{Provider, RateLimit, Reply, truncate_error_detail};
 
 pub struct OllamaProvider {
     host: String,
@@ -80,8 +80,13 @@ impl Provider for OllamaProvider {
 
         let status = response.status();
         if !status.is_success() {
+            // Bounded like the cloud transport's error path: the body is
+            // daemon-controlled text of arbitrary size, not something to embed whole.
             let detail = response.text().await.unwrap_or_default();
-            return Err(anyhow!("Ollama returned {status}: {}", detail.trim()));
+            return Err(anyhow!(
+                "Ollama returned {status}: {}",
+                truncate_error_detail(detail.trim())
+            ));
         }
 
         let parsed: Value = response

@@ -44,6 +44,14 @@ pub struct Delegation {
     pub prompt: String,
 }
 
+/// A file write request parsed out of a model's plain-text reply by
+/// `parse_file_writes`. See that function's doc comment for the block syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileWrite {
+    pub path: String,
+    pub content: String,
+}
+
 /// Ceiling on a stored task result, in characters. The ledger is re-injected into
 /// *every* prompt for the rest of the session, so an unbounded sub-agent reply
 /// (a full file dump, say) would make every subsequent turn's system prompt grow by
@@ -80,6 +88,25 @@ pub struct LoadedSkill {
     pub content: String,
 }
 
+/// How many `ACTION: write_file(...)` outcomes stay in the ledger. Same
+/// bound-the-ledger reasoning as `MAX_LOADED_SKILLS`: the ledger is re-injected into
+/// every prompt, so an unbounded history of writes would make every subsequent turn's
+/// system prompt grow without bound. Only name and status are ever stored here —
+/// never file content — so this is far cheaper per entry than a loaded skill, and the
+/// cap can afford to be generous.
+const MAX_RECORDED_WRITES: usize = 20;
+
+/// The recorded outcome of an `ACTION: write_file(...)` request: the path and either
+/// `"ok (N bytes)"` or the error text. Deliberately holds no content — the audit
+/// found the rendered system prompt already too large (see
+/// `docs/AUDIT-2026-07-30.md` §3.2); echoing file content back into every future
+/// prompt would make that worse for every write a model makes.
+#[derive(Debug, Clone)]
+pub struct WrittenFile {
+    pub path: String,
+    pub outcome: String,
+}
+
 #[derive(Debug, Default)]
 pub struct SwarmLedger {
     tasks: Vec<Task>,
@@ -91,6 +118,9 @@ pub struct SwarmLedger {
     /// Skills loaded via `ACTION: read_skill(...)`, oldest first. Capped at
     /// `MAX_LOADED_SKILLS`; see `record_skill`.
     loaded_skills: Vec<LoadedSkill>,
+    /// Outcomes of `ACTION: write_file(...)` requests, oldest first. Capped at
+    /// `MAX_RECORDED_WRITES`; see `record_file_write`.
+    written_files: Vec<WrittenFile>,
 }
 
 impl SwarmLedger {
@@ -184,6 +214,33 @@ impl SwarmLedger {
         });
     }
 
+    pub fn written_files(&self) -> &[WrittenFile] {
+        &self.written_files
+    }
+
+    /// Records a file write's outcome after `ACTION: write_file(...)` runs, so it
+    /// becomes visible to the requesting model. Same next-turn timing as
+    /// `record_result` and `record_skill`: the ledger is only re-rendered into the
+    /// *next* prompt.
+    ///
+    /// Re-recording the same path updates its outcome in place, mirroring
+    /// `record_skill`'s in-place refresh — it does not move to the end of the list,
+    /// since the path is the identity here, not the write attempt. Otherwise,
+    /// recording past `MAX_RECORDED_WRITES` evicts the oldest entry to make room.
+    pub fn record_file_write(&mut self, path: &str, outcome: &str) {
+        if let Some(existing) = self.written_files.iter_mut().find(|w| w.path == path) {
+            existing.outcome = outcome.to_string();
+            return;
+        }
+        if self.written_files.len() >= MAX_RECORDED_WRITES {
+            self.written_files.remove(0);
+        }
+        self.written_files.push(WrittenFile {
+            path: path.to_string(),
+            outcome: outcome.to_string(),
+        });
+    }
+
     pub fn assign_task(&mut self, id: usize, model_label: &str) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
             task.assigned_to = Some(model_label.to_string());
@@ -263,6 +320,13 @@ impl SwarmLedger {
             }
         }
 
+        if !self.written_files.is_empty() {
+            out.push_str("\n### Workspace files\n");
+            for written in &self.written_files {
+                out.push_str(&format!("- {}: {}\n", written.path, written.outcome));
+            }
+        }
+
         out.push_str(
             "\n### Delegation protocol\n\
              You are one model in a multi-model swarm. To hand work to another model, \
@@ -286,6 +350,22 @@ impl SwarmLedger {
              failure, the error) becomes visible to you on your NEXT turn, not this one. \
              At most 3 skills are kept loaded at once and each is size-capped; loading \
              another past the cap evicts the oldest loaded skill.\n",
+        );
+
+        out.push_str(
+            "\n### File write protocol\n\
+             To create or overwrite a file in your private workspace directory, emit \
+             exactly this form:\n\
+             `ACTION: write_file(<relative path>)`\n\
+             followed by the file's content, one line at a time, followed by a line of \
+             exactly `ACTION: end_file`. Paths are relative to the workspace; \
+             subdirectories are created automatically. Files are capped at 256KB. A \
+             line exactly `ACTION: end_file` cannot appear inside the content — it \
+             always closes the block there instead. `ACTION: delegate_task(...)` and \
+             `ACTION: read_skill(...)` lines inside the content are treated as \
+             content, not executed. Like a delegation result, the outcome is recorded \
+             in this ledger and becomes visible to you on your NEXT turn, not this \
+             one.\n",
         );
 
         out
@@ -351,6 +431,92 @@ impl SwarmLedger {
         }
 
         found
+    }
+
+    /// Extracts every `ACTION: write_file(path)` ... `ACTION: end_file` block from a
+    /// reply, returning the extracted writes AND the reply text with those blocks
+    /// removed (everything else passes through unchanged).
+    ///
+    /// This differs from `parse_delegations`/`parse_read_skill` in shape, not just in
+    /// what it looks for: those are per-line, forgiving parsers where each line
+    /// stands alone. A write block spans multiple lines, and its *content* is
+    /// arbitrary model-authored text — which means it can itself contain a line that
+    /// looks exactly like `ACTION: delegate_task(...)` or `ACTION: read_skill(...)`
+    /// (a model writing documentation about this very protocol will do exactly that).
+    /// If the raw reply were handed back to `parse_delegations`/`parse_read_skill`
+    /// unchanged, those lines would execute even though they were never meant as
+    /// instructions — they are file content, not a request. So this is a single
+    /// sequential, stateful pass: it tracks whether it is inside an open block and
+    /// only ever treats a line as a delegation/skill trigger by leaving it in the
+    /// stripped text for those parsers to see later. The orchestrator feeds the
+    /// *stripped* text, not the raw reply, to `parse_delegations`/`parse_read_skill`.
+    ///
+    /// Rules:
+    /// - A line matching `ACTION: write_file(<path>)` (same trimming conventions as
+    ///   the siblings) opens a block; that line is consumed, not passed through.
+    /// - Every following line is content until a line that, after the same trimming,
+    ///   is exactly `ACTION: end_file` or `ACTION: end_file()`; that line closes the
+    ///   block and is also consumed, not passed through and not part of the content.
+    /// - A `write_file` line encountered while already inside an open block is
+    ///   ordinary content, not a new block — blocks do not nest.
+    /// - An empty (or all-whitespace) path closes as a no-op: the block is still
+    ///   consumed (its lines do not leak into the stripped text), but nothing is
+    ///   added to the returned writes.
+    /// - An unterminated block — no `end_file` before the reply ends — is dropped
+    ///   from BOTH the writes and the stripped text. This is a deliberate asymmetry
+    ///   with the empty-path case: by the time an unterminated block is discovered,
+    ///   whatever content lines it swallowed may already contain an unexecuted
+    ///   `ACTION: delegate_task(...)`-shaped line, so there is no safe way to un-swallow
+    ///   them back into the stripped text without also potentially resurrecting a
+    ///   partial, truncated block marker. Silently dropping the whole thing is
+    ///   consistent with this project's treatment of malformed model output as an
+    ///   expected case, not an exceptional one.
+    pub fn parse_file_writes(reply: &str) -> (Vec<FileWrite>, String) {
+        const OPEN_MARKER: &str = "ACTION: write_file(";
+
+        let mut writes = Vec::new();
+        let mut stripped_lines: Vec<&str> = Vec::new();
+
+        // `None` when not inside a block; `Some((path, content_lines))` while one is
+        // open.
+        let mut open: Option<(String, Vec<&str>)> = None;
+
+        for line in reply.lines() {
+            let trimmed = line.trim().trim_start_matches('`').trim_end_matches('`');
+
+            if let Some((_, content_lines)) = open.as_mut() {
+                if trimmed == "ACTION: end_file" || trimmed == "ACTION: end_file()" {
+                    let (path, content_lines) = open.take().unwrap();
+                    if !path.trim().is_empty() {
+                        writes.push(FileWrite {
+                            path,
+                            content: content_lines.join("\n"),
+                        });
+                    }
+                } else {
+                    content_lines.push(line);
+                }
+                continue;
+            }
+
+            let Some(start) = trimmed.find(OPEN_MARKER) else {
+                stripped_lines.push(line);
+                continue;
+            };
+            let rest = &trimmed[start + OPEN_MARKER.len()..];
+            let Some(close) = rest.find(')') else {
+                stripped_lines.push(line);
+                continue;
+            };
+            let path = rest[..close].trim().trim_matches(['"', '\'']).to_string();
+            open = Some((path, Vec::new()));
+        }
+
+        // An unterminated block reaches here still `Some`: per the doc comment above,
+        // it is dropped entirely — not added to `writes`, and its swallowed lines
+        // never rejoin `stripped_lines`.
+
+        (writes, stripped_lines.join("\n"))
     }
 }
 
@@ -613,5 +779,87 @@ mod tests {
         let text = SwarmLedger::new().system_prompt();
         assert!(text.contains("ACTION: read_skill"));
         assert!(text.contains("NEXT turn"));
+    }
+
+    #[test]
+    fn parses_a_simple_write_file_block() {
+        let (writes, stripped) = SwarmLedger::parse_file_writes(
+            "Sure, here you go.\nACTION: write_file(notes/todo.md)\nline one\nline two\nACTION: end_file\nDone.",
+        );
+        assert_eq!(
+            writes,
+            vec![FileWrite {
+                path: "notes/todo.md".into(),
+                content: "line one\nline two".into(),
+            }]
+        );
+        assert!(!stripped.contains("write_file"));
+        assert!(!stripped.contains("end_file"));
+        assert!(stripped.contains("Sure, here you go."));
+        assert!(stripped.contains("Done."));
+    }
+
+    #[test]
+    fn an_unterminated_write_block_is_skipped_and_stripped() {
+        // No `ACTION: end_file` before the reply ends: the block, and everything it
+        // swallowed, must vanish from both outputs rather than surfacing partially.
+        let (writes, stripped) = SwarmLedger::parse_file_writes(
+            "before\nACTION: write_file(notes.md)\nsome content\nmore content",
+        );
+        assert!(writes.is_empty());
+        assert_eq!(stripped, "before");
+    }
+
+    #[test]
+    fn action_lines_inside_file_content_are_not_parsed_as_delegations() {
+        // A model documenting the delegation protocol inside a file it writes must
+        // not have that example line actually execute as a delegation once the
+        // stripped text reaches `parse_delegations`.
+        let reply = "ACTION: write_file(README.md)\n\
+                      Here is how delegation works:\n\
+                      ACTION: delegate_task(ollama:llama3, do something)\n\
+                      ACTION: end_file";
+        let (writes, stripped) = SwarmLedger::parse_file_writes(reply);
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].content.contains("ACTION: delegate_task"));
+        assert!(SwarmLedger::parse_delegations(&stripped).is_empty());
+    }
+
+    #[test]
+    fn a_write_file_line_inside_a_block_is_content_not_a_new_block() {
+        let reply = "ACTION: write_file(a.md)\n\
+                      ACTION: write_file(b.md)\n\
+                      ACTION: end_file";
+        let (writes, stripped) = SwarmLedger::parse_file_writes(reply);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].path, "a.md");
+        assert_eq!(writes[0].content, "ACTION: write_file(b.md)");
+        assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn recorded_writes_are_rendered_without_content() {
+        let mut ledger = SwarmLedger::new();
+        ledger.record_file_write("secret_plan.md", "ok (42 bytes)");
+        let text = ledger.system_prompt();
+        assert!(text.contains("### Workspace files"));
+        assert!(text.contains("secret_plan.md: ok (42 bytes)"));
+    }
+
+    #[test]
+    fn the_file_write_protocol_text_does_not_promise_a_same_turn_result() {
+        let text = SwarmLedger::new().system_prompt();
+        assert!(text.contains("ACTION: write_file"));
+        assert!(text.contains("ACTION: end_file"));
+        assert!(text.contains("NEXT turn"));
+    }
+
+    #[test]
+    fn re_recording_a_path_updates_in_place() {
+        let mut ledger = SwarmLedger::new();
+        ledger.record_file_write("notes.md", "ok (10 bytes)");
+        ledger.record_file_write("notes.md", "ok (20 bytes)");
+        assert_eq!(ledger.written_files().len(), 1);
+        assert_eq!(ledger.written_files()[0].outcome, "ok (20 bytes)");
     }
 }

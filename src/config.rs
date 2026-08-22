@@ -22,6 +22,7 @@ pub struct Paths {
     pub vault_file: PathBuf,
     pub audit_log: PathBuf,
     pub skills_dir: PathBuf,
+    pub workspace_dir: PathBuf,
 }
 
 impl Paths {
@@ -41,6 +42,17 @@ impl Paths {
         fs::create_dir_all(&skills_dir).with_context(|| {
             format!("failed to create skills directory {}", skills_dir.display())
         })?;
+        // Deliberately a separate tree from `skills_dir`: that directory is read-only
+        // to models (see `skills.rs`'s module doc), and a model that could write there
+        // could inject its own content into every future system prompt. `workspace`
+        // is the one place models may write — see `workspace.rs`.
+        let workspace_dir = data_dir.join("workspace");
+        fs::create_dir_all(&workspace_dir).with_context(|| {
+            format!(
+                "failed to create workspace directory {}",
+                workspace_dir.display()
+            )
+        })?;
         restrict_to_owner(&data_dir)?;
 
         Ok(Self {
@@ -48,6 +60,7 @@ impl Paths {
             vault_file: data_dir.join("vault.enc"),
             audit_log: data_dir.join("audit.log"),
             skills_dir,
+            workspace_dir,
             data_dir,
         })
     }
@@ -133,6 +146,21 @@ pub fn builtin_endpoint(provider: &str) -> Option<CloudEndpoint> {
         _ => return None,
     };
     Some(e)
+}
+
+/// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`) to the
+/// canonical id vendor discovery actually looks up in the keyring (`anthropic`,
+/// `google`). A key stored under the alias would be stored successfully but never
+/// found — discovery only ever asks for canonical ids. Kept visibly next to
+/// `builtin_endpoint`'s alias arms so a future alias gets added to both. Anything
+/// that isn't one of the two aliases — including a custom endpoint name — passes
+/// through unchanged.
+pub fn canonical_provider(name: &str) -> &str {
+    match name.to_ascii_lowercase().as_str() {
+        "claude" => "anthropic",
+        "gemini" => "google",
+        _ => name,
+    }
 }
 
 /// Which transport carries a connection's traffic. `Api` and `Cli` are the only two
@@ -292,6 +320,15 @@ mod tests {
         assert_eq!(openai.api, Api::OpenAiCompatible);
         assert_ne!(anthropic.base_url, openai.base_url);
         assert!(anthropic.base_url.contains("anthropic.com"));
+    }
+
+    #[test]
+    fn aliases_canonicalise_to_the_id_discovery_reads_back() {
+        assert_eq!(canonical_provider("claude"), "anthropic");
+        assert_eq!(canonical_provider("gemini"), "google");
+        assert_eq!(canonical_provider("anthropic"), "anthropic");
+        assert_eq!(canonical_provider("openai"), "openai");
+        assert_eq!(canonical_provider("my-gateway"), "my-gateway");
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub mod skills;
 pub mod swarm;
 pub mod ui;
 pub mod vault;
+pub mod workspace;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -123,9 +124,21 @@ fn apply_hardening(classified: bool) -> Result<Hardening> {
 }
 
 fn auth(service: &str, delete: bool, settings: &Settings) -> Result<()> {
+    // A custom endpoint literally named `gemini` or `claude` must keep that name —
+    // only fall back to the builtin alias mapping when no custom endpoint claims
+    // the raw name. Otherwise `builtin_endpoint`'s aliases (`claude` -> `anthropic`,
+    // `gemini` -> `google`) are canonicalised so the keyring entry lands under the
+    // id vendor discovery actually reads back (`discover_vendors` only ever asks
+    // for canonical ids), rather than under an alias no lookup ever queries.
+    let canonical = if settings.custom_endpoints.contains_key(service) {
+        service
+    } else {
+        crate::config::canonical_provider(service)
+    };
+
     if delete {
-        Credentials::delete(service)?;
-        println!("Removed the stored key for {service}.");
+        Credentials::delete(canonical)?;
+        println!("Removed the stored key for {canonical}.");
         return Ok(());
     }
 
@@ -139,7 +152,7 @@ fn auth(service: &str, delete: bool, settings: &Settings) -> Result<()> {
     // Reading from the terminal keeps the key out of shell history and out of the
     // process table, where a `--key` argument would be visible to any local user.
     let key = if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        rpassword::prompt_password(format!("API key for {service} (input hidden): "))
+        rpassword::prompt_password(format!("API key for {canonical} (input hidden): "))
             .context("failed to read the key from the terminal")?
     } else {
         let mut buf = String::new();
@@ -148,8 +161,8 @@ fn auth(service: &str, delete: bool, settings: &Settings) -> Result<()> {
         buf
     };
 
-    Credentials::set(service, key.trim())?;
-    println!("Stored the {service} key in the OS keyring.");
+    Credentials::set(canonical, key.trim())?;
+    println!("Stored the {canonical} key in the OS keyring.");
     Ok(())
 }
 

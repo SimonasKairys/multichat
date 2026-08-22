@@ -36,6 +36,14 @@ simon audit                  # verify the audit log's hash chain
 `-m` accepts a full label (`ollama:llama3`), a bare model name (`llama3`), or a provider
 name (`anthropic`).
 
+`simon auth` also accepts `claude` and `gemini` as aliases, storing the key under
+`anthropic`/`google` respectively so vendor discovery finds it.
+
+The connection picker can also prompt for a key directly: press **space** on an API
+row marked `(no key stored)` to open a masked entry field instead of quitting to run
+`simon auth`. Either way, the key lands in the OS keyring only — never in
+`config.json`.
+
 In the TUI: type and press **Enter** to send, **PageUp/PageDown** to scroll, **Esc** or
 **Ctrl-C** to quit.
 
@@ -121,7 +129,36 @@ other skill access — a model's reply is untrusted input, no different from a n
 by a user, so the same `..`/absolute-path/symlink checks apply. The content (or, on
 failure, the error) is recorded in the ledger and becomes visible on the model's next
 turn, same timing as a delegation result. At most 3 skills are kept loaded at once, each
-capped in size; loading a fourth evicts the oldest.
+capped in size; loading a fourth evicts the oldest. The skills directory itself stays
+read-only to models — see [Model file writes](#model-file-writes) for the one place
+they may write.
+
+### Model file writes
+
+Models may also create or overwrite a file in a dedicated, sandboxed workspace
+directory (`<data dir>/workspace`, a separate tree from the read-only skills
+directory) by emitting a block:
+
+```
+ACTION: write_file(notes/todo.md)
+- write the summary
+- send it to review
+ACTION: end_file
+```
+
+Everything between the `write_file` line and the `end_file` line is written verbatim as
+the file's content. Paths are relative to the workspace and subdirectories are created
+automatically; `..`, absolute paths, and symlinks escaping the workspace root are all
+rejected, the same traversal hardening as the skills directory. Files are capped at
+256KB, and the workspace holds at most 256 files at once (overwriting an existing file
+never counts against that cap). A line containing `ACTION: delegate_task(...)` or
+`ACTION: read_skill(...)` inside the content is treated as content, not executed — this
+matters because a model writing documentation about its own protocol will naturally
+include example lines that look like real requests. Every write, successful or not, is
+audited (`file.written` / `file.write_failed`) and shown in the TUI as it happens; the
+outcome (path and byte count, or the error — never content) is also recorded in the
+ledger and becomes visible to the model on its next turn, same timing as a delegation
+result.
 
 ## Security posture
 
@@ -159,6 +196,14 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   and symlinks escaping the root are all rejected. This is reachable from model output
   via `ACTION: read_skill(<name>)` (see [Skills](#skills)), not just from trusted
   callers, so the rejection is load-bearing, not defensive dead code.
+- **Model-initiated file writes confined to a dedicated workspace directory** (see
+  [Model file writes](#model-file-writes)) — the same traversal hardening as skills
+  (`..`, absolute paths, and symlinks escaping the root are all rejected), size- and
+  count-capped, and every write is audited and rendered in the TUI so the user sees
+  everything a model has written. The skills directory itself remains read-only to
+  models — a model that could write a skill file could inject its own content into the
+  system prompt sent to every model for the rest of the session — so this is
+  deliberately a separate tree, not a relaxation of that guarantee.
 - **Proxy support** — honours `HTTP_PROXY`/`HTTPS_PROXY` and, via reqwest's `socks`
   feature, `ALL_PROXY=socks5://…`.
 - **`unsafe` confined to one file** — `#![deny(unsafe_code)]` crate-wide with a single

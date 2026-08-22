@@ -17,6 +17,7 @@ use crate::providers::{
 };
 use crate::skills::SkillsDir;
 use crate::swarm::SwarmLedger;
+use crate::workspace::Workspace;
 
 /// Delegations honoured per user turn, so a model cannot spin the swarm forever.
 const MAX_DELEGATIONS_PER_TURN: usize = 3;
@@ -50,6 +51,11 @@ pub enum Event {
     Reply { label: String, text: String },
     /// A delegation was dispatched.
     Delegated { from: String, to: String },
+    /// A model wrote a file into the sandboxed workspace via `ACTION: write_file`.
+    /// Carries only the path — never content, same reasoning as `WrittenFile` in
+    /// `swarm.rs` — so the user can see that a write happened without this event
+    /// itself becoming a way to smuggle file content through the TUI.
+    FileWritten { path: String },
     /// Something went wrong; the session continues.
     Error(String),
     /// The orchestrator has finished handling a turn.
@@ -99,6 +105,12 @@ pub struct TransportOption {
     pub availability: Availability,
     /// Present only when `transport == Some(Transport::Cli)`.
     pub cli: Option<CliSpec>,
+    /// `true` only for the "no key stored" API row: the one case the picker can fix
+    /// on its own, by prompting for a key and writing it to the keyring. Every other
+    /// unavailable reason (a classified-mode refusal, a keyring read error) needs
+    /// something outside the picker to resolve, so this must never be set from the
+    /// reason string — only from the specific `Credentials::get` outcome below.
+    pub needs_key: bool,
 }
 
 /// A connectable model the picker can show the user, whether or not it can actually
@@ -247,6 +259,7 @@ async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate
                     "remote Ollama hosts are refused under --classified".into(),
                 ),
                 cli: None,
+                needs_key: false,
             }],
         }];
     }
@@ -267,6 +280,7 @@ async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate
                     detail: settings.ollama_host.clone(),
                     availability: Availability::Available,
                     cli: None,
+                    needs_key: false,
                 }],
             })
             .collect(),
@@ -280,6 +294,7 @@ async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate
                 detail: settings.ollama_host.clone(),
                 availability: Availability::Unavailable(format!("unreachable: {e}")),
                 cli: None,
+                needs_key: false,
             }],
         }],
     }
@@ -316,23 +331,29 @@ fn build_vendor_candidate(
     let mut transports = Vec::new();
 
     if let Some(endpoint) = settings.endpoint(id) {
-        let (availability, detail) = if classified {
+        let (availability, detail, needs_key) = if classified {
             (
                 Availability::Unavailable("cloud APIs are refused under --classified".into()),
                 endpoint.base_url.clone(),
+                false,
             )
         } else {
             match Credentials::get(id) {
-                Ok(Some(_)) => (Availability::Available, endpoint.base_url.clone()),
+                Ok(Some(_)) => (Availability::Available, endpoint.base_url.clone(), false),
                 // The reason is rendered separately from the detail column, so the
                 // detail stays the endpoint URL — repeating it here printed it twice.
+                // This is the only branch the picker can resolve by itself (prompt
+                // for a key, write it to the keyring), so it is the only one that
+                // sets `needs_key`.
                 Ok(None) => (
                     Availability::Unavailable("no key stored".into()),
                     endpoint.base_url.clone(),
+                    true,
                 ),
                 Err(e) => (
                     Availability::Unavailable(format!("keyring error: {e}")),
                     endpoint.base_url.clone(),
+                    false,
                 ),
             }
         };
@@ -342,6 +363,7 @@ fn build_vendor_candidate(
             detail,
             availability,
             cli: None,
+            needs_key,
         });
     }
 
@@ -365,6 +387,7 @@ fn build_vendor_candidate(
             detail: cli.path.clone(),
             availability,
             cli: Some(cli.clone()),
+            needs_key: false,
         });
     }
 
@@ -703,6 +726,9 @@ pub struct Orchestrator {
     ledger: SwarmLedger,
     audit: AuditLogger,
     skills: SkillsDir,
+    /// The only place models may write files. Deliberately a separate tree from
+    /// `skills` — see `workspace.rs`'s module doc.
+    workspace: Workspace,
     events: mpsc::Sender<Event>,
     /// Carried so a picker reopened mid-chat (`Command::Reconfigure`) rebuilds the
     /// registry under the same air-gap policy the session started with.
@@ -724,6 +750,7 @@ impl Orchestrator {
             ledger,
             audit: AuditLogger::open(paths.audit_log.clone())?,
             skills: SkillsDir::new(paths.skills_dir.clone())?,
+            workspace: Workspace::new(paths.workspace_dir.clone())?,
             events,
             classified,
         })
@@ -863,14 +890,27 @@ impl Orchestrator {
             &format!("model={primary_label} chars={}", reply.text.len()),
         );
 
+        // The TUI sees the RAW reply, unmodified — the user must see exactly what the
+        // model said, including any write_file/end_file block markers, not a version
+        // silently edited by the write-block parser below.
         self.emit(Event::Reply {
             label: primary_label.clone(),
             text: reply.text.clone(),
         })
         .await;
 
-        self.run_delegations(&primary_label, &reply.text).await;
-        self.run_skill_reads(&reply.text).await;
+        // `parse_file_writes` strips write blocks out of the reply before anything
+        // else sees it, so an `ACTION: delegate_task(...)`/`ACTION: read_skill(...)`
+        // line inside a file a model is writing (documentation about this very
+        // protocol, say) is never mistaken for a real request. Delegation and skill
+        // reads run on the stripped text; writes run last, keeping the existing
+        // execution order (delegations, then skill reads) unchanged for the two
+        // actions that already existed.
+        let (writes, stripped) = SwarmLedger::parse_file_writes(&reply.text);
+
+        self.run_delegations(&primary_label, &stripped).await;
+        self.run_skill_reads(&stripped).await;
+        self.run_file_writes(writes).await;
     }
 
     /// Executes any `delegate_task` lines the primary emitted.
@@ -997,6 +1037,42 @@ impl Orchestrator {
                         .audit
                         .log("skill.read_failed", &format!("name={name} error={e}"));
                     self.emit(Event::Error(format!("skill `{name}`: {e}")))
+                        .await;
+                }
+            }
+        }
+    }
+
+    /// Executes any `write_file` blocks the primary emitted, mirroring
+    /// `run_skill_reads` in structure: resolve each request and never let one bad
+    /// write take down the turn.
+    ///
+    /// Only the primary's own reply is ever scanned for write blocks — `writes` here
+    /// comes from `parse_file_writes(&reply.text)` in `handle_prompt`, never from a
+    /// sub-agent's delegation reply — so the same non-recursion guarantee that holds
+    /// for delegations and skill reads holds here too.
+    async fn run_file_writes(&mut self, writes: Vec<crate::swarm::FileWrite>) {
+        for write in writes.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+            match self.workspace.write(&write.path, &write.content) {
+                Ok(_) => {
+                    let outcome = format!("ok ({} bytes)", write.content.len());
+                    let _ = self.audit.log(
+                        "file.written",
+                        &format!("path={} chars={}", write.path, write.content.len()),
+                    );
+                    self.ledger.record_file_write(&write.path, &outcome);
+                    self.emit(Event::FileWritten {
+                        path: write.path.clone(),
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    let _ = self.audit.log(
+                        "file.write_failed",
+                        &format!("path={} error={e}", write.path),
+                    );
+                    self.ledger.record_file_write(&write.path, &e.to_string());
+                    self.emit(Event::Error(format!("write `{}`: {e}", write.path)))
                         .await;
                 }
             }
@@ -1264,6 +1340,7 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
             events: event_tx,
             classified: false,
         };
@@ -1300,6 +1377,7 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
             events: event_tx,
             classified: false,
         };
@@ -1342,6 +1420,7 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
             events: event_tx,
             classified: false,
         };
@@ -1385,6 +1464,7 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
             events: event_tx,
             classified: false,
         };
@@ -1427,6 +1507,7 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
             events: event_tx,
             classified: false,
         };
@@ -1461,6 +1542,7 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
             events: event_tx,
             classified: false,
         };
@@ -1484,6 +1566,7 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
             events: event_tx,
             classified: false,
         };
@@ -1512,6 +1595,7 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
             events: event_tx,
             classified: false,
         };
@@ -1533,6 +1617,7 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
             events: event_tx,
             classified: false,
         };
@@ -1562,5 +1647,111 @@ mod tests {
         assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
         // The old registry is untouched: still has the original primary.
         assert_eq!(orch.registry.primary(), "ollama:llama3");
+    }
+
+    #[tokio::test]
+    async fn a_write_file_reply_creates_the_file_and_audits_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        // `StubProvider::send` echoes `"echo: {prompt}"`, prefixing only the first
+        // line — the write block markers on later lines reach the reply intact.
+        orch.handle_prompt(
+            "please write it\nACTION: write_file(hello.txt)\nHello, world!\nACTION: end_file",
+        )
+        .await;
+
+        let mut saw_write = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::FileWritten { path } = event {
+                assert_eq!(path, "hello.txt");
+                saw_write = true;
+            }
+        }
+        assert!(saw_write, "expected an Event::FileWritten");
+
+        let written = std::fs::read_to_string(paths.workspace_dir.join("hello.txt")).unwrap();
+        assert_eq!(written, "Hello, world!");
+
+        let audit_text = std::fs::read_to_string(&paths.audit_log).unwrap();
+        assert!(audit_text.contains("file.written"));
+        assert!(audit_text.contains("hello.txt"));
+    }
+
+    #[tokio::test]
+    async fn a_write_traversal_attempt_surfaces_as_an_error_not_a_crash() {
+        // Mirrors `a_read_skill_traversal_attempt_surfaces_as_an_error_not_a_crash`:
+        // the path here comes straight from model output, so it must go through
+        // `Workspace::write`'s hardening and surface as `Event::Error`, not a path
+        // outside the workspace root and not a panic that takes down the turn.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        orch.run_file_writes(vec![crate::swarm::FileWrite {
+            path: "../escape.txt".into(),
+            content: "malicious".into(),
+        }])
+        .await;
+
+        assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+        assert!(!tmp.path().join("escape.txt").exists());
+        let written = orch.ledger.written_files();
+        assert_eq!(written.len(), 1);
+        assert!(written[0].outcome.contains("escapes"));
+    }
+
+    #[tokio::test]
+    async fn a_written_file_is_listed_in_the_next_system_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        orch.run_file_writes(vec![crate::swarm::FileWrite {
+            path: "notes.txt".into(),
+            content: "hello".into(),
+        }])
+        .await;
+
+        let prompt = orch.system_prompt();
+        assert!(prompt.contains("### Workspace files"));
+        assert!(prompt.contains("notes.txt: ok (5 bytes)"));
+        // The write's content ("hello") must never itself be echoed into the ledger —
+        // only the path and byte-count outcome (see `WrittenFile`'s doc comment).
+        assert!(!prompt.contains("hello"));
     }
 }

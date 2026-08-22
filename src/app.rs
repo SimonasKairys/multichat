@@ -104,6 +104,10 @@ impl App {
                 speaker: Speaker::System,
                 text: format!("{from} delegated to {to}"),
             }),
+            Event::FileWritten { path } => self.transcript.push(Line {
+                speaker: Speaker::System,
+                text: format!("wrote workspace file: {path}"),
+            }),
             Event::Error(text) => self.transcript.push(Line {
                 speaker: Speaker::Error,
                 text,

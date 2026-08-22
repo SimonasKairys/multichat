@@ -20,9 +20,10 @@ use ratatui::{
 };
 use std::io::{self, Stdout};
 use tokio::sync::mpsc;
+use zeroize::Zeroize;
 
 use crate::app::App;
-use crate::config::Settings;
+use crate::config::{Credentials, Settings};
 use crate::orchestrator::{Command, Event, discover_candidates};
 use crate::picker::PickerState;
 
@@ -194,21 +195,58 @@ async fn run_picker(
                 match maybe_term {
                     Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => {
                         if let Some(state) = picker.as_mut() {
-                            match key.code {
-                                KeyCode::Up => state.move_up(),
-                                KeyCode::Down => state.move_down(),
-                                KeyCode::Char(' ') => state.toggle(),
-                                KeyCode::Tab => state.cycle_transport(),
-                                KeyCode::Char('c') => state.set_commander(),
-                                KeyCode::Enter => {
-                                    if let Some((connections, commander)) = state.submit() {
-                                        settings.connections = connections;
-                                        settings.commander = commander;
-                                        return Ok(true);
+                            if state.key_entry().is_some() {
+                                // While a masked key prompt is open, every other
+                                // binding (toggle, cycle transport, commander, quit)
+                                // is suspended — none of them make sense mid-entry,
+                                // and letting `q`/`Esc` fall through would make
+                                // "cancel the prompt" indistinguishable from "quit
+                                // the picker".
+                                match key.code {
+                                    KeyCode::Char(c) => state.push_key_char(c),
+                                    KeyCode::Backspace => state.backspace_key(),
+                                    KeyCode::Esc => state.cancel_key_entry(),
+                                    KeyCode::Enter => {
+                                        if let Some((id, mut key_text)) =
+                                            state.submit_key_entry()
+                                        {
+                                            // The only place in the picker path that
+                                            // touches the keyring — `PickerState`
+                                            // itself stays I/O-free.
+                                            match Credentials::set(&id, key_text.trim()) {
+                                                Ok(()) => {
+                                                    if let Some((c, t)) =
+                                                        needs_key_row(state, &id)
+                                                    {
+                                                        state.mark_key_stored(c, t);
+                                                    }
+                                                }
+                                                Err(e) => state.mark_key_store_failed(&format!(
+                                                    "failed to store key: {e}"
+                                                )),
+                                            }
+                                            key_text.zeroize();
+                                        }
                                     }
+                                    _ => {}
                                 }
-                                KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
-                                _ => {}
+                            } else {
+                                match key.code {
+                                    KeyCode::Up => state.move_up(),
+                                    KeyCode::Down => state.move_down(),
+                                    KeyCode::Char(' ') => state.toggle(),
+                                    KeyCode::Tab => state.cycle_transport(),
+                                    KeyCode::Char('c') => state.set_commander(),
+                                    KeyCode::Enter => {
+                                        if let Some((connections, commander)) = state.submit() {
+                                            settings.connections = connections;
+                                            settings.commander = commander;
+                                            return Ok(true);
+                                        }
+                                    }
+                                    KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -230,6 +268,23 @@ async fn run_picker(
             }
         }
     }
+}
+
+/// Finds the `(candidate, transport)` row that a just-completed key entry belongs
+/// to. `PickerState::submit_key_entry` only hands back the candidate id (its public
+/// surface has no reason to expose row indices), so the caller — this function —
+/// re-derives them from `needs_key`, which singles out exactly the row that could
+/// have opened key entry for that candidate.
+fn needs_key_row(state: &PickerState, id: &str) -> Option<(usize, usize)> {
+    state.candidates().iter().enumerate().find_map(|(ci, c)| {
+        if c.id != id {
+            return None;
+        }
+        c.transports
+            .iter()
+            .position(|t| t.needs_key)
+            .map(|ti| (ci, ti))
+    })
 }
 
 async fn handle_key(
@@ -307,12 +362,20 @@ fn draw_picker(frame: &mut ratatui::Frame, picker: Option<&PickerState>) {
     );
     frame.render_widget(list, chunks[0]);
 
-    let hint = picker
-        .and_then(|p| p.flash.as_deref())
-        .map(str::to_string)
-        .unwrap_or_else(|| {
-            "space toggle · c commander · tab transport · enter connect · q quit".to_string()
-        });
+    // Key entry takes over the hint/flash line with a masked prompt — never the
+    // typed characters themselves, only a `•` per character typed so far.
+    let hint = match picker.and_then(|p| p.key_entry()) {
+        Some((id, len)) => format!(
+            "API key for {id} (stored in OS keyring, never in config; enter confirms, esc cancels): {}",
+            "•".repeat(len)
+        ),
+        None => picker
+            .and_then(|p| p.flash.as_deref())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                "space toggle · c commander · tab transport · enter connect · q quit".to_string()
+            }),
+    };
     frame.render_widget(Paragraph::new(hint), chunks[1]);
 }
 

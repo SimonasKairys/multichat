@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use zeroize::Zeroize;
+
 use crate::config::ConnectionSpec;
 use crate::orchestrator::{Availability, Candidate};
 
@@ -21,14 +23,26 @@ struct Selection {
     chosen: usize,
 }
 
+/// Browsing the row list, or entering a masked API key for a row that has none
+/// stored yet. Kept as an explicit mode rather than a bool so there is exactly one
+/// place ([`PickerState::key_entry`]) the UI has to ask "are we editing text right
+/// now" before routing a keypress.
+enum Mode {
+    Browsing,
+    EnteringKey { candidate: usize, buffer: String },
+}
+
 /// Picker state: candidates discovered up front, plus the user's in-progress
-/// choices. Nothing here touches the filesystem, the network, or a terminal.
+/// choices. Nothing here touches the filesystem, the network, or a terminal — in
+/// particular, key entry never calls the keyring itself; it only hands a typed key
+/// back to the caller (`src/ui/mod.rs::run_picker`), which is the one place that does.
 pub struct PickerState {
     candidates: Vec<Candidate>,
     rows: Vec<RowRef>,
     selections: Vec<Selection>,
     cursor: usize,
     commander: Option<usize>,
+    mode: Mode,
     /// Set when `space`/`enter`/`c` was a no-op, to show in the hint line.
     pub flash: Option<String>,
 }
@@ -76,6 +90,7 @@ impl PickerState {
             selections,
             cursor: 0,
             commander: commander_idx,
+            mode: Mode::Browsing,
             flash: None,
         }
     }
@@ -148,6 +163,19 @@ impl PickerState {
         self.commander == Some(candidate) && self.selections[candidate].chosen == transport
     }
 
+    /// `Some((candidate id, buffer length))` while a masked key prompt is open, so
+    /// the UI can render `API key for <id>: ` followed by one `•` per typed
+    /// character — the buffer's actual contents never leave this module through
+    /// this accessor.
+    pub fn key_entry(&self) -> Option<(&str, usize)> {
+        match &self.mode {
+            Mode::Browsing => None,
+            Mode::EnteringKey { candidate, buffer } => {
+                Some((self.candidates[*candidate].id.as_str(), buffer.len()))
+            }
+        }
+    }
+
     // --- interaction -----------------------------------------------------------
 
     pub fn move_up(&mut self) {
@@ -166,22 +194,53 @@ impl PickerState {
         self.rows.get(self.cursor).copied()
     }
 
-    /// Ticks or unticks the highlighted row. A row backed by an unavailable
-    /// transport is a no-op that surfaces the reason instead — never a silent
-    /// failure, and never a way to select something construction would later drop.
+    /// Ticks or unticks the highlighted row. Enabling a row backed by an
+    /// unavailable transport is a no-op that surfaces the reason instead — never
+    /// a silent failure, and never a way to select something construction would
+    /// later drop. Un-ticking is different: a row can arrive already enabled+
+    /// chosen from saved config (e.g. a key that was removed from the keyring
+    /// after `enabled = true` was written), and construction drops a disabled row
+    /// regardless of its availability — so refusing the un-tick would only trap
+    /// the user with a stale `[x]` they can never clear.
     pub fn toggle(&mut self) {
+        // Key entry routes every keypress through the UI's dedicated match arm
+        // (`push_key_char`/`backspace_key`/`cancel_key_entry`/`submit_key_entry`);
+        // `toggle` should not fire underneath it even if a caller mis-routes.
+        if !matches!(self.mode, Mode::Browsing) {
+            return;
+        }
+
         let Some(row) = self.current_row() else {
             return;
         };
-        let option = &self.candidates[row.candidate].transports[row.transport];
-        if let Availability::Unavailable(reason) = &option.availability {
-            self.flash = Some(reason.clone());
-            return;
+
+        let already_chosen = {
+            let sel = &self.selections[row.candidate];
+            sel.enabled && sel.chosen == row.transport
+        };
+
+        if !already_chosen {
+            let option = &self.candidates[row.candidate].transports[row.transport];
+            if let Availability::Unavailable(reason) = &option.availability {
+                if option.needs_key {
+                    // The one unavailable reason the picker can fix itself: open the
+                    // masked prompt instead of just flashing why the row can't be
+                    // ticked.
+                    self.mode = Mode::EnteringKey {
+                        candidate: row.candidate,
+                        buffer: String::new(),
+                    };
+                    self.flash = None;
+                    return;
+                }
+                self.flash = Some(reason.clone());
+                return;
+            }
         }
         self.flash = None;
 
         let sel = &mut self.selections[row.candidate];
-        if sel.enabled && sel.chosen == row.transport {
+        if already_chosen {
             sel.enabled = false;
             if self.commander == Some(row.candidate) {
                 self.commander = None;
@@ -190,6 +249,83 @@ impl PickerState {
             sel.enabled = true;
             sel.chosen = row.transport;
         }
+    }
+
+    // --- key entry ---------------------------------------------------------------
+
+    /// Appends a typed character to the in-progress key. A no-op outside key-entry
+    /// mode.
+    pub fn push_key_char(&mut self, c: char) {
+        if let Mode::EnteringKey { buffer, .. } = &mut self.mode {
+            buffer.push(c);
+        }
+    }
+
+    /// Deletes the last typed character. A no-op outside key-entry mode or on an
+    /// empty buffer.
+    pub fn backspace_key(&mut self) {
+        if let Mode::EnteringKey { buffer, .. } = &mut self.mode {
+            buffer.pop();
+        }
+    }
+
+    /// Abandons key entry and returns to browsing. The half-typed key must not
+    /// linger anywhere in picker state once the mode ends, so the buffer is
+    /// zeroized rather than just dropped — an ordinary `String` drop frees its heap
+    /// allocation without clearing it first.
+    pub fn cancel_key_entry(&mut self) {
+        if let Mode::EnteringKey { mut buffer, .. } =
+            std::mem::replace(&mut self.mode, Mode::Browsing)
+        {
+            buffer.zeroize();
+        }
+    }
+
+    /// On a non-empty buffer, leaves key-entry mode and hands the typed key to the
+    /// caller as `(candidate_id, key)` — this is the only copy of the key that
+    /// survives the call; the picker keeps none. On an empty buffer, cancels
+    /// instead (with a flash) and returns `None`: an empty key is never something
+    /// to attempt storing.
+    pub fn submit_key_entry(&mut self) -> Option<(String, String)> {
+        let (candidate, is_empty) = match &self.mode {
+            Mode::EnteringKey { candidate, buffer } => (*candidate, buffer.is_empty()),
+            Mode::Browsing => return None,
+        };
+
+        if is_empty {
+            self.flash = Some("empty key — nothing stored".into());
+            self.cancel_key_entry();
+            return None;
+        }
+
+        let id = self.candidates[candidate].id.clone();
+        match std::mem::replace(&mut self.mode, Mode::Browsing) {
+            Mode::EnteringKey { buffer, .. } => Some((id, buffer)),
+            Mode::Browsing => unreachable!("checked above: mode was EnteringKey"),
+        }
+    }
+
+    /// Called by the UI after it has written the key to the OS keyring: flips the
+    /// row to available, ticks it (mirrors the normal enabling path in `toggle`,
+    /// since this row is now exactly as selectable as any other available one), and
+    /// flashes confirmation.
+    pub fn mark_key_stored(&mut self, candidate: usize, transport: usize) {
+        let option = &mut self.candidates[candidate].transports[transport];
+        option.availability = Availability::Available;
+        option.needs_key = false;
+
+        let sel = &mut self.selections[candidate];
+        sel.enabled = true;
+        sel.chosen = transport;
+
+        self.flash = Some("key stored in OS keyring".into());
+    }
+
+    /// Called by the UI when the keyring write itself failed. Stays in browsing
+    /// mode — key entry already ended when `submit_key_entry` returned the key — and
+    /// just surfaces why nothing was stored.
+    pub fn mark_key_store_failed(&mut self, error: &str) {
+        self.flash = Some(error.to_string());
     }
 
     /// Cycles which transport the highlighted candidate would use, without changing
@@ -287,12 +423,13 @@ mod tests {
                 detail: String::new(),
                 availability: Availability::Available,
                 cli: None,
+                needs_key: false,
             }],
         }
     }
 
     /// A vendor with two transport rows: CLI (available or not) and API (always
-    /// unavailable here, standing in for "no key stored").
+    /// unavailable here, standing in for "no key stored" — `needs_key` set to match).
     fn candidate_dual(id: &str, cli_available: bool) -> Candidate {
         Candidate {
             id: id.into(),
@@ -314,6 +451,7 @@ mod tests {
                         args: vec![],
                         system_arg: None,
                     }),
+                    needs_key: false,
                 },
                 crate::orchestrator::TransportOption {
                     transport: Some(Transport::Api),
@@ -321,8 +459,28 @@ mod tests {
                     detail: "(no key stored)".into(),
                     availability: Availability::Unavailable("no key stored".into()),
                     cli: None,
+                    needs_key: true,
                 },
             ],
+        }
+    }
+
+    /// A single-row candidate unavailable for a reason the picker cannot fix by
+    /// prompting (e.g. a classified-mode refusal) — `needs_key` is false, unlike
+    /// `candidate_dual`'s API row.
+    fn candidate_refused(id: &str, reason: &str) -> Candidate {
+        Candidate {
+            id: id.into(),
+            group: id.to_uppercase(),
+            model: id.into(),
+            transports: vec![crate::orchestrator::TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: String::new(),
+                availability: Availability::Unavailable(reason.into()),
+                cli: None,
+                needs_key: false,
+            }],
         }
     }
 
@@ -350,13 +508,142 @@ mod tests {
     }
 
     #[test]
-    fn no_op_toggle_on_an_unavailable_row_flashes_the_reason() {
+    fn toggling_a_no_key_api_row_opens_key_entry_instead_of_flashing() {
         let candidates = vec![candidate_dual("anthropic", true)];
         let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
         picker.move_down(); // the API row: no key stored
         picker.toggle();
+
         assert!(!picker.is_checked(0, 1));
-        assert_eq!(picker.flash.as_deref(), Some("no key stored"));
+        assert!(picker.flash.is_none());
+        let (id, len) = picker
+            .key_entry()
+            .expect("toggle on a needs_key row should open key entry");
+        assert_eq!(id, "anthropic");
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn a_row_unavailable_for_other_reasons_still_flashes_not_prompts() {
+        // A classified-mode refusal is unavailable for a reason the picker cannot
+        // fix by prompting, so `needs_key` is false and the old flash behaviour
+        // must still apply.
+        let candidates = vec![candidate_refused(
+            "anthropic",
+            "cloud APIs are refused under --classified",
+        )];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.toggle();
+
+        assert!(picker.key_entry().is_none());
+        assert!(!picker.is_checked(0, 0));
+        assert_eq!(
+            picker.flash.as_deref(),
+            Some("cloud APIs are refused under --classified")
+        );
+    }
+
+    #[test]
+    fn typed_key_chars_accumulate_and_backspace_deletes() {
+        let candidates = vec![candidate_dual("anthropic", true)];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down();
+        picker.toggle();
+
+        picker.push_key_char('s');
+        picker.push_key_char('k');
+        picker.push_key_char('-');
+        assert_eq!(picker.key_entry().unwrap().1, 3);
+
+        picker.backspace_key();
+        assert_eq!(picker.key_entry().unwrap().1, 2);
+    }
+
+    #[test]
+    fn esc_cancels_key_entry_and_wipes_the_buffer() {
+        let candidates = vec![candidate_dual("anthropic", true)];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down();
+        picker.toggle();
+        picker.push_key_char('x');
+
+        picker.cancel_key_entry();
+
+        assert!(picker.key_entry().is_none());
+        // Cancelling leaves the row exactly as it was: unavailable and un-ticked.
+        assert!(!picker.is_checked(0, 1));
+    }
+
+    #[test]
+    fn submitting_an_empty_key_stores_nothing_and_flashes() {
+        let candidates = vec![candidate_dual("anthropic", true)];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down();
+        picker.toggle();
+
+        let result = picker.submit_key_entry();
+
+        assert!(result.is_none());
+        assert!(picker.key_entry().is_none());
+        assert_eq!(picker.flash.as_deref(), Some("empty key — nothing stored"));
+    }
+
+    #[test]
+    fn a_submitted_key_is_handed_off_exactly_once() {
+        let candidates = vec![candidate_dual("anthropic", true)];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down();
+        picker.toggle();
+        picker.push_key_char('s');
+        picker.push_key_char('k');
+
+        let (id, key) = picker
+            .submit_key_entry()
+            .expect("a non-empty buffer should submit");
+        assert_eq!(id, "anthropic");
+        assert_eq!(key, "sk");
+        assert!(picker.key_entry().is_none());
+
+        // The buffer was transferred out, not copied: a second submit in a row (the
+        // mode is already back to Browsing) hands off nothing.
+        assert!(picker.submit_key_entry().is_none());
+    }
+
+    #[test]
+    fn mark_key_stored_ticks_the_row_and_makes_it_available() {
+        let candidates = vec![candidate_dual("anthropic", true)];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down();
+        picker.toggle();
+        picker.push_key_char('s');
+        let _ = picker.submit_key_entry();
+
+        picker.mark_key_stored(0, 1);
+
+        assert!(picker.is_checked(0, 1));
+        assert!(
+            picker.candidates()[0].transports[1]
+                .availability
+                .is_available()
+        );
+        assert!(!picker.candidates()[0].transports[1].needs_key);
+        assert_eq!(picker.flash.as_deref(), Some("key stored in OS keyring"));
+    }
+
+    #[test]
+    fn mark_key_store_failed_flashes_the_error_and_stays_in_browsing() {
+        let candidates = vec![candidate_dual("anthropic", true)];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down();
+        picker.toggle();
+        picker.push_key_char('s');
+        let _ = picker.submit_key_entry();
+
+        picker.mark_key_store_failed("keyring is locked");
+
+        assert_eq!(picker.flash.as_deref(), Some("keyring is locked"));
+        assert!(picker.key_entry().is_none());
+        assert!(!picker.is_checked(0, 1));
     }
 
     #[test]
@@ -385,6 +672,35 @@ mod tests {
         assert_eq!(picker.flash.as_deref(), Some("no key stored"));
         assert!(!picker.is_commander(0, 1));
         assert!(!picker.is_checked(0, 1));
+    }
+
+    #[test]
+    fn an_unavailable_row_that_is_already_ticked_can_still_be_unticked() {
+        // Saved config can carry `enabled = true` for a transport that has since
+        // gone unavailable (e.g. the API key was removed from the keyring after
+        // the config was written). Construction drops a disabled row either way,
+        // so refusing the un-tick would trap the user with a permanent `[x]`.
+        let candidates = vec![candidate_dual("google", false)];
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "google".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Api),
+                path: None,
+                model: None,
+            },
+        );
+        let mut picker = PickerState::new(candidates, &connections, Some("google"), false);
+        assert!(picker.is_checked(0, 1));
+        assert!(picker.is_commander(0, 1));
+
+        picker.move_down(); // land on the API row
+        picker.toggle();
+
+        assert!(!picker.is_checked(0, 1));
+        assert!(picker.flash.is_none());
+        assert!(!picker.is_commander(0, 1));
     }
 
     #[test]

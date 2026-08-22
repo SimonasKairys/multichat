@@ -50,8 +50,9 @@ pub struct PickerState {
 impl PickerState {
     /// Builds the initial state. On first run (`first_run` — the saved config has no
     /// `connections` at all) every available candidate starts ticked with its first
-    /// available transport, and the first ticked one is commander: today's "connect
-    /// everything" behaviour, so the user unticks rather than starting from nothing.
+    /// available transport, but no commander is chosen — the user must explicitly
+    /// pick one with `c` before `submit` will succeed; a silent auto-pick would let
+    /// a session start against a model the user never meant to be primary.
     /// Otherwise the saved `connections`/`commander` are restored verbatim.
     pub fn new(
         candidates: Vec<Candidate>,
@@ -75,14 +76,12 @@ impl PickerState {
             })
             .collect();
 
+        // A prior explicit choice (the saved `commander`) is honored regardless of
+        // `first_run`. There is no first-run fallback here: the user must pick a
+        // commander themselves, via `set_commander`, before `submit` will succeed.
         let commander_idx = commander
             .and_then(|label| candidates.iter().position(|c| c.id == label))
-            .filter(|&i| selections[i].enabled)
-            .or_else(|| {
-                first_run
-                    .then(|| (0..candidates.len()).find(|&i| selections[i].enabled))
-                    .flatten()
-            });
+            .filter(|&i| selections[i].enabled);
 
         Self {
             candidates,
@@ -368,13 +367,21 @@ impl PickerState {
     }
 
     /// Finalises the picker into a `connections`/`commander` pair to persist, or
-    /// refuses (setting `flash`) if nothing is ticked — starting a session with no
-    /// providers is a worse outcome than asking again.
+    /// refuses (setting `flash`) if nothing is ticked, or if no commander has been
+    /// chosen — starting a session with no providers, or with no model designated to
+    /// receive prompts, is a worse outcome than asking again. The nothing-ticked
+    /// check runs first: a user who hasn't ticked anything should be told that,
+    /// not sent chasing a commander they can't set on an empty selection.
     pub fn submit(&mut self) -> Option<(BTreeMap<String, ConnectionSpec>, Option<String>)> {
         if !self.selections.iter().any(|s| s.enabled) {
             self.flash = Some("tick at least one connection before connecting".into());
             return None;
         }
+
+        let Some(commander_idx) = self.commander else {
+            self.flash = Some("press `c` to choose a commander before connecting".into());
+            return None;
+        };
 
         let mut connections = BTreeMap::new();
         for (i, candidate) in self.candidates.iter().enumerate() {
@@ -391,18 +398,9 @@ impl PickerState {
             );
         }
 
-        let commander = self
-            .commander
-            .map(|i| self.candidates[i].id.clone())
-            .or_else(|| {
-                self.candidates
-                    .iter()
-                    .enumerate()
-                    .find(|(i, _)| self.selections[*i].enabled)
-                    .map(|(_, c)| c.id.clone())
-            });
+        let commander = self.candidates[commander_idx].id.clone();
 
-        Some((connections, commander))
+        Some((connections, Some(commander)))
     }
 }
 
@@ -715,6 +713,28 @@ mod tests {
     }
 
     #[test]
+    fn unticking_the_commander_forces_choosing_one_again_before_connecting() {
+        let candidates = vec![candidate_single("ollama:llama3")];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.toggle();
+        picker.set_commander();
+        assert!(picker.is_commander(0, 0));
+
+        picker.toggle(); // unticks the commander row, clearing `commander` too
+        picker.toggle(); // re-ticks it, but that alone does not restore commander status
+        assert!(!picker.is_commander(0, 0));
+
+        assert!(picker.submit().is_none());
+        assert_eq!(
+            picker.flash.as_deref(),
+            Some("press `c` to choose a commander before connecting")
+        );
+
+        picker.set_commander();
+        assert!(picker.submit().is_some());
+    }
+
+    #[test]
     fn submitting_an_empty_selection_is_refused() {
         let candidates = vec![candidate_single("ollama:llama3")];
         let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
@@ -734,6 +754,34 @@ mod tests {
     }
 
     #[test]
+    fn submitting_without_a_commander_refuses_and_flashes() {
+        let candidates = vec![candidate_single("ollama:llama3")];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.toggle(); // ticked, but no commander chosen
+
+        assert!(picker.submit().is_none());
+        assert_eq!(
+            picker.flash.as_deref(),
+            Some("press `c` to choose a commander before connecting")
+        );
+    }
+
+    #[test]
+    fn submitting_with_nothing_ticked_still_reports_that_first() {
+        // Pins the ordering: with nothing ticked *and* no commander chosen, the
+        // nothing-ticked flash must win — telling the user about a missing
+        // commander first would be solving the wrong problem.
+        let candidates = vec![candidate_single("ollama:llama3")];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        assert!(picker.submit().is_none());
+        assert_eq!(
+            picker.flash.as_deref(),
+            Some("tick at least one connection before connecting")
+        );
+    }
+
+    #[test]
     fn first_run_pre_ticks_every_available_candidate() {
         let candidates = vec![
             candidate_single("ollama:llama3"),
@@ -744,7 +792,25 @@ mod tests {
         // anthropic's first available transport is CLI (index 0); API (index 1) is
         // unavailable in this fixture.
         assert!(picker.is_checked(1, 0));
-        assert!(picker.is_commander(0, 0));
+        // Ticking is automatic on first run; choosing a commander is not — see
+        // `a_first_run_starts_with_no_commander_until_the_user_picks_one`.
+        assert!(!picker.is_commander(0, 0));
+        assert!(!picker.is_commander(1, 0));
+    }
+
+    #[test]
+    fn a_first_run_starts_with_no_commander_until_the_user_picks_one() {
+        let candidates = vec![
+            candidate_single("ollama:llama3"),
+            candidate_dual("anthropic", true),
+        ];
+        let picker = PickerState::new(candidates, &BTreeMap::new(), None, true);
+        assert!(picker.is_checked(0, 0));
+        assert!(picker.is_checked(1, 0));
+
+        for row in picker.rows() {
+            assert!(!picker.is_commander(row.candidate, row.transport));
+        }
     }
 
     #[test]
@@ -763,6 +829,28 @@ mod tests {
         let picker = PickerState::new(candidates, &connections, Some("anthropic"), false);
         assert!(picker.is_checked(0, 0));
         assert!(picker.is_commander(0, 0));
+    }
+
+    #[test]
+    fn a_saved_commander_is_restored_without_asking_again() {
+        let candidates = vec![candidate_single("ollama:llama3")];
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "ollama:llama3".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: None,
+                path: None,
+                model: None,
+            },
+        );
+        let mut picker = PickerState::new(candidates, &connections, Some("ollama:llama3"), false);
+        assert!(picker.is_commander(0, 0));
+
+        let (connections, commander) = picker.submit().expect("a restored commander should submit");
+        assert!(connections["ollama:llama3"].enabled);
+        assert_eq!(commander.as_deref(), Some("ollama:llama3"));
+        assert!(picker.flash.is_none());
     }
 
     #[test]

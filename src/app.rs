@@ -36,6 +36,38 @@ impl Line {
     }
 }
 
+/// What a `/commander` line typed in the chat input means, resolved before it ever
+/// reaches the orchestrator. This is the only slash command the TUI understands
+/// today — anything else starting with `/` is ordinary prompt text, so this stays a
+/// single recognizer rather than a general command framework.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommanderCommand {
+    /// Bare `/commander`: list the roster instead of sending anything to a model.
+    List,
+    /// `/commander <name>`: switch to it. `name` is passed through unresolved —
+    /// matching it against a label, bare model name, or provider name happens on the
+    /// orchestrator side, against the live registry (`Registry::set_primary`).
+    SwitchTo(String),
+}
+
+/// Recognises `/commander` as exactly the first whitespace-separated token — never a
+/// prefix — so `/commanders foo` or `/commander-old` are not the command and fall
+/// through to the model unchanged, same as any other `/`-prefixed text a model might
+/// reasonably expect verbatim (`/etc/passwd is a file`, `/help`).
+pub fn parse_commander_command(text: &str) -> Option<CommanderCommand> {
+    let trimmed = text.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    if parts.next()? != "/commander" {
+        return None;
+    }
+    let rest = parts.next().unwrap_or("").trim();
+    Some(if rest.is_empty() {
+        CommanderCommand::List
+    } else {
+        CommanderCommand::SwitchTo(rest.to_string())
+    })
+}
+
 pub struct App {
     pub input: String,
     pub transcript: Vec<Line>,
@@ -44,6 +76,10 @@ pub struct App {
     /// True while the orchestrator is working on a turn.
     pub busy: bool,
     pub primary: String,
+    /// Every connected label, kept so `/commander`'s bare form can list them without
+    /// a round trip to the orchestrator — this is already handed to `App::new` and
+    /// refreshed on `Reconfigured`, so retaining it is the only plumbing needed.
+    pub roster: Vec<String>,
     pub should_quit: bool,
 }
 
@@ -66,6 +102,7 @@ impl App {
             scroll: 0,
             busy: false,
             primary,
+            roster: roster.to_vec(),
             should_quit: false,
         }
     }
@@ -115,6 +152,7 @@ impl App {
             Event::TurnComplete => self.busy = false,
             Event::Reconfigured { primary, roster } => {
                 self.primary = primary.clone();
+                self.roster = roster.clone();
                 self.transcript.push(Line {
                     speaker: Speaker::System,
                     text: format!("connections updated — commander: {primary}"),
@@ -126,7 +164,48 @@ impl App {
                     });
                 }
             }
+            Event::CommanderChanged { label, .. } => {
+                self.primary = label.clone();
+                self.transcript.push(Line {
+                    speaker: Speaker::System,
+                    text: format!("commander: {label}"),
+                });
+            }
         }
+    }
+
+    /// Renders `/commander`'s bare-form listing into the transcript: every connected
+    /// label, with the current commander marked, in the same `swarm: a, b, c` shape
+    /// `Event::Reconfigured`'s handler already uses so this reads as native system
+    /// output rather than a bolted-on command reply. This never reaches the
+    /// orchestrator, so it must clear `busy` itself — see `finish_local_command`.
+    pub fn list_commander(&mut self) {
+        let listing = self
+            .roster
+            .iter()
+            .map(|label| {
+                if *label == self.primary {
+                    format!("{label} (commander)")
+                } else {
+                    label.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.transcript.push(Line {
+            speaker: Speaker::System,
+            text: format!("swarm: {listing}"),
+        });
+        self.finish_local_command();
+    }
+
+    /// Clears `busy` after a command handled entirely by the UI, with no round trip
+    /// to the orchestrator. `submit()` optimistically sets `busy` assuming a model
+    /// turn started; a locally-handled command produces no `TurnComplete` to clear
+    /// it, so callers that short-circuit before sending a `Command` must call this
+    /// instead.
+    pub fn finish_local_command(&mut self) {
+        self.busy = false;
     }
 
     pub fn scroll_up(&mut self) {
@@ -153,7 +232,7 @@ impl App {
             format!("{} · working… (Esc to quit)", self.primary)
         } else {
             format!(
-                "{} · Enter send · Ctrl+O connections · Esc quit",
+                "{} · Enter send · /commander · Ctrl+O connections · Esc quit",
                 self.primary
             )
         }
@@ -248,6 +327,92 @@ mod tests {
             app.body()
                 .contains("swarm: anthropic:claude-opus-5, ollama:llama3")
         );
+    }
+
+    #[test]
+    fn a_commander_change_updates_the_primary_and_status_line() {
+        let mut app = app();
+        app.apply(Event::CommanderChanged {
+            label: "anthropic:claude-opus-5".into(),
+            connection_id: Some("anthropic".into()),
+        });
+        assert_eq!(app.primary, "anthropic:claude-opus-5");
+        assert!(app.status_line().contains("anthropic:claude-opus-5"));
+        assert!(app.body().contains("commander: anthropic:claude-opus-5"));
+    }
+
+    #[test]
+    fn handling_a_local_command_clears_busy() {
+        // `/commander` (bare form) never reaches the orchestrator, so there is no
+        // `TurnComplete` to clear the `busy` flag `submit()` set optimistically —
+        // `finish_local_command` (and anything that calls it, like `list_commander`)
+        // must clear it directly.
+        let mut app = app();
+        app.push_char('x');
+        app.submit();
+        assert!(app.busy);
+        app.finish_local_command();
+        assert!(!app.busy);
+    }
+
+    #[test]
+    fn listing_the_commander_marks_the_current_one_and_clears_busy() {
+        let mut app = App::new(
+            "ollama:llama3",
+            &[
+                "ollama:llama3".to_string(),
+                "anthropic:claude-opus-5".to_string(),
+            ],
+        );
+        app.push_char('x');
+        app.submit();
+        assert!(app.busy);
+
+        app.list_commander();
+
+        assert!(!app.busy);
+        assert!(
+            app.body()
+                .contains("swarm: ollama:llama3 (commander), anthropic:claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn a_bare_commander_command_is_recognised() {
+        assert_eq!(
+            parse_commander_command("/commander"),
+            Some(CommanderCommand::List)
+        );
+        // Leading/trailing whitespace around the whole line must not matter.
+        assert_eq!(
+            parse_commander_command("  /commander  "),
+            Some(CommanderCommand::List)
+        );
+    }
+
+    #[test]
+    fn a_commander_command_with_a_name_carries_the_name() {
+        assert_eq!(
+            parse_commander_command("/commander claude"),
+            Some(CommanderCommand::SwitchTo("claude".to_string()))
+        );
+        assert_eq!(
+            parse_commander_command("/commander  llama3.2:3b  "),
+            Some(CommanderCommand::SwitchTo("llama3.2:3b".to_string())),
+            "extra internal/trailing whitespace around the argument must be trimmed"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_message_starting_with_a_slash_is_not_a_command() {
+        assert_eq!(parse_commander_command("/etc/passwd is a file"), None);
+        assert_eq!(parse_commander_command("/help"), None);
+    }
+
+    #[test]
+    fn commander_command_matching_is_exact_not_a_prefix() {
+        assert_eq!(parse_commander_command("/commanders foo"), None);
+        assert_eq!(parse_commander_command("/commander-old"), None);
     }
 
     #[test]

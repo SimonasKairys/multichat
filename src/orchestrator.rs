@@ -30,6 +30,10 @@ pub enum Command {
     /// inside chat). The orchestrator rebuilds its registry from this and resets the
     /// swarm roster so the system prompt matches reality.
     Reconfigure(Settings),
+    /// `/commander <name>` typed in chat: switch the primary, live, to whatever
+    /// `name` resolves to against the current registry (exact label, bare model
+    /// name, or provider name — the same rule `Registry::get` uses).
+    SetCommander(String),
 }
 
 impl std::fmt::Debug for Command {
@@ -40,6 +44,9 @@ impl std::fmt::Debug for Command {
             // `Settings` can carry API-shaped strings the user typed as endpoint
             // overrides; never derive Debug through it into a log line.
             Command::Reconfigure(_) => write!(f, "Reconfigure(..)"),
+            // User-typed but not secret (it is a model name/label the user chose),
+            // unlike `Settings` above — fine to print verbatim.
+            Command::SetCommander(name) => f.debug_tuple("SetCommander").field(name).finish(),
         }
     }
 }
@@ -64,6 +71,15 @@ pub enum Event {
     Reconfigured {
         primary: String,
         roster: Vec<String>,
+    },
+    /// `/commander <name>` resolved and switched the primary. `connection_id` is
+    /// `settings.commander`'s key (see `Registry::connection_id`'s doc comment for
+    /// why that differs from `label`) — `None` only if the label somehow has no
+    /// backing connection id, in which case the UI still switches for the session
+    /// but has nothing to persist.
+    CommanderChanged {
+        label: String,
+        connection_id: Option<String>,
     },
 }
 
@@ -529,6 +545,11 @@ pub struct Registry {
     /// to the audit trail so an entry carries real config identity (addresses part
     /// of audit finding 2.3).
     applied: BTreeMap<String, ConnectionSpec>,
+    /// Maps a provider's label back to the connection id it was built from. Needed
+    /// because a live commander switch (`/commander <name>`) must persist
+    /// `settings.commander`, which is a connection id, not a label — see
+    /// `resolve_commander`'s doc comment for why the two are not interchangeable.
+    connection_ids: BTreeMap<String, String>,
 }
 
 impl Registry {
@@ -551,6 +572,7 @@ impl Registry {
         let client = http_client()?;
         let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
         let mut applied: BTreeMap<String, ConnectionSpec> = BTreeMap::new();
+        let mut connection_ids: BTreeMap<String, String> = BTreeMap::new();
 
         if settings.connections.is_empty() {
             for candidate in &candidates {
@@ -569,7 +591,9 @@ impl Registry {
                 };
                 match construct_provider(candidate, option.transport, &conn, &client, settings) {
                     Ok(p) => {
-                        providers.insert(p.label(), p);
+                        let label = p.label();
+                        connection_ids.insert(label.clone(), candidate.id.clone());
+                        providers.insert(label, p);
                         applied.insert(candidate.id.clone(), conn);
                     }
                     Err(e) => eprintln!("[discovery] skipping {}: {e}", candidate.id),
@@ -608,7 +632,9 @@ impl Registry {
                 }
                 match construct_provider(candidate, transport, conn, &client, settings) {
                     Ok(p) => {
-                        providers.insert(p.label(), p);
+                        let label = p.label();
+                        connection_ids.insert(label.clone(), id.clone());
+                        providers.insert(label, p);
                         applied.insert(id.clone(), conn.clone());
                     }
                     Err(e) => eprintln!("[discovery] skipping {id}: {e}"),
@@ -654,6 +680,7 @@ impl Registry {
             providers,
             primary,
             applied,
+            connection_ids,
         })
     }
 
@@ -718,6 +745,22 @@ impl Registry {
 
     pub fn applied_connections(&self) -> &BTreeMap<String, ConnectionSpec> {
         &self.applied
+    }
+
+    /// The connection id a label was built from, for persisting `settings.commander`
+    /// after a live switch. See the field doc comment on `connection_ids`.
+    pub fn connection_id(&self, label: &str) -> Option<&str> {
+        self.connection_ids.get(label).map(String::as_str)
+    }
+
+    /// Switches the primary to whatever `want` resolves to, using the same flexible
+    /// matching as `get` (exact label, bare model name, or provider name). Returns
+    /// the resolved label on success; leaves `primary` untouched on no match, so a
+    /// bad `/commander` argument never leaves the session without a commander.
+    pub fn set_primary(&mut self, want: &str) -> Option<String> {
+        let label = Self::match_label(&self.providers, want)?;
+        self.primary = label.clone();
+        Some(label)
     }
 }
 
@@ -818,6 +861,14 @@ impl Orchestrator {
                 Command::Reconfigure(settings) => {
                     self.reconfigure(settings).await;
                 }
+                Command::SetCommander(name) => {
+                    self.set_commander(&name).await;
+                    // Mirrors `Command::Prompt`: `submit()` set `busy` optimistically
+                    // for every command typed in chat, so this must always clear it,
+                    // success or failure, the same way a prompt's `TurnComplete`
+                    // always follows regardless of whether the reply was an error.
+                    self.emit(Event::TurnComplete).await;
+                }
             }
         }
 
@@ -850,6 +901,32 @@ impl Orchestrator {
                 let _ = self.audit.log("connections.failed", &format!("error={e}"));
                 self.emit(Event::Error(format!(
                     "failed to apply new connections: {e}"
+                )))
+                .await;
+            }
+        }
+    }
+
+    /// Handles `/commander <name>` typed in chat: resolves `name` against the live
+    /// registry and, on success, switches the primary for the rest of the session and
+    /// tells the UI what to persist. On no match, the registry (and the session's
+    /// commander) are left exactly as they were — the same "leave it alone on
+    /// failure" rule `reconfigure` follows.
+    async fn set_commander(&mut self, name: &str) {
+        match self.registry.set_primary(name) {
+            Some(label) => {
+                let connection_id = self.registry.connection_id(&label).map(str::to_string);
+                let _ = self.audit.log("commander.changed", &format!("to={label}"));
+                self.emit(Event::CommanderChanged {
+                    label,
+                    connection_id,
+                })
+                .await;
+            }
+            None => {
+                self.emit(Event::Error(format!(
+                    "no model matches `{name}`. Available: {}",
+                    self.registry.labels().join(", ")
                 )))
                 .await;
             }
@@ -1148,6 +1225,7 @@ mod tests {
             providers,
             primary: primary.to_string(),
             applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
         }
     }
 
@@ -1178,6 +1256,62 @@ mod tests {
         let labels = reg.labels();
         assert!(labels.contains(&"ollama:llama3".to_string()));
         assert!(labels.contains(&"anthropic:claude-opus-5".to_string()));
+    }
+
+    #[test]
+    fn set_primary_accepts_a_bare_model_name_or_provider_name() {
+        let mut reg = registry_with(
+            vec![
+                ("ollama", "llama3", false),
+                ("anthropic", "claude-opus-5", true),
+            ],
+            "ollama:llama3",
+        );
+
+        assert_eq!(
+            reg.set_primary("claude-opus-5").as_deref(),
+            Some("anthropic:claude-opus-5"),
+            "a bare model name must resolve"
+        );
+        assert_eq!(reg.primary(), "anthropic:claude-opus-5");
+
+        assert_eq!(
+            reg.set_primary("ollama").as_deref(),
+            Some("ollama:llama3"),
+            "a bare provider name must resolve"
+        );
+        assert_eq!(reg.primary(), "ollama:llama3");
+    }
+
+    #[test]
+    fn set_primary_rejects_an_unknown_model_and_leaves_the_primary_alone() {
+        let mut reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+        assert_eq!(reg.set_primary("ghost"), None);
+        assert_eq!(reg.primary(), "ollama:llama3");
+    }
+
+    #[test]
+    fn a_labels_connection_id_round_trips() {
+        let p = StubProvider {
+            provider: "anthropic".into(),
+            model: "claude-opus-5".into(),
+            remote: true,
+        };
+        let label = p.label();
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(label.clone(), Arc::new(p));
+        let mut connection_ids = BTreeMap::new();
+        connection_ids.insert(label.clone(), "anthropic".to_string());
+
+        let reg = Registry {
+            providers,
+            primary: label.clone(),
+            applied: BTreeMap::new(),
+            connection_ids,
+        };
+
+        assert_eq!(reg.connection_id(&label), Some("anthropic"));
+        assert_eq!(reg.connection_id("nonexistent"), None);
     }
 
     #[test]
@@ -1456,6 +1590,7 @@ mod tests {
             providers,
             primary: "ollama:llama3".to_string(),
             applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
         };
 
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1647,6 +1782,72 @@ mod tests {
         assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
         // The old registry is untouched: still has the original primary.
         assert_eq!(orch.registry.primary(), "ollama:llama3");
+    }
+
+    #[tokio::test]
+    async fn set_commander_switches_the_primary_and_emits_the_resolved_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let reg = registry_with(
+            vec![("ollama", "llama3", false), ("ollama", "mistral", false)],
+            "ollama:llama3",
+        );
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        // Bare model name, not the full label — exercises `set_primary`'s flexible
+        // matching through the command path, not just directly on `Registry`.
+        orch.set_commander("mistral").await;
+
+        assert_eq!(orch.registry.primary(), "ollama:mistral");
+        match event_rx.try_recv() {
+            Ok(Event::CommanderChanged {
+                label,
+                connection_id,
+            }) => {
+                assert_eq!(label, "ollama:mistral");
+                // `registry_with` never populates `connection_ids`, mirroring a
+                // provider with no backing connection — the switch must still
+                // succeed, just with nothing to persist.
+                assert_eq!(connection_id, None);
+            }
+            other => panic!("expected CommanderChanged, got {other:?}"),
+        }
+        let audit_text = std::fs::read_to_string(&paths.audit_log).unwrap();
+        assert!(audit_text.contains("commander.changed"));
+        assert!(audit_text.contains("to=ollama:mistral"));
+    }
+
+    #[tokio::test]
+    async fn set_commander_with_an_unknown_name_emits_an_error_and_leaves_primary_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            events: event_tx,
+            classified: false,
+        };
+
+        orch.set_commander("ghost").await;
+
+        assert_eq!(orch.registry.primary(), "ollama:llama3");
+        assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
     }
 
     #[tokio::test]

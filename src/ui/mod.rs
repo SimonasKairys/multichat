@@ -22,7 +22,7 @@ use std::io::{self, Stdout};
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
 
-use crate::app::App;
+use crate::app::{App, CommanderCommand, parse_commander_command};
 use crate::config::{Credentials, Settings};
 use crate::orchestrator::{Command, Event, discover_candidates};
 use crate::picker::PickerState;
@@ -111,6 +111,27 @@ pub async fn run(
             }
             maybe_event = events.recv() => {
                 match maybe_event {
+                    // Persisting the new commander here, rather than in `App::apply`,
+                    // is what keeps `App` free of I/O: `App::apply` only ever updates
+                    // in-memory state. Mirrors `reopen_picker`'s `settings.save` below.
+                    Some(Event::CommanderChanged { label, connection_id }) => {
+                        app.apply(Event::CommanderChanged {
+                            label,
+                            connection_id: connection_id.clone(),
+                        });
+                        if let Some(id) = connection_id {
+                            settings.commander = Some(id);
+                            if let Err(e) = settings.save(&paths) {
+                                app.apply(Event::Error(format!(
+                                    "failed to save commander: {e}"
+                                )));
+                            }
+                        }
+                        // No backing connection id (shouldn't happen on the normal
+                        // path — see `Event::CommanderChanged`'s doc comment): the
+                        // switch already happened for this session, just nothing to
+                        // persist, so silently skipping here is correct, not a bug.
+                    }
                     Some(event) => app.apply(event),
                     // Orchestrator shut down; nothing more can arrive.
                     None => break,
@@ -300,11 +321,26 @@ async fn handle_key(
         }
         KeyCode::Enter => {
             if let Some(prompt) = app.submit() {
-                // A full channel means the orchestrator is backed up; report rather
-                // than silently dropping the user's message.
-                if commands.send(Command::Prompt(prompt)).await.is_err() {
-                    app.apply(Event::Error("orchestrator is not running".into()));
-                    app.busy = false;
+                // `submit()` already recorded the typed text as the user's line and
+                // set `busy = true`, assuming a model turn — both correct even for a
+                // `/commander` command; only how the text is dispatched differs
+                // below, and the bare-listing branch has to undo the `busy` guess.
+                match parse_commander_command(&prompt) {
+                    Some(CommanderCommand::List) => app.list_commander(),
+                    Some(CommanderCommand::SwitchTo(name)) => {
+                        if commands.send(Command::SetCommander(name)).await.is_err() {
+                            app.apply(Event::Error("orchestrator is not running".into()));
+                            app.busy = false;
+                        }
+                    }
+                    None => {
+                        // A full channel means the orchestrator is backed up; report
+                        // rather than silently dropping the user's message.
+                        if commands.send(Command::Prompt(prompt)).await.is_err() {
+                            app.apply(Event::Error("orchestrator is not running".into()));
+                            app.busy = false;
+                        }
+                    }
                 }
             }
         }

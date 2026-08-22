@@ -24,7 +24,7 @@ cargo build --release
 ```sh
 simon models                 # list every model this machine can reach
 simon auth anthropic         # store an API key (prompts; never pass it as an argument)
-simon chat                   # start the TUI with the first available model
+simon chat                   # choose connections and a commander, then chat
 simon chat -m ollama:llama3  # pick a commander explicitly
 simon chat --classified      # local models only, no network egress
 simon chat --vault           # persist the transcript, encrypted, across sessions
@@ -44,8 +44,18 @@ row marked `(no key stored)` to open a masked entry field instead of quitting to
 `simon auth`. Either way, the key lands in the OS keyring only — never in
 `config.json`.
 
+In the picker: **space** ticks a connection, **c** marks the highlighted row
+commander, **tab** cycles a candidate's transport, and **enter** connects — but only
+once a commander has been chosen; until then it just flashes a reminder to press
+**c**. `simon chat -m <label>` skips the picker and picks the commander
+non-interactively instead.
+
 In the TUI: type and press **Enter** to send, **PageUp/PageDown** to scroll, **Esc** or
-**Ctrl-C** to quit.
+**Ctrl-C** to quit. Type `/commander` on its own to list every connected model with
+the current commander marked, or `/commander <name>` (a full label, a bare model
+name, or a provider name) to switch commanders live, without leaving the
+conversation — the choice persists across restarts, same as the picker's. Neither
+form is ever sent to a model as a prompt.
 
 `--vault` persists the TUI transcript — what you and the models said — to an encrypted
 file so it survives between runs of `simon chat --vault`. It is **not** conversation

@@ -105,53 +105,29 @@ endpoint.
   }
 }
 ```
+## What models can do
 
-### CLI provider streaming and timeouts
+Beyond answering, a model can act by emitting a line in its reply. Five actions exist,
+all parsed out of the model's plain text — there is no function-calling API involved:
 
-`claude` and `agy` (Antigravity) are auto-detected with progress streaming already on:
-each is invoked with its NDJSON stream flag (`claude -p --output-format stream-json
---verbose`; `agy --sandbox --print-timeout 30m --output-format stream-json -p` — flags
-must precede `-p` for `agy`, which otherwise takes `--output-format` as its prompt), and
-every tool call or step the CLI reports while it works is parsed and shown live in the
-status line (`claude ·
-awaiting reply · Bash: Read the readme · 42s · ●···`), not just after the call returns.
-A hand-configured entry under `local_binaries` stays on the old buffered-output path
-unless it opts in with `"stream_format": "claude"` or `"stream_format": "agy"` —
-whichever NDJSON shape the binary actually speaks; any other value is a startup error,
-not a silent fallback to buffering. Progress details are third-party process output and
-are sanitized before they ever reach the TUI (control characters and newlines stripped,
-length capped) — never logged to the audit trail, which stays limited to sizes, paths,
-and outcomes, the same rule that already applies to file contents and delegation
-replies.
+| Action | Effect | Result arrives |
+|---|---|---|
+| `ACTION: delegate_task(<label>, <prompt>)` | Runs a sub-task on another model | next turn |
+| `ACTION: read_skill(<name>)` | Loads a skill file into context | next turn |
+| `ACTION: list_files(<path>)` | Lists one directory in the project | next turn |
+| `ACTION: read_file(<path>)` | Reads one project file | next turn |
+| `ACTION: write_file(<path>)` … `ACTION: end_file` | Writes a project file | immediately, after you approve |
 
-Both are also passed `--add-dir <project root>`. This is not cosmetic: setting the
-child's working directory alone does not tell an agentic CLI where its project is, and
-one asked to read `src/` and `data.csv` was observed running
-`find /home/main -name "data.csv" -o -name "src"` — a scan of the whole home directory —
-which its own permission check then refused, surfacing as an unexplained failed
-delegation. Naming the directory explicitly is what makes it both succeed and stay put.
-`agy` additionally gets `--sandbox`, which runs it under its own terminal restrictions
-so it can use tools without a permission prompt it has no way to answer in print mode,
-and `--print-timeout 30m`, because its own default of 5m is short enough to cut off a
-real delegated task before any of `simon`'s limits below apply. Note what is *not* used:
-`--dangerously-skip-permissions` would also have "fixed" the failure, by allowing
-exactly the wandering that the permission check was catching.
+Two rules apply to all of them, and both matter more than they look:
 
-The two paths are timed differently:
+**Results arrive on the model's *next* turn.** The ledger that carries them is only
+rendered into the next prompt, so a model that reads a file cannot also act on its
+contents in the same reply. A single "read this and fix it" request will only read; the
+fix comes when you send the next message.
 
-- **Streaming** (a dialect is configured): an **idle timeout of 180s**, reset on every
-  line the CLI emits, so an agent that's genuinely working — a long tool call, a slow
-  model behind it — is never killed just for taking a while, only for going silent. A
-  separate **total timeout of 3600s** is an absolute backstop regardless of how
-  chatty the CLI stays.
-- **Non-streaming** (no dialect — the default for anything not auto-detected or opted
-  in): a flat **900s wall-clock timeout**. There is nothing to reset it on, because a
-  plain `binary -p <prompt>` buffers all of its output until exit, so `simon` sees
-  nothing — and can show nothing — until the process is already done.
-
-Either way, the timeout is what actually kills a wedged child: the subprocess is spawned
-with `kill_on_drop`, which only reaps it once something drops the future awaiting it, so
-the timeout firing (rather than the call finishing normally) is what triggers that drop.
+**Only the commander's reply is scanned.** A sub-agent's reply is never re-parsed for
+actions, so a delegated model cannot delegate further, read, or write. This is what
+bounds the swarm — and it means the swarm cannot create files: only the commander can.
 
 ### Delegation
 
@@ -162,58 +138,49 @@ models, observed rate-limit budgets, and open tasks. A model delegates by emitti
 ACTION: delegate_task(ollama:mistral, summarise the attached diff)
 ```
 
-Delegating is the commander's **default**, not a fallback. The roster in the system
+The orchestrator runs the sub-task and records the reply — or, on failure, the error —
+on that task in the ledger, tagged `[DONE]` or `[FAILED]`, where the delegating model
+sees it on its next turn. At most 3 delegations run per turn, and they run one after
+another, not concurrently.
+
+**Delegating is the commander's default, not a fallback.** The roster in the system
 prompt annotates each model with roughly what it costs and how much context it holds,
 and the commander is told to pick the cheapest model that can do the task, keeping only
-judgement and synthesis for itself. That instruction is also prepended to the user's own
-message, not left in the system prompt alone: an agentic CLI (`claude`, `agy`) ships its
-own system prompt and tool loop and, given the mandate only in the system prompt,
-ignores it and does the work with its own tools instead. Only what reaches the model is
-augmented — the transcript and the audit log record what the user actually typed. The
-directive is omitted entirely when the commander is the only model connected.
+judgement and synthesis for itself.
 
-The orchestrator runs the sub-task and records the reply (or, on failure, the error) on
-that task in the shared ledger, tagged `[DONE]` or `[FAILED]`. A delegation that fails
-transiently is retried up to 3 times with a 3s then 8s backoff, and each retry is
-announced in the transcript with the reason. This is not defensive padding: an agentic
-CLI sub-agent fails intermittently in several unrelated ways — an internal
-`invalid arguments` error, a `CANCELED`, or a refusal to start because its own previous
-session has not been released yet — and a failed delegation is expensive in a way a
-failed HTTP call is not, since the commander does not learn of it until its next turn.
+That instruction is prepended to your own message rather than left in the system prompt
+alone. An agentic CLI (`claude`, `agy`) ships its own system prompt and tool loop, and
+given the mandate only in the system prompt it ignores it and does the work itself —
+measured, not assumed. Only what reaches the model is augmented: the transcript and the
+audit log record what you actually typed. The directive is omitted when the commander is
+the only model connected.
+
+A delegated prompt carries its own short directive, for the same reason. It tells the
+sub-agent to finish in that reply (its answer is the *entire* result that reaches
+`simon`, so anything it defers is lost) and to prefer file-reading tools over shell
+commands (`agy`'s permission checker refuses shell commands in print mode, where nobody
+is present to approve them). `simon` cannot grant that permission — the only switch on
+offer is `agy`'s blanket `--dangerously-skip-permissions`, which would auto-approve
+every tool call it ever makes and is deliberately not used — but it can point the
+sub-agent at the tools that need no approval.
+
+A delegation that fails transiently is retried up to 3 times with a 3s then 8s backoff,
+each retry announced in the transcript with its reason. Agentic CLI sub-agents fail
+intermittently in several unrelated ways, and a failed delegation is expensive in a way
+a failed HTTP call is not, since the commander does not learn of it until its next turn.
 A timeout, a missing binary, and a `--classified` refusal are *not* retried: those fail
 identically forever.
 
-A delegated prompt also carries a short sub-agent directive, for the same reason the
-commander's does — an agentic CLI has its own working habits and the turn text is the
-only lever over them. It says two things. First, finish in this reply: a sub-agent's
-answer is the *entire* result that reaches `simon`, and left alone `agy` will dispatch a
-subagent of its own and return "I have delegated running `ls -1` to a subagent and am
-waiting for the results" — which its stream reports as `SUCCESS`. That is the worst
-shape of failure, a completed task whose content is a promise. Second, prefer file-
-reading tools over shell commands: `agy`'s permission checker refuses shell commands in
-print mode, where nobody is present to approve them, so a task that leads it to run
-`find .` or `git log` fails outright while the same task done with file tools succeeds.
-`simon` cannot grant that permission — the only switch on offer is `agy`'s blanket
-`--dangerously-skip-permissions`, which would auto-approve every tool call it ever makes
-and is deliberately not used — but it can point the sub-agent at the tools that need no
-approval. Because the ledger is
-only re-rendered into the *next* prompt sent to any model, the result becomes visible to
-the delegating model on its next turn, not within the turn that requested it. Sub-agent
-replies are not re-scanned for delegations, and at most 3 delegations run per turn, so
-the swarm cannot recurse indefinitely.
-
-None of this has to be inferred from timing: the status line names whichever model is
-actually being called — the sub-agent, not the commander — along with what it's doing
-and how long it's taken so far (and, for a streaming CLI sub-agent, the latest progress
-detail it reported — see [CLI provider streaming and
-timeouts](#cli-provider-streaming-and-timeouts)), and the transcript gets a line the
-moment a delegation is dispatched (naming the agent and its task) and another when it
-finishes, reporting outcome and duration. The full sub-agent reply still arrives
-afterward as an ordinary reply line.
+None of this has to be inferred from timing. The status line names whichever model is
+actually being called — the sub-agent, not the commander — with what it is doing and how
+long it has taken, including the latest progress detail from a streaming CLI (see
+[CLI provider streaming and timeouts](#cli-provider-streaming-and-timeouts)). The
+transcript gets a line when a delegation is dispatched and another when it finishes,
+with outcome and duration.
 
 ### Skills
 
-The system prompt also lists every file in the read-only skills directory, each with the
+The system prompt lists every file in the read-only skills directory, each with the
 one-line description parsed from its optional frontmatter:
 
 ```
@@ -223,108 +190,131 @@ description: One line saying when this skill applies.
 ---
 ```
 
-A file without that block is still listed, just with no description. To load a skill's
-full contents, a model emits:
+A file without that block is still listed, just without a description. To load one:
 
 ```
 ACTION: read_skill(notes.md)
 ```
 
-The name is resolved and read through the same path-traversal-hardened lookup as any
-other skill access — a model's reply is untrusted input, no different from a name typed
-by a user, so the same `..`/absolute-path/symlink checks apply. The content (or, on
-failure, the error) is recorded in the ledger and becomes visible on the model's next
-turn, same timing as a delegation result. At most 3 skills are kept loaded at once, each
-capped in size; loading a fourth evicts the oldest. The skills directory itself stays
-read-only to models — see [Project files](#project-files) for the one place they may
-write.
+The name is resolved through the same path-traversal-hardened lookup as any other skill
+access — a model's reply is untrusted input, no different from a name typed by a user.
+At most 3 skills stay loaded at once, each size-capped; loading a fourth evicts the
+oldest. A successful load gets a transcript line naming the skill and its size.
 
-A successful load also gets a transcript line naming the skill and its size, so a read
-that would otherwise be silent (only a failure previously reached the TUI) is visible
-too; while the read is in flight the status line shows it the same way it shows a
-delegation.
+The skills directory stays **read-only** to models. A model that could write a skill
+file could inject its own content into the system prompt sent to every model for the
+rest of the session, so it is deliberately a separate tree from the project folder.
 
 ### Project files
 
-Models can list, read, and write files in the **project folder** — the directory
-`simon` was started in, or whatever `--project <dir>` points at (see
-[Use](#use)). This is a real change from earlier versions: it used to be a private
-scratch directory under `simon`'s own data directory, and is now the user's own
-project. Every access still goes through the same path-traversal hardening as the
-read-only skills directory (`..`, absolute paths, and symlinks escaping the root are
-all rejected) — a model's reply is untrusted input, no different from a path typed by
-a user.
-
-To list a directory's immediate entries:
+Models can list, read, and write files in the **project folder** — the directory `simon`
+was started in, or whatever `--project <dir>` points at. Every access goes through the
+same path-traversal hardening as the skills directory: `..`, absolute paths, and
+symlinks escaping the root are all rejected.
 
 ```
-ACTION: list_files(notes)
-```
+ACTION: list_files(notes)          # one directory's immediate entries
+ACTION: list_files()               # the project root
+ACTION: read_file(notes/todo.md)   # a file's full contents
 
-An empty path (`ACTION: list_files()`) lists the project root. Listing is never
-recursive — a model descends into a subdirectory it saw with a further `list_files`
-call naming it. To read a file's full contents:
-
-```
-ACTION: read_file(notes/todo.md)
-```
-
-Writes are **not** applied silently. Every `write_file` a model proposes is shown
-first — the path, the exact byte size, whether it creates a new file or overwrites an
-existing one (and how many bytes that would destroy), and the head of the content —
-and the turn blocks until you answer `y` (allow), `n` (refuse), or `a` (allow this and
-every later write this session). The status line becomes the question:
-
-```
-OVERWRITE src/report.py (353 bytes -> 415 bytes)? [y]es  [n]o  [a]ll
-```
-
-Nothing reaches disk before you answer. A refusal is recorded in the ledger, so the
-model learns on its next turn that the file was not written rather than carrying on as
-though it had been, and is audited as `file.write_denied`. If the UI goes away while a
-question is pending the write is refused, not applied — with nobody left to ask, nobody
-has consented. A write `Workspace` would reject anyway (a `.git/` path, an oversized
-file, a traversal attempt) is refused *without* asking, so a prompt never appears for a
-write your answer could not affect. `a` is per-session and never persisted. Pass
-`--auto-write` to skip the gate entirely, which is what an unattended or scripted run
-wants and an interactive one generally does not.
-
-To create or overwrite a file, emit a block:
-
-```
 ACTION: write_file(notes/todo.md)
 - write the summary
 - send it to review
 ACTION: end_file
 ```
 
-Everything between the `write_file` line and the `end_file` line is written verbatim as
-the file's content. Paths are relative to the project root and subdirectories are
-created automatically on write; there is no cap on how many files may exist under the
-root, but a single read or write is capped at 256KB and a single listing at 500
-entries (truncation is reported, not silent). A line containing
-`ACTION: delegate_task(...)`, `ACTION: read_skill(...)`, `ACTION: read_file(...)`, or
-`ACTION: list_files(...)` inside a `write_file` block's content is treated as content,
-not executed — this matters because a model writing documentation about its own
-protocol will naturally include example lines that look like real requests. Writes
-into `.git/` are refused outright; reading `.git/` is not special-cased, since only a
-write can corrupt a repository. Every list, read, and write, successful or not, is
-audited (`project.list`/`project.list_failed`, `project.read`/`project.read_failed`,
-`file.written`/`file.write_failed`) and shown in the TUI as it happens — the audit
-entries and the ledger record paths, byte counts, and entry counts only, **never file
-content**. The outcome becomes visible to the requesting model on its next turn, same
-timing as a delegation result; at most 3 loaded reads are kept at once (each
-size-capped), evicting the oldest, the same discipline as loaded skills.
+Listing is never recursive — a model descends by issuing another `list_files`.
+Everything between `write_file` and `end_file` is written verbatim, and subdirectories
+are created automatically.
 
-**This is not a sandbox for spawned CLI providers.** A `claude`/`gemini`/`codex` CLI
-configured as a local binary provider is started with its working directory set to
-the project folder (`Command::current_dir`), so it doesn't stumble onto whatever was
-lying around in `simon`'s own launch directory — but that only sets the starting
-point. A CLI agent with its own shell or filesystem tool access can `cd` anywhere the
-invoking user can reach and read or write outside the project folder freely; none of
-that filesystem activity passes through `simon`'s audit log or the `list_files`/
-`read_file`/`write_file` protocol above, which exists only for `simon`'s own
-in-process model calls (the cloud APIs and Ollama).
+An `ACTION:` line of any kind **inside** a `write_file` block is content, not a request.
+This matters because a model writing documentation about this protocol will naturally
+include lines that look exactly like real ones.
+
+Limits: a single read or write is capped at 256KB, a single listing at 500 entries
+(truncation is reported, not silent), and at most 3 writes and 3 reads happen per turn.
+At most 3 loaded reads are kept, evicting the oldest. There is no cap on how many files
+may exist under the root. Writes into `.git/` are refused outright — a bad write there
+can corrupt the repository in ways you cannot easily undo. Reading `.git/` is not
+special-cased, since only a write can corrupt it.
+
+Everything is audited (`project.list`, `project.read`, `file.written`, and their
+`_failed` counterparts) and shown in the TUI as it happens. **The audit log and the
+ledger record paths, byte counts, and entry counts only — never file content.**
+
+#### Writes are not applied silently
+
+Every `write_file` a model proposes is shown first — path, exact byte size, whether it
+creates or overwrites (and how many bytes that would destroy), and the head of the
+content — and the turn blocks until you answer:
+
+```
+OVERWRITE src/report.py (353 bytes -> 415 bytes)? [y]es  [n]o  [a]ll
+```
+
+Nothing reaches disk before you answer. A refusal is recorded in the ledger, so the
+model learns on its next turn that the file was not written rather than building on one
+that does not exist, and is audited as `file.write_denied`.
+
+If the UI goes away while a question is pending, the write is refused, not applied —
+with nobody left to ask, nobody has consented. A write that `Workspace` would reject
+anyway (a `.git/` path, an oversized file, a traversal attempt) is refused *without*
+asking, so a prompt never appears for a write your answer could not affect. `a` applies
+for the rest of the session and is never persisted.
+
+`--auto-write` skips the gate entirely, which is what an unattended or scripted run
+wants and an interactive one generally does not.
+
+#### This is not a sandbox for spawned CLI providers
+
+A `claude`/`gemini`/`codex` CLI configured as a local binary provider is started with
+its working directory set to the project folder and, where the CLI supports it,
+`--add-dir <project root>`. That stops it stumbling onto whatever was lying around in
+`simon`'s own launch directory, and stops it searching elsewhere for files it was asked
+about — but it only sets a starting point.
+
+A CLI agent with its own shell or filesystem access can `cd` anywhere the invoking user
+can reach and read or write outside the project folder freely. None of that activity
+passes through `simon`'s audit log or the protocol above, which governs only `simon`'s
+own in-process model calls: the cloud APIs and Ollama.
+
+### CLI provider streaming and timeouts
+
+`claude` and `agy` (Antigravity) are auto-detected with progress streaming already on.
+Each is invoked with its NDJSON stream flag, and every tool call or step the CLI reports
+while it works is parsed and shown live in the status line:
+
+```
+claude · awaiting reply · Bash: Read the readme · 42s · ●···
+```
+
+Both are also passed `--add-dir <project root>`, and `agy` additionally gets
+`--sandbox` (its own terminal restrictions, which let it use tools without a permission
+prompt it cannot answer non-interactively) and `--print-timeout 30m` (its own default is
+5m, short enough to cut off a real task before any of the limits below apply). Flag
+order is not cosmetic for `agy`: its `-p` takes the next argument as the prompt, so
+every other flag must precede it.
+
+A hand-configured entry under `local_binaries` stays on the buffered-output path unless
+it opts in with `"stream_format": "claude"` or `"stream_format": "agy"` — whichever
+NDJSON shape the binary actually speaks. Any other value is a startup error, not a
+silent fallback to buffering.
+
+Progress details are third-party process output: control characters and newlines are
+stripped and the length capped before they reach the TUI, and they are never written to
+the audit log, which stays limited to sizes, paths, and outcomes.
+
+The two paths are timed differently:
+
+- **Streaming**: an **idle timeout of 180s**, reset on every line the CLI emits, so an
+  agent that is genuinely working is never killed for taking a while — only for going
+  silent. A **total timeout of 3600s** is an absolute backstop.
+- **Non-streaming**: a flat **900s wall clock**. There is nothing to reset it on,
+  because a plain `binary -p <prompt>` buffers all output until exit.
+
+Either way, the timeout is what actually kills a wedged child: the subprocess is spawned
+with `kill_on_drop`, which reaps it only once something drops the future awaiting it, so
+the timeout firing is what triggers that drop.
 
 ## Security posture
 
@@ -367,7 +357,14 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   skills (`..`, absolute paths, and symlinks escaping the root are all rejected),
   size-capped per read/write and entry-capped per listing, and every access is
   audited and rendered in the TUI so the user sees everything a model has listed,
-  read, or written. Writes into `.git/` are refused outright. The skills directory
+  read, or written. Writes into `.git/` are refused outright.
+- **Every model-proposed write requires explicit approval** (see [Writes are not
+  applied silently](#writes-are-not-applied-silently)) — the path, the exact size,
+  whether it overwrites and how many bytes that destroys, and the head of the content
+  are shown, and the turn blocks until the user answers. Nothing reaches disk
+  unapproved; a lost UI denies rather than allows, and a refusal is audited as
+  `file.write_denied`. Note the scope of the check: it establishes that the *user*
+  consented, not that the content is correct — nothing inspects what is being written. The skills directory
   itself remains read-only to models — a model that could write a skill file could
   inject its own content into the system prompt sent to every model for the rest of
   the session — so this is deliberately a separate tree, not a relaxation of that

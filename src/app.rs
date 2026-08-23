@@ -282,6 +282,15 @@ impl App {
                     text,
                 });
             }
+            Event::DelegationRetry {
+                to,
+                attempt,
+                max,
+                reason,
+            } => self.transcript.push(Line {
+                speaker: Speaker::System,
+                text: format!("{to} failed ({reason}) · retrying, attempt {attempt} of {max}"),
+            }),
             Event::SkillLoaded { name, chars } => self.transcript.push(Line {
                 speaker: Speaker::System,
                 text: format!("loaded skill {name} · {chars} chars"),

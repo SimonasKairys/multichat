@@ -8,7 +8,7 @@ use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::app::ActivityKind;
@@ -124,6 +124,16 @@ pub enum Event {
         chars: usize,
         millis: u64,
     },
+    /// A delegation failed transiently and is about to be attempted again. Carries
+    /// the reason so the user can see WHY it is retrying rather than watching the
+    /// same task silently restart — a retry that hides its cause is indistinguishable
+    /// from a hang.
+    DelegationRetry {
+        to: String,
+        attempt: usize,
+        max: usize,
+        reason: String,
+    },
     /// A skill was read successfully. A failed read still goes through `Event::Error`
     /// (unchanged), which is enough on its own to clear the activity indicator.
     SkillLoaded { name: String, chars: usize },
@@ -184,6 +194,50 @@ const MAX_TASK_DISPLAY_CHARS: usize = 120;
 /// reaches an `Event::ActivityProgress`. Mirrors `MAX_TASK_DISPLAY_CHARS`'s reasoning,
 /// just for a status-line detail instead of a transcript line — short enough that it
 /// never wraps the status line on its own.
+/// How many times a delegated task is attempted before it is reported as failed.
+///
+/// Not defensive padding — measured. An agentic CLI sub-agent fails transiently in
+/// several unrelated ways, all observed from `agy` on this machine while running the
+/// identical command twice in a row: `another active schedule task "<id>"` (it keeps
+/// session state alive briefly after its process exits, so a delegation that starts
+/// promptly after the previous one is refused), `invalid arguments: missing
+/// properties 'toolSummary', 'toolAction'` (an internal error of its own), and
+/// `CANCELED`. A failed delegation is expensive in a way a failed HTTP call is not:
+/// the commander does not learn of it until its NEXT turn, so one transient blip
+/// costs the user a full round trip.
+const MAX_DELEGATION_ATTEMPTS: usize = 3;
+
+/// How long to wait before each retry. Indexed by attempts already made, so the
+/// first retry waits `[0]` and the second `[1]`; must therefore hold
+/// `MAX_DELEGATION_ATTEMPTS - 1` entries. Deliberately several seconds rather than
+/// milliseconds: the failure this most often clears is a sub-agent's own session
+/// state not having been released yet, which no amount of immediate hammering fixes.
+const DELEGATION_RETRY_BACKOFF: [Duration; MAX_DELEGATION_ATTEMPTS - 1] =
+    [Duration::from_secs(3), Duration::from_secs(8)];
+
+/// Whether a failed delegation is worth another attempt.
+///
+/// The default is to retry: sub-agent failures are dominated by the transient CLI
+/// errors described on `MAX_DELEGATION_ATTEMPTS`, and a wrongly-retried permanent
+/// failure costs a few seconds while a wrongly-abandoned transient one costs the user
+/// a whole turn. The exceptions are the cases where retrying is either useless or
+/// actively harmful:
+///
+/// - a timeout has already spent the caller's patience (up to an hour for a streaming
+///   CLI, see `local_binary`); doing that twice more is not a recovery strategy;
+/// - a misconfigured binary (missing path, empty path) fails identically forever;
+/// - a `--classified` refusal is a policy decision, not a blip.
+fn is_retryable_delegation_error(error: &str) -> bool {
+    const PERMANENT: &[&str] = &[
+        "timed out",
+        "does not exist",
+        "has an empty path",
+        "classified",
+    ];
+    let lowered = error.to_ascii_lowercase();
+    !PERMANENT.iter().any(|marker| lowered.contains(marker))
+}
+
 const MAX_PROGRESS_DETAIL_CHARS: usize = 80;
 
 /// Truncates `s` to at most `max_chars` characters, appending `…` when cut. Same
@@ -1338,13 +1392,47 @@ impl Orchestrator {
 
             let system = self.system_prompt();
             let started = Instant::now();
-            let progress = self.spawn_progress_forwarder(target_label.clone());
-            let outcome = target
-                .send_with_progress(Some(&system), &delegation.prompt, &progress)
+            let mut attempts = 1;
+            let outcome = loop {
+                let progress = self.spawn_progress_forwarder(target_label.clone());
+                let result = target
+                    .send_with_progress(Some(&system), &delegation.prompt, &progress)
+                    .await;
+                // Drops the sink, closing the forwarding task's channel — see
+                // `spawn_progress_forwarder`'s doc comment. Inside the loop because a
+                // retry needs a fresh sink; the old one's task has already ended.
+                drop(progress);
+
+                let Err(error) = result else {
+                    break result;
+                };
+                let reason = error.to_string();
+                if attempts >= MAX_DELEGATION_ATTEMPTS || !is_retryable_delegation_error(&reason) {
+                    break Err(error);
+                }
+
+                let _ = self.audit.log(
+                    "task.retrying",
+                    &format!("task={task_id} attempt={attempts} error={reason}"),
+                );
+                self.emit(Event::DelegationRetry {
+                    to: target_label.clone(),
+                    attempt: attempts + 1,
+                    max: MAX_DELEGATION_ATTEMPTS,
+                    reason: sanitize_progress_detail(&reason),
+                })
                 .await;
-            // Drops the sink, closing the forwarding task's channel — see
-            // `spawn_progress_forwarder`'s doc comment.
-            drop(progress);
+                tokio::time::sleep(DELEGATION_RETRY_BACKOFF[attempts - 1]).await;
+                attempts += 1;
+                // The activity line was cleared by the retry event above, so the next
+                // attempt has to re-announce itself or the status line stays blank
+                // for the whole of it.
+                self.emit(Event::ActivityStarted {
+                    label: target_label.clone(),
+                    kind: ActivityKind::Delegating,
+                })
+                .await;
+            };
             match outcome {
                 Ok(reply) => {
                     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1625,6 +1713,39 @@ mod tests {
         }
     }
 
+    /// A provider that fails its first `fail_times` calls and then succeeds, for
+    /// exercising the retry path without waiting on a real flaky CLI.
+    struct FlakyProvider {
+        provider: String,
+        model: String,
+        remaining_failures: std::sync::Mutex<usize>,
+        error: String,
+    }
+
+    #[async_trait]
+    impl Provider for FlakyProvider {
+        async fn send(&self, _system: Option<&str>, _prompt: &str) -> Result<Reply> {
+            let mut remaining = self.remaining_failures.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(anyhow!("{}", self.error));
+            }
+            Ok(Reply {
+                text: "recovered".into(),
+                rate_limit: RateLimit::default(),
+            })
+        }
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+        fn provider_name(&self) -> &str {
+            &self.provider
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+    }
+
     /// A provider that always errors, used to exercise the failed-delegation path
     /// (Fix 2) without spawning a real subprocess or making a real request.
     struct FailingProvider {
@@ -1645,6 +1766,35 @@ mod tests {
         }
         fn is_remote(&self) -> bool {
             false
+        }
+    }
+
+    /// A registry whose delegation target fails `failures` times before succeeding.
+    /// Separate from `registry_with` because that one only builds `StubProvider`s.
+    fn registry_with_flaky(failures: usize) -> Registry {
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "ollama:llama3".into(),
+            Arc::new(StubProvider {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                remote: false,
+            }),
+        );
+        providers.insert(
+            "ollama:flaky".into(),
+            Arc::new(FlakyProvider {
+                provider: "ollama".into(),
+                model: "flaky".into(),
+                remaining_failures: std::sync::Mutex::new(failures),
+                error: "another active schedule task".into(),
+            }),
+        );
+        Registry {
+            providers,
+            primary: "ollama:llama3".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
         }
     }
 
@@ -2713,6 +2863,121 @@ mod tests {
         // The write's content ("hello") must never itself be echoed into the ledger —
         // only the path and byte-count outcome (see `WrittenFile`'s doc comment).
         assert!(!prompt.contains("hello"));
+    }
+
+    #[test]
+    fn a_transient_sub_agent_error_is_worth_retrying() {
+        // All four observed live from `agy` running the identical command twice.
+        assert!(is_retryable_delegation_error(
+            r#"agy failed: another active schedule task "3c32f6d6-0315""#
+        ));
+        assert!(is_retryable_delegation_error(
+            "agy failed: invalid arguments:\n- missing properties 'toolSummary'"
+        ));
+        assert!(is_retryable_delegation_error("agy failed: CANCELED"));
+        assert!(is_retryable_delegation_error("agy produced no output"));
+    }
+
+    #[test]
+    fn a_permanent_failure_is_not_retried() {
+        // A timeout has already spent the caller's patience — up to an hour for a
+        // streaming CLI — so doing it twice more is not a recovery strategy.
+        assert!(!is_retryable_delegation_error(
+            "/usr/bin/agy timed out after 3600s (total time limit for a streaming call)"
+        ));
+        assert!(!is_retryable_delegation_error(
+            "local binary `agy` points at /nope, which does not exist"
+        ));
+        assert!(!is_retryable_delegation_error(
+            "local binary `agy` has an empty path"
+        ));
+    }
+
+    #[test]
+    fn there_is_a_backoff_for_every_retry() {
+        // A mismatch here would panic on the last retry via an out-of-bounds index.
+        assert_eq!(DELEGATION_RETRY_BACKOFF.len(), MAX_DELEGATION_ATTEMPTS - 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delegation_that_fails_transiently_is_retried_and_then_succeeds() {
+        // `start_paused` makes tokio auto-advance its clock over the backoff sleeps,
+        // so this covers the real retry loop without spending 11 real seconds.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut orch = Orchestrator {
+            registry: registry_with_flaky(2),
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![9u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:flaky, do the thing)",
+        )
+        .await;
+
+        let mut retries = 0;
+        let mut finished_ok = None;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                Event::DelegationRetry { attempt, max, .. } => {
+                    retries += 1;
+                    assert_eq!(max, MAX_DELEGATION_ATTEMPTS);
+                    assert!(attempt > 1);
+                }
+                Event::DelegationFinished { ok, .. } => finished_ok = Some(ok),
+                _ => {}
+            }
+        }
+        assert_eq!(retries, 2, "two failures should produce two retry events");
+        assert_eq!(finished_ok, Some(true), "the third attempt should succeed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_delegation_that_keeps_failing_gives_up_after_the_attempt_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut orch = Orchestrator {
+            registry: registry_with_flaky(usize::MAX),
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![9u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:flaky, do the thing)",
+        )
+        .await;
+
+        let mut retries = 0;
+        let mut finished_ok = None;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                Event::DelegationRetry { .. } => retries += 1,
+                Event::DelegationFinished { ok, .. } => finished_ok = Some(ok),
+                _ => {}
+            }
+        }
+        // Three attempts means two retries, then a reported failure — not silence.
+        assert_eq!(retries, MAX_DELEGATION_ATTEMPTS - 1);
+        assert_eq!(finished_ok, Some(false));
     }
 
     #[test]

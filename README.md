@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 233 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 246 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -110,9 +110,10 @@ endpoint.
 
 `claude` and `agy` (Antigravity) are auto-detected with progress streaming already on:
 each is invoked with its NDJSON stream flag (`claude -p --output-format stream-json
---verbose`; `agy --output-format stream-json -p` — flags must precede `-p` for `agy`,
-which otherwise takes `--output-format` as its prompt), and every tool call or step the
-CLI reports while it works is parsed and shown live in the status line (`claude ·
+--verbose`; `agy --sandbox --print-timeout 30m --output-format stream-json -p` — flags
+must precede `-p` for `agy`, which otherwise takes `--output-format` as its prompt), and
+every tool call or step the CLI reports while it works is parsed and shown live in the
+status line (`claude ·
 awaiting reply · Bash: Read the readme · 42s · ●···`), not just after the call returns.
 A hand-configured entry under `local_binaries` stays on the old buffered-output path
 unless it opts in with `"stream_format": "claude"` or `"stream_format": "agy"` —
@@ -122,6 +123,19 @@ are sanitized before they ever reach the TUI (control characters and newlines st
 length capped) — never logged to the audit trail, which stays limited to sizes, paths,
 and outcomes, the same rule that already applies to file contents and delegation
 replies.
+
+Both are also passed `--add-dir <project root>`. This is not cosmetic: setting the
+child's working directory alone does not tell an agentic CLI where its project is, and
+one asked to read `src/` and `data.csv` was observed running
+`find /home/main -name "data.csv" -o -name "src"` — a scan of the whole home directory —
+which its own permission check then refused, surfacing as an unexplained failed
+delegation. Naming the directory explicitly is what makes it both succeed and stay put.
+`agy` additionally gets `--sandbox`, which runs it under its own terminal restrictions
+so it can use tools without a permission prompt it has no way to answer in print mode,
+and `--print-timeout 30m`, because its own default of 5m is short enough to cut off a
+real delegated task before any of `simon`'s limits below apply. Note what is *not* used:
+`--dangerously-skip-permissions` would also have "fixed" the failure, by allowing
+exactly the wandering that the permission check was catching.
 
 The two paths are timed differently:
 
@@ -148,8 +162,26 @@ models, observed rate-limit budgets, and open tasks. A model delegates by emitti
 ACTION: delegate_task(ollama:mistral, summarise the attached diff)
 ```
 
+Delegating is the commander's **default**, not a fallback. The roster in the system
+prompt annotates each model with roughly what it costs and how much context it holds,
+and the commander is told to pick the cheapest model that can do the task, keeping only
+judgement and synthesis for itself. That instruction is also prepended to the user's own
+message, not left in the system prompt alone: an agentic CLI (`claude`, `agy`) ships its
+own system prompt and tool loop and, given the mandate only in the system prompt,
+ignores it and does the work with its own tools instead. Only what reaches the model is
+augmented — the transcript and the audit log record what the user actually typed. The
+directive is omitted entirely when the commander is the only model connected.
+
 The orchestrator runs the sub-task and records the reply (or, on failure, the error) on
-that task in the shared ledger, tagged `[DONE]` or `[FAILED]`. Because the ledger is
+that task in the shared ledger, tagged `[DONE]` or `[FAILED]`. A delegation that fails
+transiently is retried up to 3 times with a 3s then 8s backoff, and each retry is
+announced in the transcript with the reason. This is not defensive padding: an agentic
+CLI sub-agent fails intermittently in several unrelated ways — an internal
+`invalid arguments` error, a `CANCELED`, or a refusal to start because its own previous
+session has not been released yet — and a failed delegation is expensive in a way a
+failed HTTP call is not, since the commander does not learn of it until its next turn.
+A timeout, a missing binary, and a `--classified` refusal are *not* retried: those fail
+identically forever. Because the ledger is
 only re-rendered into the *next* prompt sent to any model, the result becomes visible to
 the delegating model on its next turn, not within the turn that requested it. Sub-agent
 replies are not re-scanned for delegations, and at most 3 delegations run per turn, so

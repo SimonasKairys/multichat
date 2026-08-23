@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 256 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 259 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -125,9 +125,13 @@ rendered into the next prompt, so a model that reads a file cannot also act on i
 contents in the same reply. A single "read this and fix it" request will only read; the
 fix comes when you send the next message.
 
-**Only the commander's reply is scanned.** A sub-agent's reply is never re-parsed for
-actions, so a delegated model cannot delegate further, read, or write. This is what
-bounds the swarm — and it means the swarm cannot create files: only the commander can.
+**A sub-agent's reply is scanned for writes, and for nothing else.** It cannot delegate
+further, load a skill, or read/list files — so no reply can spawn more work, which is
+what bounds the swarm. A write spawns nothing, so sub-agents *can* author files, and
+that is how a swarm builds a project: the commander delegates the authoring and the
+cheap model writes the files. Every such write still passes the same two gates a
+commander's does — path hardening and your approval, which names the sub-agent as the
+one asking.
 
 ### Delegation
 
@@ -232,7 +236,7 @@ This matters because a model writing documentation about this protocol will natu
 include lines that look exactly like real ones.
 
 Limits: a single read or write is capped at 256KB, a single listing at 500 entries
-(truncation is reported, not silent), and at most 3 writes and 3 reads happen per turn.
+(truncation is reported, not silent), at most 10 writes and 3 reads happen per turn.
 At most 3 loaded reads are kept, evicting the oldest. There is no cap on how many files
 may exist under the root. Writes into `.git/` are refused outright — a bad write there
 can corrupt the repository in ways you cannot easily undo. Reading `.git/` is not

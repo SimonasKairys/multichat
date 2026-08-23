@@ -159,6 +159,7 @@ pub struct App {
 /// A write the user has been asked to allow.
 #[derive(Debug, Clone)]
 pub struct PendingWrite {
+    pub author: String,
     pub path: String,
     pub bytes: usize,
     pub overwrites: Option<u64>,
@@ -169,12 +170,12 @@ impl PendingWrite {
     pub fn question(&self) -> String {
         match self.overwrites {
             Some(old) => format!(
-                "OVERWRITE {} ({old} bytes -> {} bytes)? [y]es  [n]o  [a]ll",
-                self.path, self.bytes
+                "{} wants to OVERWRITE {} ({old} bytes -> {} bytes)? [y]es  [n]o  [a]ll",
+                self.author, self.path, self.bytes
             ),
             None => format!(
-                "CREATE {} ({} bytes)? [y]es  [n]o  [a]ll",
-                self.path, self.bytes
+                "{} wants to CREATE {} ({} bytes)? [y]es  [n]o  [a]ll",
+                self.author, self.path, self.bytes
             ),
         }
     }
@@ -322,6 +323,7 @@ impl App {
                 text: format!("{to} failed ({reason}) · retrying, attempt {attempt} of {max}"),
             }),
             Event::WriteRequested {
+                author,
                 path,
                 bytes,
                 overwrites,
@@ -332,25 +334,26 @@ impl App {
                 // to render.
                 self.transcript.push(Line {
                     speaker: Speaker::System,
-                    text: format!("--- proposed write: {path} ---\n{preview}"),
+                    text: format!("--- {author} proposes writing {path} ---\n{preview}"),
                 });
                 self.pending_write = Some(PendingWrite {
+                    author,
                     path,
                     bytes,
                     overwrites,
                 });
             }
-            Event::WriteDenied { path } => self.transcript.push(Line {
+            Event::WriteDenied { author, path } => self.transcript.push(Line {
                 speaker: Speaker::System,
-                text: format!("refused write: {path}"),
+                text: format!("refused {author}'s write: {path}"),
             }),
             Event::SkillLoaded { name, chars } => self.transcript.push(Line {
                 speaker: Speaker::System,
                 text: format!("loaded skill {name} · {chars} chars"),
             }),
-            Event::FileWritten { path } => self.transcript.push(Line {
+            Event::FileWritten { author, path } => self.transcript.push(Line {
                 speaker: Speaker::System,
-                text: format!("wrote project file: {path}"),
+                text: format!("{author} wrote project file: {path}"),
             }),
             Event::FileRead { path, chars } => self.transcript.push(Line {
                 speaker: Speaker::System,
@@ -882,6 +885,7 @@ mod tests {
             kind: ActivityKind::Primary,
         });
         app.apply(Event::WriteRequested {
+            author: "agy".into(),
             path: "src/main.rs".into(),
             bytes: 120,
             overwrites: Some(80),
@@ -889,7 +893,7 @@ mod tests {
         });
         let line = app.status_line_at(Instant::now());
         // The turn is blocked on this answer, so the line must ask rather than spin.
-        assert!(line.contains("OVERWRITE src/main.rs"));
+        assert!(line.contains("agy wants to OVERWRITE src/main.rs"));
         assert!(line.contains("[y]es"));
         assert!(!line.contains("awaiting reply"));
         assert!(app.pending_write.is_some());
@@ -904,19 +908,21 @@ mod tests {
     #[test]
     fn a_new_file_and_an_overwrite_ask_different_questions() {
         let create = PendingWrite {
+            author: "agy".into(),
             path: "a.txt".into(),
             bytes: 10,
             overwrites: None,
         };
-        assert!(create.question().starts_with("CREATE a.txt"));
+        assert!(create.question().starts_with("agy wants to CREATE a.txt"));
 
         let clobber = PendingWrite {
+            author: "agy".into(),
             path: "a.txt".into(),
             bytes: 10,
             overwrites: Some(4096),
         };
         let q = clobber.question();
-        assert!(q.starts_with("OVERWRITE a.txt"));
+        assert!(q.starts_with("agy wants to OVERWRITE a.txt"));
         // The size being destroyed must appear; it is the whole basis for saying no.
         assert!(q.contains("4096 bytes"));
     }

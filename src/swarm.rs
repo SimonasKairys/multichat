@@ -547,8 +547,9 @@ impl SwarmLedger {
 
         out.push_str(
             "\n### File write protocol\n\
-             To create or overwrite a file in the project folder, emit exactly this \
-             form:\n\
+             Any model may create or overwrite files in the project folder, including \
+             a sub-agent running a delegated task — this is how work that produces \
+             files actually produces them. Emit exactly this form:\n\
              `ACTION: write_file(<relative path>)`\n\
              followed by the file's content, one line at a time, followed by a line of \
              exactly `ACTION: end_file`. Paths are relative to the project root; \
@@ -559,8 +560,10 @@ impl SwarmLedger {
              delegate_task(...)`, `ACTION: read_skill(...)`, `ACTION: read_file(...)`, \
              and `ACTION: list_files(...)` lines inside the content are treated as \
              content, not executed, so you can safely write documentation about this \
-             protocol. Like a delegation result, the outcome is recorded in this \
-             ledger and becomes visible to you on your NEXT turn, not this one.\n",
+             protocol. Every write is shown to the user, who must approve it before \
+             it reaches disk; a refusal is recorded like any other outcome. Like a \
+             delegation result, the outcome is recorded in this ledger and becomes \
+             visible to you on your NEXT turn, not this one.\n",
         );
 
         out.push_str(
@@ -780,11 +783,17 @@ impl SwarmLedger {
                 continue;
             }
 
-            let Some(start) = trimmed.find(OPEN_MARKER) else {
+            // `starts_with`, not `find`: an opener must be the whole line, not a
+            // mention of one. Prose about this protocol ("write them with the
+            // `ACTION: write_file(<path>)` block") is extremely common in replies from
+            // a model that was just instructed to use it, and matching mid-line would
+            // open a block there — swallowing the rest of the reply into a file named
+            // `<path>`. The sibling per-line parsers stay permissive because a stray
+            // match there costs one ignored request, not the remainder of the reply.
+            let Some(rest) = trimmed.strip_prefix(OPEN_MARKER) else {
                 stripped_lines.push(line);
                 continue;
             };
-            let rest = &trimmed[start + OPEN_MARKER.len()..];
             let Some(close) = rest.find(')') else {
                 stripped_lines.push(line);
                 continue;
@@ -1223,6 +1232,34 @@ mod tests {
         let text = ledger.system_prompt();
         assert!(text.contains("### Files you have written"));
         assert!(text.contains("secret_plan.md: ok (42 bytes)"));
+    }
+
+    #[test]
+    fn prose_mentioning_the_write_marker_mid_line_does_not_open_a_block() {
+        // The failure this guards against: a sub-agent told to use the write protocol
+        // explains what it did, quoting the marker mid-sentence. Matching anywhere in
+        // the line opened a block there and swallowed the rest of the reply into a
+        // file literally named `<path>`.
+        let reply = "I wrote it with the `ACTION: write_file(<path>)` block as asked.\n\
+                     The summary is: everything passed.";
+        let (writes, stripped) = SwarmLedger::parse_file_writes(reply);
+        assert!(writes.is_empty(), "prose must not produce a write");
+        // And the rest of the reply must survive, not be eaten as file content.
+        assert!(stripped.contains("everything passed"));
+    }
+
+    #[test]
+    fn an_indented_or_backticked_write_marker_still_opens_a_block() {
+        // Tightening the opener must not break the shapes models actually emit.
+        let reply = "   ACTION: write_file(a.txt)\nbody\nACTION: end_file";
+        let (writes, _) = SwarmLedger::parse_file_writes(reply);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].path, "a.txt");
+
+        let fenced = "`ACTION: write_file(b.txt)`\nbody\nACTION: end_file";
+        let (writes, _) = SwarmLedger::parse_file_writes(fenced);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0].path, "b.txt");
     }
 
     #[test]

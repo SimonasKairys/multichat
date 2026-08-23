@@ -28,6 +28,16 @@ use crate::workspace::Workspace;
 /// Delegations honoured per user turn, so a model cannot spin the swarm forever.
 const MAX_DELEGATIONS_PER_TURN: usize = 3;
 
+/// How many files one model may write in a single turn.
+///
+/// Higher than `MAX_DELEGATIONS_PER_TURN`, which it used to borrow, because the two
+/// bound different things. A delegation costs a model call; a write costs a disk write
+/// the user has already been shown and has approved one at a time. Creating a project
+/// from nothing is the case that needs the headroom — a README, a module, a test and a
+/// manifest is already four — and the user, not this number, is the real limit on how
+/// much lands.
+const MAX_WRITES_PER_TURN: usize = 10;
+
 /// The commander directive prepended to the user's own prompt, or `None` when the
 /// commander is the only model connected and there is therefore nobody to delegate to.
 ///
@@ -60,10 +70,14 @@ fn commander_preamble(primary: &str, roster: &[String]) -> Option<String> {
     Some(format!(
         "[swarm] You are the commander. Connected and available to you: {}.\n\
          If answering this needs real work — reading files, searching, summarising, \
-         drafting — do NOT do it with your own tools. Hand it to the cheapest capable \
-         model with `ACTION: delegate_task(<label>, <self-contained prompt>)`, then \
-         stop and say what you delegated; their results reach you on your NEXT turn. \
-         If the question just needs a direct answer, answer it directly.\n\
+         drafting, or WRITING FILES — do NOT do it with your own tools. Hand it to \
+         the cheapest capable model with `ACTION: delegate_task(<label>, \
+         <self-contained prompt>)`, then stop and say what you delegated; their \
+         results reach you on your NEXT turn. A sub-agent can create and edit project \
+         files itself, so \"build X\" is delegated like anything else: tell it exactly \
+         which files to write and what each must contain, and it writes them. Give \
+         one file, or one coherent group of files, per delegation. If the question \
+         just needs a direct answer, answer it directly.\n\
          --- the user's message follows ---\n",
         others.join(", ")
     ))
@@ -138,6 +152,10 @@ pub enum Event {
     /// orchestrator blocks on a `WriteDecision` until the UI answers, so nothing
     /// reaches disk before the user has seen this.
     WriteRequested {
+        /// Which model is asking. A sub-agent can propose writes too, and "agy wants
+        /// to overwrite this" is a materially different question from "your commander
+        /// does".
+        author: String,
         path: String,
         bytes: usize,
         /// Size of the file this would overwrite, or `None` when creating a new one.
@@ -146,7 +164,7 @@ pub enum Event {
         preview: String,
     },
     /// The user refused a write. Distinct from `Error`: nothing went wrong.
-    WriteDenied { path: String },
+    WriteDenied { author: String, path: String },
     /// A skill was read successfully. A failed read still goes through `Event::Error`
     /// (unchanged), which is enough on its own to clear the activity indicator.
     SkillLoaded { name: String, chars: usize },
@@ -167,7 +185,7 @@ pub enum Event {
     /// Carries only the path — never content, same reasoning as `WrittenFile` in
     /// `swarm.rs` — so the user can see that a write happened without this event
     /// itself becoming a way to smuggle file content through the TUI.
-    FileWritten { path: String },
+    FileWritten { author: String, path: String },
     /// A project file was read successfully via `ACTION: read_file(...)`. Carries
     /// only the path and a size, never content — same reasoning as `FileWritten`. A
     /// failed read still goes through `Event::Error` (unchanged), which is enough on
@@ -238,7 +256,14 @@ fn subagent_preamble() -> &'static str {
      Use your own file reading and directory listing tools rather than shell \
      commands. You are running non-interactively, so there is nobody available to \
      approve a shell command and one may simply be refused; reading files directly \
-     always works.\n--- the task follows ---\n"
+     always works.\n\
+     If this task is to CREATE or EDIT files, write them using the file-write \
+     protocol described in your system prompt: one block per file, with that file's \
+     complete final content in between. That protocol is the only way a file you \
+     produce actually reaches the project — describing a file, or quoting it in prose \
+     outside a write block, writes nothing. Every write is shown to the user for \
+     approval before it lands.\n\
+     --- the task follows ---\n"
 }
 
 /// The user's answer to a pending write request.
@@ -1446,7 +1471,7 @@ impl Orchestrator {
         self.run_skill_reads(&primary_label, &stripped).await;
         self.run_file_reads(&primary_label, &stripped).await;
         self.run_file_lists(&primary_label, &stripped).await;
-        self.run_file_writes(writes).await;
+        self.run_file_writes(&primary_label, writes).await;
     }
 
     /// Executes any `delegate_task` lines the primary emitted.
@@ -1541,12 +1566,28 @@ impl Orchestrator {
                     if let Some(budget) = reply.rate_limit.summary() {
                         self.ledger.update_budget(&target_label, &budget);
                     }
+                    // A sub-agent's reply IS scanned for write blocks — and for
+                    // nothing else. That asymmetry is the whole design: the bound on
+                    // the swarm is that a sub-agent cannot *delegate*, read a skill,
+                    // or read/list files, so no reply can spawn more work. A write
+                    // spawns nothing. Without this a swarm could only ever describe a
+                    // project it had been asked to build, because the commander is the
+                    // one told to hand authoring off and the author could not write.
+                    //
+                    // Safe to allow only because every write still passes the same two
+                    // gates a commander's does: `Workspace`'s path hardening, and the
+                    // user's explicit approval, which now names the sub-agent as the
+                    // one asking.
+                    let (sub_writes, sub_text) = SwarmLedger::parse_file_writes(&reply.text);
+                    self.run_file_writes(&target_label, sub_writes).await;
+
                     // Record the reply on the task before flipping it to Done, so the
                     // ledger shown to the delegating model on its next turn carries
-                    // the answer, not just a status tag. This is Fix 1: previously the
-                    // reply reached only the TUI (via Event::Reply below) and the
-                    // delegating model never saw it at all.
-                    self.ledger.record_result(task_id, &reply.text);
+                    // the answer, not just a status tag. The *stripped* text: file
+                    // content is already on disk, and echoing it back into every
+                    // future prompt is exactly the ledger growth `MAX_RESULT_CHARS`
+                    // exists to prevent.
+                    self.ledger.record_result(task_id, &sub_text);
                     self.ledger
                         .update_status(task_id, crate::swarm::TaskStatus::Done);
                     let _ = self.audit.log(
@@ -1556,13 +1597,13 @@ impl Orchestrator {
                     self.emit(Event::DelegationFinished {
                         to: target_label.clone(),
                         ok: true,
-                        chars: reply.text.len(),
+                        chars: sub_text.len(),
                         millis,
                     })
                     .await;
                     self.emit(Event::Reply {
                         label: target_label,
-                        text: reply.text,
+                        text: sub_text,
                     })
                     .await;
                 }
@@ -1676,7 +1717,7 @@ impl Orchestrator {
     /// closed is the only defensible choice for a gate whose entire purpose is that
     /// nothing reaches disk unseen: if there is nobody left to ask, there is nobody to
     /// have consented.
-    async fn confirm_write(&mut self, write: &crate::swarm::FileWrite) -> bool {
+    async fn confirm_write(&mut self, author: &str, write: &crate::swarm::FileWrite) -> bool {
         if self.approve_all {
             return true;
         }
@@ -1695,6 +1736,7 @@ impl Orchestrator {
             .map(|m| m.len());
 
         self.emit(Event::WriteRequested {
+            author: author.to_string(),
             path: write.path.clone(),
             bytes: write.content.len(),
             overwrites,
@@ -1717,8 +1759,8 @@ impl Orchestrator {
         }
     }
 
-    async fn run_file_writes(&mut self, writes: Vec<crate::swarm::FileWrite>) {
-        for write in writes.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+    async fn run_file_writes(&mut self, author: &str, writes: Vec<crate::swarm::FileWrite>) {
+        for write in writes.into_iter().take(MAX_WRITES_PER_TURN) {
             // Before the user is asked anything: a write that `Workspace` will refuse
             // regardless must not be put to them for approval. Asking about a doomed
             // write teaches that the answer does not matter, and makes the refusal
@@ -1734,7 +1776,7 @@ impl Orchestrator {
                     .await;
                 continue;
             }
-            if !self.confirm_write(&write).await {
+            if !self.confirm_write(author, &write).await {
                 let _ = self
                     .audit
                     .log("file.write_denied", &format!("path={}", write.path));
@@ -1745,6 +1787,7 @@ impl Orchestrator {
                 self.ledger
                     .record_file_write(&write.path, "denied by the user");
                 self.emit(Event::WriteDenied {
+                    author: author.to_string(),
                     path: write.path.clone(),
                 })
                 .await;
@@ -1759,6 +1802,7 @@ impl Orchestrator {
                     );
                     self.ledger.record_file_write(&write.path, &outcome);
                     self.emit(Event::FileWritten {
+                        author: author.to_string(),
                         path: write.path.clone(),
                     })
                     .await;
@@ -1894,6 +1938,35 @@ mod tests {
         }
         fn is_remote(&self) -> bool {
             self.remote
+        }
+    }
+
+    /// A provider that returns fixed text regardless of the prompt, for exercising
+    /// what a *reply's* shape causes. `StubProvider` echoes its prompt, which cannot
+    /// carry a multi-line write block: `parse_delegations` is a per-line parser, so a
+    /// delegated prompt is always one line.
+    struct ScriptedProvider {
+        provider: String,
+        model: String,
+        reply: String,
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn send(&self, _system: Option<&str>, _prompt: &str) -> Result<Reply> {
+            Ok(Reply {
+                text: self.reply.clone(),
+                rate_limit: RateLimit::default(),
+            })
+        }
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+        fn provider_name(&self) -> &str {
+            &self.provider
+        }
+        fn is_remote(&self) -> bool {
+            false
         }
     }
 
@@ -2988,7 +3061,7 @@ mod tests {
 
         let mut saw_write = false;
         while let Ok(event) = event_rx.try_recv() {
-            if let Event::FileWritten { path } = event {
+            if let Event::FileWritten { path, .. } = event {
                 assert_eq!(path, "hello.txt");
                 saw_write = true;
             }
@@ -3028,10 +3101,13 @@ mod tests {
             approve_all: false,
         };
 
-        orch.run_file_writes(vec![crate::swarm::FileWrite {
-            path: "../escape.txt".into(),
-            content: "malicious".into(),
-        }])
+        orch.run_file_writes(
+            "ollama:llama3",
+            vec![crate::swarm::FileWrite {
+                path: "../escape.txt".into(),
+                content: "malicious".into(),
+            }],
+        )
         .await;
 
         assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
@@ -3071,10 +3147,13 @@ mod tests {
             approve_all: false,
         };
 
-        orch.run_file_writes(vec![crate::swarm::FileWrite {
-            path: "notes.txt".into(),
-            content: "hello".into(),
-        }])
+        orch.run_file_writes(
+            "ollama:llama3",
+            vec![crate::swarm::FileWrite {
+                path: "notes.txt".into(),
+                content: "hello".into(),
+            }],
+        )
         .await;
 
         let prompt = orch.system_prompt();
@@ -3181,7 +3260,7 @@ mod tests {
         let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
 
         dec_tx.send(WriteDecision::Deny).await.unwrap();
-        orch.run_file_writes(one_write()).await;
+        orch.run_file_writes("ollama:llama3", one_write()).await;
 
         assert!(
             !project.path().join("notes.txt").exists(),
@@ -3217,7 +3296,7 @@ mod tests {
         let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
 
         dec_tx.send(WriteDecision::Approve).await.unwrap();
-        orch.run_file_writes(one_write()).await;
+        orch.run_file_writes("ollama:llama3", one_write()).await;
 
         assert_eq!(
             std::fs::read_to_string(project.path().join("notes.txt")).unwrap(),
@@ -3245,11 +3324,14 @@ mod tests {
         let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
 
         dec_tx.send(WriteDecision::ApproveAll).await.unwrap();
-        orch.run_file_writes(one_write()).await;
-        orch.run_file_writes(vec![crate::swarm::FileWrite {
-            path: "second.txt".into(),
-            content: "two".into(),
-        }])
+        orch.run_file_writes("ollama:llama3", one_write()).await;
+        orch.run_file_writes(
+            "ollama:llama3",
+            vec![crate::swarm::FileWrite {
+                path: "second.txt".into(),
+                content: "two".into(),
+            }],
+        )
         .await;
 
         assert!(project.path().join("notes.txt").exists());
@@ -3272,7 +3354,7 @@ mod tests {
         drop(dec_tx);
         let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
 
-        orch.run_file_writes(one_write()).await;
+        orch.run_file_writes("ollama:llama3", one_write()).await;
         assert!(!project.path().join("notes.txt").exists());
     }
 
@@ -3292,10 +3374,13 @@ mod tests {
         let (_dec_tx, dec_rx) = mpsc::channel(1);
         let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
 
-        orch.run_file_writes(vec![crate::swarm::FileWrite {
-            path: ".git/HEAD".into(),
-            content: "ref: refs/heads/pwned".into(),
-        }])
+        orch.run_file_writes(
+            "ollama:llama3",
+            vec![crate::swarm::FileWrite {
+                path: ".git/HEAD".into(),
+                content: "ref: refs/heads/pwned".into(),
+            }],
+        )
         .await;
 
         assert_eq!(
@@ -3326,6 +3411,105 @@ mod tests {
         assert!(
             preview.contains("more line(s) not shown"),
             "a truncated preview must say so, or it reads as the whole file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_can_write_files_but_still_cannot_delegate_or_read() {
+        // The asymmetry that makes a swarm able to build a project without becoming
+        // unbounded: a sub-agent's reply produces writes, and nothing else. A write
+        // spawns no further work, so the recursion bound is untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("secret.txt"), "top secret").unwrap();
+
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "ollama:llama3".into(),
+            Arc::new(StubProvider {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                remote: false,
+            }),
+        );
+        // Its reply is a write block plus two actions that must stay inert.
+        providers.insert(
+            "ollama:builder".into(),
+            Arc::new(ScriptedProvider {
+                provider: "ollama".into(),
+                model: "builder".into(),
+                reply: "Done.\n\
+                        ACTION: write_file(made.txt)\n\
+                        from the sub-agent\n\
+                        ACTION: end_file\n\
+                        ACTION: read_file(secret.txt)\n\
+                        ACTION: delegate_task(ollama:llama3, recurse)"
+                    .into(),
+            }),
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut orch = Orchestrator {
+            registry: Registry {
+                providers,
+                primary: "ollama:llama3".into(),
+                applied: BTreeMap::new(),
+                connection_ids: BTreeMap::new(),
+            },
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![6u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project.path().to_path_buf(),
+            // Pre-approved: the gate is exercised by its own tests, and this one is
+            // about what a sub-agent's reply is allowed to cause.
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:builder, build it)",
+        )
+        .await;
+
+        // The write landed, attributed to the sub-agent.
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("made.txt")).unwrap(),
+            "from the sub-agent"
+        );
+        let mut author = None;
+        let mut saw_read = false;
+        let mut delegated_to = Vec::new();
+        while let Ok(e) = event_rx.try_recv() {
+            match e {
+                Event::FileWritten { author: a, .. } => author = Some(a),
+                Event::FileRead { .. } => saw_read = true,
+                Event::Delegated { to, .. } => delegated_to.push(to),
+                _ => {}
+            }
+        }
+        assert_eq!(author.as_deref(), Some("ollama:builder"));
+        // ...but its other actions are inert: no read, and no second delegation.
+        assert!(
+            !saw_read,
+            "a sub-agent must not be able to read project files"
+        );
+        assert_eq!(
+            delegated_to.len(),
+            1,
+            "a sub-agent reply must not spawn another delegation"
+        );
+        // The file content must not be echoed back into the ledger either.
+        let tasks = orch.ledger.tasks();
+        assert!(
+            !tasks[0]
+                .result
+                .as_deref()
+                .unwrap_or("")
+                .contains("from the sub-agent")
         );
     }
 
@@ -3645,8 +3829,11 @@ mod tests {
             approve_all: false,
         };
 
+        // Leading newline so the marker lands at the start of a line in the stub's
+        // echoed reply (`echo: <prompt>`), which is what a real model emits and what
+        // `parse_file_writes` now requires — see its `strip_prefix` comment.
         orch.handle_prompt(
-            "ACTION: write_file(README.md)\n\
+            "\nACTION: write_file(README.md)\n\
              Here is how to read a file:\n\
              ACTION: read_file(secret.txt)\n\
              ACTION: end_file",

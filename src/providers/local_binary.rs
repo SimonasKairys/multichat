@@ -307,6 +307,7 @@ impl LocalBinaryProvider {
 
         let mut lines = BufReader::new(stdout).lines();
         let mut result_text: Option<String> = None;
+        let mut stream_error: Option<String> = None;
         let mut assistant_text = String::new();
         let mut accumulated_bytes = 0usize;
 
@@ -358,6 +359,12 @@ impl LocalBinaryProvider {
                                     }
                                 }
                                 StreamLineEffect::Result(text) => result_text = Some(text),
+                                // Recorded rather than returned immediately: the
+                                // child is still running, and letting it exit on its
+                                // own keeps the `wait()` below meaningful.
+                                StreamLineEffect::Failure(reason) => {
+                                    stream_error = Some(reason);
+                                }
                                 // A line that isn't valid JSON, or is JSON of a shape
                                 // this dialect doesn't recognise, is skipped silently
                                 // — this is a third-party CLI's own output format and
@@ -386,6 +393,14 @@ impl LocalBinaryProvider {
         };
 
         let stderr_text = stderr_task.await.unwrap_or_default();
+
+        // A reason reported in the stream beats both the exit status and stderr: an
+        // agentic CLI that fails a tool permission check exits non-zero with empty
+        // stderr, which on its own produces "exited with exit status: 1: " and tells
+        // the user nothing about what actually went wrong.
+        if let Some(reason) = stream_error {
+            return Err(anyhow!("{} failed: {}", self.binary_path, reason));
+        }
 
         if !status.success() {
             return Err(anyhow!(
@@ -433,6 +448,14 @@ enum StreamLineEffect {
     /// The dialect's terminal event: this is the final reply text, replacing whatever
     /// `AssistantText` had accumulated so far.
     Result(String),
+    /// The dialect's terminal event reporting that the run FAILED, carrying whatever
+    /// reason it gave. Distinct from `Result` because a failed run often still carries
+    /// partial reply text: agy answers a denied tool permission with `status: ERROR`,
+    /// an `error` string, and a `response` that reads like a normal (but useless)
+    /// answer — "I have dispatched a subagent and will report shortly". Treating that
+    /// `response` as the reply would report a confident non-answer as success, so the
+    /// reason wins over the text.
+    Failure(String),
     /// Not JSON, or JSON this dialect doesn't recognise the shape of. Never an error.
     Ignore,
 }
@@ -456,13 +479,20 @@ fn parse_claude_line(line: &str) -> StreamLineEffect {
     };
     match value.get("type").and_then(Value::as_str) {
         Some("assistant") => claude_assistant_effect(&value),
-        Some("result") => StreamLineEffect::Result(
-            value
+        Some("result") => {
+            let text = value
                 .get("result")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
-                .to_string(),
-        ),
+                .to_string();
+            // On a failed run this dialect puts the reason in the same `result`
+            // field the reply text normally occupies, so the flag is the only thing
+            // distinguishing "here is your answer" from "here is why there isn't one".
+            if value.get("is_error").and_then(Value::as_bool) == Some(true) {
+                return StreamLineEffect::Failure(text);
+            }
+            StreamLineEffect::Result(text)
+        }
         _ => StreamLineEffect::Ignore,
     }
 }
@@ -507,13 +537,29 @@ fn parse_agy_line(line: &str) -> StreamLineEffect {
     };
     match value.get("event").and_then(Value::as_str) {
         Some("step_update") => agy_step_update_effect(&value),
-        Some("result") => StreamLineEffect::Result(
-            value
-                .pointer("/result/response")
+        Some("result") => {
+            let status = value
+                .pointer("/result/status")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-        ),
+                .unwrap_or("SUCCESS");
+            if status != "SUCCESS" {
+                // The `error` field is the actionable half — a denied tool
+                // permission, a quota refusal — so prefer it, falling back to the
+                // bare status when the CLI gave no detail.
+                let reason = value
+                    .pointer("/result/error")
+                    .and_then(Value::as_str)
+                    .unwrap_or(status);
+                return StreamLineEffect::Failure(reason.to_string());
+            }
+            StreamLineEffect::Result(
+                value
+                    .pointer("/result/response")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        }
         _ => StreamLineEffect::Ignore,
     }
 }
@@ -899,6 +945,40 @@ mod tests {
             parse_agy_line(line),
             StreamLineEffect::Progress("subagent: invoke_subagent".to_string())
         );
+    }
+
+    #[test]
+    fn agy_dialect_reports_a_failed_run_as_a_failure_not_as_its_partial_text() {
+        // Captured from a real run: agy denied its own `run_command` tool, then
+        // answered with a confident-sounding `response` that contains no answer. The
+        // reason must win, or a denied-permission failure reads as a successful reply.
+        let line = r#"{"event":"result","result":{"status":"ERROR","response":"I have dispatched a research subagent and will report shortly.\n","error":"permission check failed for command \"pwd\": user denied permission to run command:\npwd"}}"#;
+        match parse_agy_line(line) {
+            StreamLineEffect::Failure(reason) => {
+                assert!(reason.contains("user denied permission"), "got: {reason}");
+            }
+            other => panic!("expected a Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agy_dialect_falls_back_to_the_bare_status_when_no_error_detail_is_given() {
+        let line = r#"{"event":"result","result":{"status":"CANCELLED","response":""}}"#;
+        match parse_agy_line(line) {
+            StreamLineEffect::Failure(reason) => assert_eq!(reason, "CANCELLED"),
+            other => panic!("expected a Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_dialect_reports_an_is_error_result_as_a_failure() {
+        // This dialect reuses the `result` field for the failure reason, so the flag
+        // is the only thing separating an answer from an explanation of its absence.
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"Credit balance is too low"}"#;
+        match parse_claude_line(line) {
+            StreamLineEffect::Failure(reason) => assert_eq!(reason, "Credit balance is too low"),
+            other => panic!("expected a Failure, got {other:?}"),
+        }
     }
 
     #[test]

@@ -28,6 +28,47 @@ use crate::workspace::Workspace;
 /// Delegations honoured per user turn, so a model cannot spin the swarm forever.
 const MAX_DELEGATIONS_PER_TURN: usize = 3;
 
+/// The commander directive prepended to the user's own prompt, or `None` when the
+/// commander is the only model connected and there is therefore nobody to delegate to.
+///
+/// The delegation protocol already lives in the system prompt (see
+/// `SwarmLedger::system_prompt`), and for a plain API or Ollama model that is enough —
+/// emitting `ACTION:` lines is the only way such a model can act at all. It is NOT
+/// enough for an agentic CLI provider. `claude` and `agy` ship their own system prompt
+/// and their own tool loop; handed simon's protocol via `--system-prompt`, they
+/// ignore it and do the work with their own `Bash`/`Read` tools instead. That was
+/// measured, not assumed: with the delegation mandate in the system prompt alone, a
+/// `claude` commander asked to audit a project ran six of its own tool calls and
+/// delegated nothing. With the same mandate in the user turn, it delegated three
+/// well-formed tasks to the cheap model instead.
+///
+/// So the directive rides in the user turn, where an agentic CLI weights it against
+/// its own instructions rather than under them. It is deliberately short and
+/// conditional — prepending a heavy "you must delegate" block to every message would
+/// make a commander delegate the word "hi" — and it defers to the model's judgement on
+/// whether the question actually needs any work doing.
+fn commander_preamble(primary: &str, roster: &[String]) -> Option<String> {
+    let others: Vec<&str> = roster
+        .iter()
+        .map(String::as_str)
+        .filter(|label| *label != primary)
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "[swarm] You are the commander. Connected and available to you: {}.\n\
+         If answering this needs real work — reading files, searching, summarising, \
+         drafting — do NOT do it with your own tools. Hand it to the cheapest capable \
+         model with `ACTION: delegate_task(<label>, <self-contained prompt>)`, then \
+         stop and say what you delegated; their results reach you on your NEXT turn. \
+         If the question just needs a direct answer, answer it directly.\n\
+         --- the user's message follows ---\n",
+        others.join(", ")
+    ))
+}
+
 /// Sent from the UI to the orchestrator.
 pub enum Command {
     Prompt(String),
@@ -1139,9 +1180,16 @@ impl Orchestrator {
         .await;
 
         let system = self.system_prompt();
+        // The user's own text is what the transcript and the audit log record; only
+        // what reaches the model is augmented. See `commander_preamble` for why the
+        // directive cannot just live in the system prompt.
+        let effective_prompt = match commander_preamble(&primary_label, &self.registry.labels()) {
+            Some(preamble) => format!("{preamble}\n{prompt}"),
+            None => prompt.to_string(),
+        };
         let progress = self.spawn_progress_forwarder(primary_label.clone());
         let reply = match provider
-            .send_with_progress(Some(&system), prompt, &progress)
+            .send_with_progress(Some(&system), &effective_prompt, &progress)
             .await
         {
             Ok(reply) => reply,
@@ -2606,6 +2654,81 @@ mod tests {
         // The write's content ("hello") must never itself be echoed into the ledger —
         // only the path and byte-count outcome (see `WrittenFile`'s doc comment).
         assert!(!prompt.contains("hello"));
+    }
+
+    #[test]
+    fn a_lone_commander_gets_no_delegation_preamble() {
+        // Nobody to delegate to: telling the model to hand work off would be advice it
+        // cannot follow, and would waste tokens on every single turn.
+        assert!(commander_preamble("claude", &["claude".to_string()]).is_none());
+        assert!(commander_preamble("claude", &[]).is_none());
+    }
+
+    #[test]
+    fn a_commander_with_a_swarm_is_told_who_it_can_delegate_to() {
+        let preamble = commander_preamble(
+            "claude",
+            &[
+                "claude".to_string(),
+                "agy".to_string(),
+                "ollama:l3".to_string(),
+            ],
+        )
+        .expect("a roster with other models must produce a preamble");
+        assert!(preamble.contains("ACTION: delegate_task"));
+        // The commander itself must not be listed as a delegation target.
+        assert!(!preamble.contains("claude."));
+        assert!(preamble.contains("agy, ollama:l3"));
+        // A trivial question must still be answerable directly, or the commander will
+        // delegate greetings.
+        assert!(preamble.contains("answer it directly"));
+    }
+
+    #[tokio::test]
+    async fn the_preamble_reaches_the_model_but_not_the_transcript_or_the_audit_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(
+            vec![("ollama", "llama3", false), ("ollama", "helper", false)],
+            "ollama:llama3",
+        );
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![7u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.handle_prompt("hello").await;
+
+        // `StubProvider` echoes whatever prompt it received, so the reply is proof of
+        // what actually reached the model.
+        let mut reply_text = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::Reply { text, .. } = event {
+                reply_text = text;
+            }
+        }
+        assert!(
+            reply_text.contains("ACTION: delegate_task"),
+            "the model should have received the commander directive: {reply_text}"
+        );
+        assert!(reply_text.contains("hello"));
+
+        // The audit log records what the *user* typed, not the augmented prompt —
+        // otherwise every turn's recorded size is inflated by a constant simon added.
+        let log = std::fs::read_to_string(&paths.audit_log).unwrap();
+        assert!(
+            log.contains("chars=5"),
+            "audit log should record `hello`: {log}"
+        );
     }
 
     #[tokio::test]

@@ -194,6 +194,40 @@ const MAX_TASK_DISPLAY_CHARS: usize = 120;
 /// reaches an `Event::ActivityProgress`. Mirrors `MAX_TASK_DISPLAY_CHARS`'s reasoning,
 /// just for a status-line detail instead of a transcript line — short enough that it
 /// never wraps the status line on its own.
+/// The directive prepended to a delegated task's prompt before it is sent.
+///
+/// Symmetric with `commander_preamble` and for the same underlying reason: an
+/// agentic CLI has its own ideas about how to work, and the only lever simon has over
+/// them is the text of the turn.
+///
+/// A sub-agent's reply is the ENTIRE result that reaches simon — there is no second
+/// round trip in which to collect anything it deferred. Left to itself, `agy` will
+/// dispatch a subagent of its own and return immediately with
+/// "I have delegated running `ls -1` to a subagent and am waiting for the results",
+/// which its stream reports as `status: SUCCESS`. That is the worst possible shape of
+/// failure: simon records a completed task whose content is a promise, and the
+/// commander then synthesises an answer out of nothing.
+///
+/// The second half addresses a separate failure with the same root. `agy`'s
+/// permission checker refuses shell commands in print mode — there is nobody there to
+/// approve them — so any task that leads it to run `find .`, `git ls-files`, or
+/// `git log` fails outright, while the same task done with its file-reading tools
+/// succeeds. That was measured both ways. simon cannot grant the permission (the only
+/// switch on offer is agy's blanket `--dangerously-skip-permissions`, which would
+/// auto-approve every tool call it ever makes and is deliberately not used), but it
+/// can point the sub-agent at the tools that do not need one.
+fn subagent_preamble() -> &'static str {
+    "[sub-agent] Complete this task fully in THIS reply. Do not dispatch, launch, or \
+     delegate to a subagent of your own, and do not answer that you are waiting on \
+     one: your reply is the entire result that reaches the requester, so anything you \
+     defer is lost. If you genuinely cannot finish, say what you found and what \
+     blocked you.\n\
+     Use your own file reading and directory listing tools rather than shell \
+     commands. You are running non-interactively, so there is nobody available to \
+     approve a shell command and one may simply be refused; reading files directly \
+     always works.\n--- the task follows ---\n"
+}
+
 /// How many times a delegated task is attempted before it is reported as failed.
 ///
 /// Not defensive padding — measured. An agentic CLI sub-agent fails transiently in
@@ -1391,12 +1425,15 @@ impl Orchestrator {
             .await;
 
             let system = self.system_prompt();
+            // Only what is sent is augmented; the ledger and the TUI keep the
+            // commander's own wording, the same split `commander_preamble` uses.
+            let effective_task = format!("{}{}", subagent_preamble(), delegation.prompt);
             let started = Instant::now();
             let mut attempts = 1;
             let outcome = loop {
                 let progress = self.spawn_progress_forwarder(target_label.clone());
                 let result = target
-                    .send_with_progress(Some(&system), &delegation.prompt, &progress)
+                    .send_with_progress(Some(&system), &effective_task, &progress)
                     .await;
                 // Drops the sink, closing the forwarding task's channel — see
                 // `spawn_progress_forwarder`'s doc comment. Inside the loop because a
@@ -2863,6 +2900,62 @@ mod tests {
         // The write's content ("hello") must never itself be echoed into the ledger —
         // only the path and byte-count outcome (see `WrittenFile`'s doc comment).
         assert!(!prompt.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn a_delegated_task_is_told_to_finish_in_turn_but_the_ledger_keeps_the_original() {
+        // `StubProvider` echoes the prompt it received, so the reply proves what was
+        // actually sent; the ledger and the transcript must still show the
+        // commander's own wording, not simon's augmentation.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(
+            vec![("ollama", "llama3", false), ("ollama", "helper", false)],
+            "ollama:llama3",
+        );
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![4u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:helper, summarise the diff)",
+        )
+        .await;
+
+        let mut sent = String::new();
+        let mut announced = String::new();
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                Event::Reply { text, .. } => sent = text,
+                Event::Delegated { task, .. } => announced = task,
+                _ => {}
+            }
+        }
+        assert!(
+            sent.contains("Do not dispatch, launch, or delegate to a subagent of your own"),
+            "the sub-agent should have been told to finish in-turn: {sent}"
+        );
+        assert!(
+            sent.contains("rather than shell commands"),
+            "the sub-agent should be steered off shell commands: {sent}"
+        );
+        assert!(sent.contains("summarise the diff"));
+        // What the user and the commander see stays unaugmented.
+        assert_eq!(announced, "summarise the diff");
+        let tasks = orch.ledger.tasks();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].description, "summarise the diff");
     }
 
     #[test]

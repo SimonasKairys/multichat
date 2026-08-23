@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 246 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 248 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -181,7 +181,22 @@ CLI sub-agent fails intermittently in several unrelated ways — an internal
 session has not been released yet — and a failed delegation is expensive in a way a
 failed HTTP call is not, since the commander does not learn of it until its next turn.
 A timeout, a missing binary, and a `--classified` refusal are *not* retried: those fail
-identically forever. Because the ledger is
+identically forever.
+
+A delegated prompt also carries a short sub-agent directive, for the same reason the
+commander's does — an agentic CLI has its own working habits and the turn text is the
+only lever over them. It says two things. First, finish in this reply: a sub-agent's
+answer is the *entire* result that reaches `simon`, and left alone `agy` will dispatch a
+subagent of its own and return "I have delegated running `ls -1` to a subagent and am
+waiting for the results" — which its stream reports as `SUCCESS`. That is the worst
+shape of failure, a completed task whose content is a promise. Second, prefer file-
+reading tools over shell commands: `agy`'s permission checker refuses shell commands in
+print mode, where nobody is present to approve them, so a task that leads it to run
+`find .` or `git log` fails outright while the same task done with file tools succeeds.
+`simon` cannot grant that permission — the only switch on offer is `agy`'s blanket
+`--dangerously-skip-permissions`, which would auto-approve every tool call it ever makes
+and is deliberately not used — but it can point the sub-agent at the tools that need no
+approval. Because the ledger is
 only re-rendered into the *next* prompt sent to any model, the result becomes visible to
 the delegating model on its next turn, not within the turn that requested it. Sub-agent
 replies are not re-scanned for delegations, and at most 3 delegations run per turn, so

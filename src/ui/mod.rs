@@ -25,7 +25,7 @@ use zeroize::Zeroize;
 
 use crate::app::{App, CommanderCommand, parse_commander_command};
 use crate::config::{Credentials, Settings};
-use crate::orchestrator::{Command, Event, discover_candidates};
+use crate::orchestrator::{Command, Event, WriteDecision, discover_candidates};
 use crate::picker::PickerState;
 
 /// Restores the terminal on drop, so a panic or an early `?` cannot leave the user in
@@ -81,6 +81,7 @@ pub async fn pick_connections(settings: &mut Settings, classified: bool) -> Resu
 pub async fn run(
     mut app: App,
     commands: mpsc::Sender<Command>,
+    decisions: mpsc::Sender<WriteDecision>,
     mut events: mpsc::Receiver<Event>,
     mut settings: Settings,
     paths: crate::config::Paths,
@@ -114,7 +115,7 @@ pub async fn run(
                         if is_reopen_picker(key.code, key.modifiers) {
                             reopen_picker(&mut guard, &mut input, &mut app, &commands, &mut settings, &paths, classified).await;
                         } else {
-                            handle_key(&mut app, key.code, key.modifiers, &commands).await;
+                            handle_key(&mut app, key.code, key.modifiers, &commands, &decisions).await;
                         }
                     }
                     // Ignore resize/mouse/focus events; the next draw picks up the size.
@@ -339,7 +340,32 @@ async fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
     commands: &mpsc::Sender<Command>,
+    decisions: &mpsc::Sender<WriteDecision>,
 ) {
+    // A pending write takes the keyboard until it is answered. Typing must not fall
+    // through to the input box: the turn is blocked on this answer, and a user who
+    // kept typing would be composing a message that cannot be sent while silently
+    // leaving a model waiting.
+    if app.pending_write.is_some() {
+        let decision = match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(WriteDecision::Approve),
+            KeyCode::Char('a') | KeyCode::Char('A') => Some(WriteDecision::ApproveAll),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(WriteDecision::Deny),
+            // Anything else is ignored rather than treated as a default. Neither
+            // default is safe: silently allowing is the whole thing this gate exists
+            // to prevent, and silently refusing would make a stray keypress look like
+            // a model failure.
+            _ => None,
+        };
+        if let Some(decision) = decision {
+            app.pending_write = None;
+            if decisions.send(decision).await.is_err() {
+                app.apply(Event::Error("orchestrator is not running".into()));
+            }
+        }
+        return;
+    }
+
     match code {
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {

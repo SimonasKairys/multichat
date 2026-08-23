@@ -148,7 +148,36 @@ pub struct App {
     /// a round trip to the orchestrator — this is already handed to `App::new` and
     /// refreshed on `Reconfigured`, so retaining it is the only plumbing needed.
     pub roster: Vec<String>,
+    /// Set while a model is waiting for permission to write a file. While this is
+    /// `Some` the input line becomes a y/n/a prompt rather than a text box — see
+    /// `handle_key` in `ui/mod.rs` — because answering it is the only thing that lets
+    /// the turn continue.
+    pub pending_write: Option<PendingWrite>,
     pub should_quit: bool,
+}
+
+/// A write the user has been asked to allow.
+#[derive(Debug, Clone)]
+pub struct PendingWrite {
+    pub path: String,
+    pub bytes: usize,
+    pub overwrites: Option<u64>,
+}
+
+impl PendingWrite {
+    /// The one-line question, phrased so the destructive case is unmistakable.
+    pub fn question(&self) -> String {
+        match self.overwrites {
+            Some(old) => format!(
+                "OVERWRITE {} ({old} bytes -> {} bytes)? [y]es  [n]o  [a]ll",
+                self.path, self.bytes
+            ),
+            None => format!(
+                "CREATE {} ({} bytes)? [y]es  [n]o  [a]ll",
+                self.path, self.bytes
+            ),
+        }
+    }
 }
 
 impl App {
@@ -182,6 +211,7 @@ impl App {
             spinner_frame: 0,
             primary,
             roster: roster.to_vec(),
+            pending_write: None,
             should_quit: false,
         }
     }
@@ -290,6 +320,29 @@ impl App {
             } => self.transcript.push(Line {
                 speaker: Speaker::System,
                 text: format!("{to} failed ({reason}) · retrying, attempt {attempt} of {max}"),
+            }),
+            Event::WriteRequested {
+                path,
+                bytes,
+                overwrites,
+                preview,
+            } => {
+                // The preview goes in the transcript, where it can scroll, rather than
+                // in the one-line prompt — a 20-line file would otherwise have nowhere
+                // to render.
+                self.transcript.push(Line {
+                    speaker: Speaker::System,
+                    text: format!("--- proposed write: {path} ---\n{preview}"),
+                });
+                self.pending_write = Some(PendingWrite {
+                    path,
+                    bytes,
+                    overwrites,
+                });
+            }
+            Event::WriteDenied { path } => self.transcript.push(Line {
+                speaker: Speaker::System,
+                text: format!("refused write: {path}"),
             }),
             Event::SkillLoaded { name, chars } => self.transcript.push(Line {
                 speaker: Speaker::System,
@@ -407,6 +460,12 @@ impl App {
     /// `Instant::now()` through call sites here (rather than baking it into every
     /// test's expectations) is what keeps those tests deterministic.
     pub fn status_line_at(&self, now: Instant) -> String {
+        // Takes priority over every other state, including a running activity: the
+        // turn is blocked on this answer, so the status line must ask for it rather
+        // than keep spinning as though it were still waiting on a model.
+        if let Some(pending) = &self.pending_write {
+            return pending.question();
+        }
         match &self.activity {
             Some(activity) => {
                 let elapsed = now.saturating_duration_since(activity.started).as_secs();
@@ -813,6 +872,53 @@ mod tests {
         assert!(app.busy);
         app.finish_local_command();
         assert!(!app.busy);
+    }
+
+    #[test]
+    fn a_pending_write_takes_over_the_status_line_from_a_running_activity() {
+        let mut app = app();
+        app.apply(Event::ActivityStarted {
+            label: "claude".into(),
+            kind: ActivityKind::Primary,
+        });
+        app.apply(Event::WriteRequested {
+            path: "src/main.rs".into(),
+            bytes: 120,
+            overwrites: Some(80),
+            preview: "fn main() {}\n".into(),
+        });
+        let line = app.status_line_at(Instant::now());
+        // The turn is blocked on this answer, so the line must ask rather than spin.
+        assert!(line.contains("OVERWRITE src/main.rs"));
+        assert!(line.contains("[y]es"));
+        assert!(!line.contains("awaiting reply"));
+        assert!(app.pending_write.is_some());
+        // The content has to be visible somewhere, or the question is unanswerable.
+        assert!(
+            app.transcript
+                .iter()
+                .any(|l| l.text.contains("fn main() {}"))
+        );
+    }
+
+    #[test]
+    fn a_new_file_and_an_overwrite_ask_different_questions() {
+        let create = PendingWrite {
+            path: "a.txt".into(),
+            bytes: 10,
+            overwrites: None,
+        };
+        assert!(create.question().starts_with("CREATE a.txt"));
+
+        let clobber = PendingWrite {
+            path: "a.txt".into(),
+            bytes: 10,
+            overwrites: Some(4096),
+        };
+        let q = clobber.question();
+        assert!(q.starts_with("OVERWRITE a.txt"));
+        // The size being destroyed must appear; it is the whole basis for saying no.
+        assert!(q.contains("4096 bytes"));
     }
 
     #[test]

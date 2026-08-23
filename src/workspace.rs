@@ -132,6 +132,16 @@ impl Workspace {
             .with_context(|| format!("failed to read project file `{requested}`"))
     }
 
+    /// Metadata for an existing project file, so a caller can tell what a write would
+    /// replace before making it. Goes through the same `resolve` hardening as `read`,
+    /// so a model-supplied path can no more stat something outside the project than it
+    /// could read it. A path that does not exist yet is an error, which callers read
+    /// as "this write creates a new file".
+    pub fn metadata(&self, requested: &str) -> Result<fs::Metadata> {
+        let path = self.resolve(requested)?;
+        fs::metadata(&path).with_context(|| format!("failed to stat project file `{requested}`"))
+    }
+
     /// Lists one directory's immediate entries — never recursively, so a model must
     /// spend a further `list` call to descend into a subdirectory it saw. `requested`
     /// empty (or `.`) means the project root itself; anything else goes through the
@@ -184,6 +194,42 @@ impl Workspace {
         Ok(entries)
     }
 
+    /// The checks a write must pass that need no filesystem changes to evaluate:
+    /// traversal, size, and the `.git` refusal.
+    ///
+    /// Split out of `write` so a caller can find out that a write is doomed *before*
+    /// acting on it — specifically, before asking the user to approve it. Prompting
+    /// for a write that would be refused anyway trains the user that their answer does
+    /// not matter, and makes a refusal look like the consequence of their approval.
+    ///
+    /// Deliberately not the whole of `write`'s validation: the symlink and
+    /// canonical-prefix checks require creating the parent directory first, and a
+    /// check with side effects is not a check. Those stay in `write`, which is still
+    /// the only thing standing between a path and the disk — this is an early-out, not
+    /// a replacement.
+    pub fn precheck(&self, requested: &str, content_len: usize) -> Result<()> {
+        Self::reject_traversal(requested)?;
+        if content_len > MAX_FILE_BYTES {
+            return Err(anyhow!(
+                "project file `{requested}` is {content_len} bytes, over the {MAX_FILE_BYTES}-byte limit"
+            ));
+        }
+        Self::reject_git_writes(requested, Path::new(requested))
+    }
+
+    /// Refuses any write whose path passes through a `.git` component.
+    fn reject_git_writes(requested: &str, candidate: &Path) -> Result<()> {
+        if candidate
+            .components()
+            .any(|c| matches!(c, Component::Normal(name) if name == ".git"))
+        {
+            return Err(anyhow!(
+                "project path `{requested}` would write into `.git`, which is refused"
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolves a model-supplied relative path and writes `content` to it, creating
     /// any parent directories as needed. Returns the resolved absolute path on
     /// success.
@@ -232,14 +278,11 @@ impl Workspace {
         // string, so a symlink whose target lands inside `.git` is caught too, not
         // just a request that spells `.git` out directly. Reading `.git` is not
         // special-cased — only a write can corrupt it.
-        if resolved
-            .components()
-            .any(|c| matches!(c, Component::Normal(name) if name == ".git"))
-        {
-            return Err(anyhow!(
-                "project path `{requested}` would write into `.git`, which is refused"
-            ));
-        }
+        // `precheck` already ran this against the lexical path, as an early-out so a
+        // doomed write is never put to the user for approval. This re-runs it against
+        // the RESOLVED path, which is the load-bearing one: it is what catches a
+        // symlink whose target lands inside `.git`.
+        Self::reject_git_writes(requested, &resolved)?;
 
         // A symlink at the final path — even one whose parent is legitimately inside
         // the root — could redirect the write outside it. `symlink_metadata` never

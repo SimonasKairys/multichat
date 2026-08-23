@@ -134,6 +134,19 @@ pub enum Event {
         max: usize,
         reason: String,
     },
+    /// A model wants to write a file and is waiting for the user to allow it. The
+    /// orchestrator blocks on a `WriteDecision` until the UI answers, so nothing
+    /// reaches disk before the user has seen this.
+    WriteRequested {
+        path: String,
+        bytes: usize,
+        /// Size of the file this would overwrite, or `None` when creating a new one.
+        /// The single most important thing to know before answering.
+        overwrites: Option<u64>,
+        preview: String,
+    },
+    /// The user refused a write. Distinct from `Error`: nothing went wrong.
+    WriteDenied { path: String },
     /// A skill was read successfully. A failed read still goes through `Event::Error`
     /// (unchanged), which is enough on its own to clear the activity indicator.
     SkillLoaded { name: String, chars: usize },
@@ -226,6 +239,48 @@ fn subagent_preamble() -> &'static str {
      commands. You are running non-interactively, so there is nobody available to \
      approve a shell command and one may simply be refused; reading files directly \
      always works.\n--- the task follows ---\n"
+}
+
+/// The user's answer to a pending write request.
+///
+/// `ApproveAll` is per-session, not persisted: a user who trusts one turn's writes has
+/// not necessarily agreed to be asked nothing for the rest of time, and a persisted
+/// "yes to everything" is exactly the setting people forget they enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteDecision {
+    Approve,
+    ApproveAll,
+    Deny,
+}
+
+/// How much of a pending file's content is shown before the user decides.
+///
+/// A write is unreviewable if the user cannot see what it says, but a 256KB file
+/// (`workspace::MAX_FILE_BYTES`) would bury the question itself off-screen. The size
+/// and path are always exact; this only bounds the body.
+const WRITE_PREVIEW_LINES: usize = 20;
+const WRITE_PREVIEW_CHARS: usize = 1200;
+
+/// Renders the head of a pending write's content for the confirmation prompt, marking
+/// it when truncated so a preview is never mistaken for the whole file.
+fn write_preview(content: &str) -> String {
+    let mut out = String::new();
+    let total_lines = content.lines().count();
+    for line in content.lines().take(WRITE_PREVIEW_LINES) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if let Some((cut, _)) = out.char_indices().nth(WRITE_PREVIEW_CHARS) {
+        out.truncate(cut);
+        out.push_str("…\n");
+    }
+    if total_lines > WRITE_PREVIEW_LINES {
+        out.push_str(&format!(
+            "… {} more line(s) not shown\n",
+            total_lines - WRITE_PREVIEW_LINES
+        ));
+    }
+    out
 }
 
 /// How many times a delegated task is attempted before it is reported as failed.
@@ -1117,6 +1172,13 @@ pub struct Orchestrator {
     /// — with the same project root the session started with, without re-reading it
     /// from anywhere else.
     project_root: PathBuf,
+    /// Answers to `Event::WriteRequested`, from the UI. `None` when the session was
+    /// started with writes pre-approved (`--auto-write`), which is also what test and
+    /// non-interactive callers pass.
+    decisions: Option<mpsc::Receiver<WriteDecision>>,
+    /// Set by a `WriteDecision::ApproveAll`; skips the prompt for the rest of the
+    /// session. Never persisted — see `WriteDecision`.
+    approve_all: bool,
 }
 
 impl Orchestrator {
@@ -1126,6 +1188,7 @@ impl Orchestrator {
         project_root: PathBuf,
         classified: bool,
         events: mpsc::Sender<Event>,
+        decisions: Option<mpsc::Receiver<WriteDecision>>,
     ) -> Result<Self> {
         let mut ledger = SwarmLedger::new();
         ledger.set_roster(registry.labels());
@@ -1139,6 +1202,8 @@ impl Orchestrator {
             events,
             classified,
             project_root,
+            decisions,
+            approve_all: false,
         })
     }
 
@@ -1601,8 +1666,90 @@ impl Orchestrator {
     /// comes from `parse_file_writes(&reply.text)` in `handle_prompt`, never from a
     /// sub-agent's delegation reply — so the same non-recursion guarantee that holds
     /// for delegations and skill reads holds here too.
+    /// Asks the user to allow one write, returning whether it may proceed.
+    ///
+    /// Returns `true` without asking when the session pre-approved writes
+    /// (`--auto-write`, and every non-interactive caller) or the user has already
+    /// answered "all" this session.
+    ///
+    /// A closed channel means the UI is gone, and that denies the write. Failing
+    /// closed is the only defensible choice for a gate whose entire purpose is that
+    /// nothing reaches disk unseen: if there is nobody left to ask, there is nobody to
+    /// have consented.
+    async fn confirm_write(&mut self, write: &crate::swarm::FileWrite) -> bool {
+        if self.approve_all {
+            return true;
+        }
+        if self.decisions.is_none() {
+            return true;
+        }
+
+        // Read the existing file's size before asking, not after: "overwrites 4KB" and
+        // "creates a new file" are different questions, and the user is being asked to
+        // answer one of them.
+        let overwrites = self
+            .workspace
+            .metadata(&write.path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len());
+
+        self.emit(Event::WriteRequested {
+            path: write.path.clone(),
+            bytes: write.content.len(),
+            overwrites,
+            preview: write_preview(&write.content),
+        })
+        .await;
+
+        // Borrowed only now: `emit` needs `&self`, so holding a `&mut` on the receiver
+        // across it would not compile.
+        let Some(decisions) = self.decisions.as_mut() else {
+            return true;
+        };
+        match decisions.recv().await {
+            Some(WriteDecision::Approve) => true,
+            Some(WriteDecision::ApproveAll) => {
+                self.approve_all = true;
+                true
+            }
+            Some(WriteDecision::Deny) | None => false,
+        }
+    }
+
     async fn run_file_writes(&mut self, writes: Vec<crate::swarm::FileWrite>) {
         for write in writes.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+            // Before the user is asked anything: a write that `Workspace` will refuse
+            // regardless must not be put to them for approval. Asking about a doomed
+            // write teaches that the answer does not matter, and makes the refusal
+            // that follows a "yes" look like a consequence of approving it.
+            if let Err(e) = self.workspace.precheck(&write.path, write.content.len()) {
+                let outcome = format!("failed: {e}");
+                let _ = self.audit.log(
+                    "file.write_failed",
+                    &format!("path={} error={e}", write.path),
+                );
+                self.ledger.record_file_write(&write.path, &outcome);
+                self.emit(Event::Error(format!("write `{}`: {e}", write.path)))
+                    .await;
+                continue;
+            }
+            if !self.confirm_write(&write).await {
+                let _ = self
+                    .audit
+                    .log("file.write_denied", &format!("path={}", write.path));
+                // Recorded in the ledger like any other outcome, so the model learns on
+                // its next turn that the file was NOT written. Without this it would
+                // carry on as though the write had succeeded and build on a file that
+                // does not exist.
+                self.ledger
+                    .record_file_write(&write.path, "denied by the user");
+                self.emit(Event::WriteDenied {
+                    path: write.path.clone(),
+                })
+                .await;
+                continue;
+            }
             match self.workspace.write(&write.path, &write.content) {
                 Ok(_) => {
                     let outcome = format!("ok ({} bytes)", write.content.len());
@@ -2142,6 +2289,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -2183,6 +2332,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_delegations(
@@ -2228,6 +2379,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_delegations("ollama:llama3", "ACTION: delegate_task(ghost:model, hi)")
@@ -2275,6 +2428,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_delegations(
@@ -2327,6 +2482,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_delegations(
@@ -2397,6 +2554,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_delegations(
@@ -2447,6 +2606,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         let long_task = format!("a{}", "€".repeat(130));
@@ -2486,6 +2647,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
@@ -2524,6 +2687,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
@@ -2571,6 +2736,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_skill_reads(
@@ -2613,6 +2780,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(nope.md)")
@@ -2658,6 +2827,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         let prompt = orch.system_prompt();
@@ -2682,6 +2853,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -2731,6 +2904,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         // Bare model name, not the full label — exercises `set_primary`'s flexible
@@ -2773,6 +2948,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.set_commander("ghost").await;
@@ -2798,6 +2975,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         // `StubProvider::send` echoes `"echo: {prompt}"`, prefixing only the first
@@ -2845,6 +3024,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_file_writes(vec![crate::swarm::FileWrite {
@@ -2886,6 +3067,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_file_writes(vec![crate::swarm::FileWrite {
@@ -2925,6 +3108,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_delegations(
@@ -2956,6 +3141,192 @@ mod tests {
         let tasks = orch.ledger.tasks();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].description, "summarise the diff");
+    }
+
+    /// Builds an orchestrator whose writes must be approved through `decisions`.
+    fn orch_with_write_gate(
+        project: &std::path::Path,
+        paths: &Paths,
+        events: mpsc::Sender<Event>,
+        decisions: mpsc::Receiver<WriteDecision>,
+    ) -> Orchestrator {
+        Orchestrator {
+            registry: registry_with(vec![("ollama", "llama3", false)], "ollama:llama3"),
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![5u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project.to_path_buf()).unwrap(),
+            events,
+            classified: false,
+            project_root: project.to_path_buf(),
+            decisions: Some(decisions),
+            approve_all: false,
+        }
+    }
+
+    fn one_write() -> Vec<crate::swarm::FileWrite> {
+        vec![crate::swarm::FileWrite {
+            path: "notes.txt".into(),
+            content: "hello".into(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_denied_write_never_reaches_disk_and_is_recorded_as_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (dec_tx, dec_rx) = mpsc::channel(1);
+        let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
+
+        dec_tx.send(WriteDecision::Deny).await.unwrap();
+        orch.run_file_writes(one_write()).await;
+
+        assert!(
+            !project.path().join("notes.txt").exists(),
+            "a denied write must not create the file"
+        );
+        let mut asked = false;
+        let mut denied = false;
+        let mut written = false;
+        while let Ok(e) = event_rx.try_recv() {
+            match e {
+                Event::WriteRequested { .. } => asked = true,
+                Event::WriteDenied { .. } => denied = true,
+                Event::FileWritten { .. } => written = true,
+                _ => {}
+            }
+        }
+        assert!(asked && denied && !written);
+        // The model must learn the write did not happen, or it builds on a file that
+        // does not exist.
+        let recorded = orch.ledger.written_files();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].outcome.contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn an_approved_write_lands_and_reports_what_it_would_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("notes.txt"), "0123456789").unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (dec_tx, dec_rx) = mpsc::channel(1);
+        let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
+
+        dec_tx.send(WriteDecision::Approve).await.unwrap();
+        orch.run_file_writes(one_write()).await;
+
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("notes.txt")).unwrap(),
+            "hello"
+        );
+        let mut overwrites = None;
+        while let Ok(e) = event_rx.try_recv() {
+            if let Event::WriteRequested { overwrites: o, .. } = e {
+                overwrites = o;
+            }
+        }
+        // Knowing 10 bytes are about to be destroyed is the point of the prompt.
+        assert_eq!(overwrites, Some(10));
+    }
+
+    #[tokio::test]
+    async fn approve_all_stops_asking_for_the_rest_of_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        // Capacity 1 and only ONE decision sent: if the second write asked again this
+        // would deadlock rather than pass, which is the assertion.
+        let (dec_tx, dec_rx) = mpsc::channel(1);
+        let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
+
+        dec_tx.send(WriteDecision::ApproveAll).await.unwrap();
+        orch.run_file_writes(one_write()).await;
+        orch.run_file_writes(vec![crate::swarm::FileWrite {
+            path: "second.txt".into(),
+            content: "two".into(),
+        }])
+        .await;
+
+        assert!(project.path().join("notes.txt").exists());
+        assert!(project.path().join("second.txt").exists());
+        let asked = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|e| matches!(e, Event::WriteRequested { .. }))
+            .count();
+        assert_eq!(asked, 1, "the second write must not ask again");
+    }
+
+    #[tokio::test]
+    async fn a_closed_decision_channel_denies_rather_than_writes() {
+        // Fail closed: if the UI is gone there is nobody to have consented, and the
+        // entire purpose of the gate is that nothing reaches disk unseen.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let (dec_tx, dec_rx) = mpsc::channel(1);
+        drop(dec_tx);
+        let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
+
+        orch.run_file_writes(one_write()).await;
+        assert!(!project.path().join("notes.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_doomed_write_is_refused_without_asking_the_user() {
+        // `.git/HEAD` is refused by `Workspace` no matter what the user answers, so
+        // putting it to them would teach that their answer does not matter — and a
+        // refusal after a "yes" reads as approval having failed.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
+        std::fs::write(project.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        // Nothing is ever sent on this channel: if the code asked, it would block
+        // forever rather than pass.
+        let (_dec_tx, dec_rx) = mpsc::channel(1);
+        let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
+
+        orch.run_file_writes(vec![crate::swarm::FileWrite {
+            path: ".git/HEAD".into(),
+            content: "ref: refs/heads/pwned".into(),
+        }])
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/main"
+        );
+        let mut asked = false;
+        let mut errored = false;
+        while let Ok(e) = event_rx.try_recv() {
+            match e {
+                Event::WriteRequested { .. } => asked = true,
+                Event::Error(_) => errored = true,
+                _ => {}
+            }
+        }
+        assert!(!asked, "a doomed write must not be put to the user");
+        assert!(errored, "but it must still be reported");
+    }
+
+    #[test]
+    fn a_write_preview_marks_itself_when_truncated() {
+        let short = write_preview("one\ntwo\n");
+        assert!(short.contains("one") && short.contains("two"));
+        assert!(!short.contains("not shown"));
+
+        let long: String = (0..100).map(|i| format!("line {i}\n")).collect();
+        let preview = write_preview(&long);
+        assert!(
+            preview.contains("more line(s) not shown"),
+            "a truncated preview must say so, or it reads as the whole file"
+        );
     }
 
     #[test]
@@ -3010,6 +3381,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_delegations(
@@ -3051,6 +3424,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_delegations(
@@ -3121,6 +3496,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.handle_prompt("hello").await;
@@ -3166,6 +3543,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(notes.txt)")
@@ -3214,6 +3593,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(../secret.txt)")
@@ -3260,6 +3641,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.handle_prompt(
@@ -3309,6 +3692,8 @@ mod tests {
             events: event_tx,
             classified: false,
             project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
         };
 
         orch.run_file_lists("ollama:llama3", "ACTION: list_files()")

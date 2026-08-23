@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 248 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 256 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -268,6 +268,26 @@ call naming it. To read a file's full contents:
 ```
 ACTION: read_file(notes/todo.md)
 ```
+
+Writes are **not** applied silently. Every `write_file` a model proposes is shown
+first — the path, the exact byte size, whether it creates a new file or overwrites an
+existing one (and how many bytes that would destroy), and the head of the content —
+and the turn blocks until you answer `y` (allow), `n` (refuse), or `a` (allow this and
+every later write this session). The status line becomes the question:
+
+```
+OVERWRITE src/report.py (353 bytes -> 415 bytes)? [y]es  [n]o  [a]ll
+```
+
+Nothing reaches disk before you answer. A refusal is recorded in the ledger, so the
+model learns on its next turn that the file was not written rather than carrying on as
+though it had been, and is audited as `file.write_denied`. If the UI goes away while a
+question is pending the write is refused, not applied — with nobody left to ask, nobody
+has consented. A write `Workspace` would reject anyway (a `.git/` path, an oversized
+file, a traversal attempt) is refused *without* asking, so a prompt never appears for a
+write your answer could not affect. `a` is per-session and never persisted. Pass
+`--auto-write` to skip the gate entirely, which is what an unattended or scripted run
+wants and an interactive one generally does not.
 
 To create or overwrite a file, emit a block:
 

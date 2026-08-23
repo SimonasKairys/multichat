@@ -64,6 +64,13 @@ enum Commands {
         /// conversation memory; every turn is still sent with no message history.
         #[arg(long)]
         vault: bool,
+        /// Write files without asking. By default every `write_file` a model proposes
+        /// is shown — path, size, whether it overwrites, and the content — and waits
+        /// for the user to allow it. This turns that gate off, which is what a
+        /// scripted or unattended session wants and what an interactive one almost
+        /// never does.
+        #[arg(long)]
+        auto_write: bool,
     },
     /// Store an API key in the OS keyring. The key is read from the terminal or stdin,
     /// never from a command-line argument.
@@ -120,7 +127,11 @@ async fn main() -> Result<()> {
         Some(Commands::Models) => list_models(&settings, cli.classified).await,
         Some(Commands::Audit) => verify_audit(&paths),
         Some(Commands::Vault { action }) => vault_command(&paths, action),
-        Some(Commands::Chat { model, vault }) => {
+        Some(Commands::Chat {
+            model,
+            vault,
+            auto_write,
+        }) => {
             let project_root = resolve_project_root(cli.project)?;
             chat(
                 &paths,
@@ -129,6 +140,7 @@ async fn main() -> Result<()> {
                 cli.classified,
                 vault,
                 &project_root,
+                auto_write,
             )
             .await
         }
@@ -141,6 +153,7 @@ async fn main() -> Result<()> {
                 cli.classified,
                 false,
                 &project_root,
+                false,
             )
             .await
         }
@@ -274,6 +287,7 @@ async fn chat(
     classified: bool,
     vault: bool,
     project_root: &Path,
+    auto_write: bool,
 ) -> Result<()> {
     let mut settings = settings.clone();
 
@@ -306,6 +320,11 @@ async fn chat(
 
     let (command_tx, command_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::channel(64);
+    // Capacity 1: a write gate is strictly one question at a time — the orchestrator
+    // blocks on the answer before proposing the next write — so anything larger would
+    // only be able to hold answers to questions nobody asked.
+    let (decision_tx, decision_rx) = mpsc::channel(1);
+    let write_gate = if auto_write { None } else { Some(decision_rx) };
 
     let orchestrator = Orchestrator::new(
         registry,
@@ -313,12 +332,14 @@ async fn chat(
         project_root.to_path_buf(),
         classified,
         event_tx,
+        write_gate,
     )?;
     let worker = tokio::spawn(orchestrator.run(command_rx));
 
     let ui_result = ui::run(
         app,
         command_tx,
+        decision_tx,
         event_rx,
         settings,
         paths.clone(),

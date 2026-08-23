@@ -107,6 +107,45 @@ pub struct WrittenFile {
     pub outcome: String,
 }
 
+/// How many project files may be loaded into the ledger via `ACTION: read_file(...)`
+/// at once. Same reasoning as `MAX_LOADED_SKILLS`: the ledger is re-injected into
+/// every prompt for the rest of the session, so an unbounded number of loaded reads
+/// would make every subsequent turn's system prompt grow without bound. Loading a
+/// read past this cap evicts the oldest — see `record_file_read`.
+const MAX_LOADED_READS: usize = 3;
+
+/// Ceiling on a single loaded project file's content, in characters. Same reasoning
+/// as `MAX_SKILL_CONTENT_CHARS`, applied to project files instead of skill files:
+/// `Workspace::read` already caps a single file at 256KB
+/// (`workspace::MAX_FILE_BYTES`), which is still far too much to inject into every
+/// prompt for the rest of the session.
+const MAX_READ_CONTENT_CHARS: usize = 4000;
+
+/// A project file a model has loaded into context via `ACTION: read_file(...)`. Kept
+/// separate from `LoadedSkill` because these come from different trees with different
+/// trust properties (a skill file is user-authored; a project file may itself be
+/// something a model wrote earlier in the session) — rendering them under separate
+/// headings keeps that distinction visible to whichever model reads the prompt.
+#[derive(Debug, Clone)]
+pub struct LoadedRead {
+    pub path: String,
+    pub content: String,
+}
+
+/// How many `ACTION: list_files(...)` outcomes stay in the ledger. Same
+/// bound-the-ledger reasoning as `MAX_RECORDED_WRITES`: a directory listing is
+/// metadata (entry names), not file content, so it is far cheaper per entry than a
+/// loaded read and the cap can afford to be just as generous as writes.
+const MAX_RECORDED_LISTS: usize = 20;
+
+/// The recorded outcome of an `ACTION: list_files(...)` request: the path and either
+/// the newline-joined entries or the error text.
+#[derive(Debug, Clone)]
+pub struct ListedFiles {
+    pub path: String,
+    pub outcome: String,
+}
+
 #[derive(Debug, Default)]
 pub struct SwarmLedger {
     tasks: Vec<Task>,
@@ -121,6 +160,12 @@ pub struct SwarmLedger {
     /// Outcomes of `ACTION: write_file(...)` requests, oldest first. Capped at
     /// `MAX_RECORDED_WRITES`; see `record_file_write`.
     written_files: Vec<WrittenFile>,
+    /// Project files loaded via `ACTION: read_file(...)`, oldest first. Capped at
+    /// `MAX_LOADED_READS`; see `record_file_read`.
+    loaded_reads: Vec<LoadedRead>,
+    /// Outcomes of `ACTION: list_files(...)` requests, oldest first. Capped at
+    /// `MAX_RECORDED_LISTS`; see `record_file_list`.
+    file_listings: Vec<ListedFiles>,
 }
 
 impl SwarmLedger {
@@ -241,6 +286,65 @@ impl SwarmLedger {
         });
     }
 
+    pub fn loaded_reads(&self) -> &[LoadedRead] {
+        &self.loaded_reads
+    }
+
+    /// Records a project file's content after a successful `ACTION: read_file(...)`,
+    /// so it becomes visible to the requesting model. Same next-turn timing as
+    /// `record_skill`: the ledger is only re-rendered into the *next* prompt.
+    ///
+    /// Re-requesting an already-loaded path refreshes its content in place rather
+    /// than adding a second entry, mirroring `record_skill`'s in-place refresh —
+    /// the path is the identity here, not the request. Otherwise, loading past
+    /// `MAX_LOADED_READS` evicts the oldest entry to make room.
+    pub fn record_file_read(&mut self, path: &str, content: &str) {
+        // Truncate on a char boundary, not a byte index — mirrors `record_skill`,
+        // for the same reason: `content` may contain multi-byte UTF-8, and slicing
+        // mid-character panics.
+        let truncated = match content.char_indices().nth(MAX_READ_CONTENT_CHARS) {
+            Some((cut, _)) => format!("{}…", &content[..cut]),
+            None => content.to_string(),
+        };
+
+        if let Some(existing) = self.loaded_reads.iter_mut().find(|r| r.path == path) {
+            existing.content = truncated;
+            return;
+        }
+        if self.loaded_reads.len() >= MAX_LOADED_READS {
+            self.loaded_reads.remove(0);
+        }
+        self.loaded_reads.push(LoadedRead {
+            path: path.to_string(),
+            content: truncated,
+        });
+    }
+
+    pub fn file_listings(&self) -> &[ListedFiles] {
+        &self.file_listings
+    }
+
+    /// Records a directory listing's outcome after `ACTION: list_files(...)` runs,
+    /// so it becomes visible to the requesting model. Same next-turn timing as
+    /// `record_file_write`.
+    ///
+    /// Re-recording the same path updates its outcome in place, mirroring
+    /// `record_file_write`'s in-place refresh. Otherwise, recording past
+    /// `MAX_RECORDED_LISTS` evicts the oldest entry to make room.
+    pub fn record_file_list(&mut self, path: &str, outcome: &str) {
+        if let Some(existing) = self.file_listings.iter_mut().find(|l| l.path == path) {
+            existing.outcome = outcome.to_string();
+            return;
+        }
+        if self.file_listings.len() >= MAX_RECORDED_LISTS {
+            self.file_listings.remove(0);
+        }
+        self.file_listings.push(ListedFiles {
+            path: path.to_string(),
+            outcome: outcome.to_string(),
+        });
+    }
+
     pub fn assign_task(&mut self, id: usize, model_label: &str) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
             task.assigned_to = Some(model_label.to_string());
@@ -321,9 +425,35 @@ impl SwarmLedger {
         }
 
         if !self.written_files.is_empty() {
-            out.push_str("\n### Workspace files\n");
+            out.push_str("\n### Files you have written\n");
             for written in &self.written_files {
                 out.push_str(&format!("- {}: {}\n", written.path, written.outcome));
+            }
+        }
+
+        if !self.loaded_reads.is_empty() {
+            out.push_str("\n### Loaded project files\n");
+            for read in &self.loaded_reads {
+                out.push_str(&format!("#### {}\n{}\n", read.path, read.content));
+            }
+        }
+
+        if !self.file_listings.is_empty() {
+            out.push_str("\n### Project file listings\n");
+            for listing in &self.file_listings {
+                // An empty path means the project root — render it as `.` rather
+                // than a blank label, mirroring `Workspace::list`'s own treatment of
+                // an empty request as the root.
+                let label = if listing.path.is_empty() {
+                    "."
+                } else {
+                    listing.path.as_str()
+                };
+                // Indent continuation lines so a multi-entry listing nests under its
+                // path instead of producing bare lines that read as separate ledger
+                // entries — same treatment as a multi-line task result above.
+                let indented = listing.outcome.replace('\n', "\n    ");
+                out.push_str(&format!("- {label}: {indented}\n"));
             }
         }
 
@@ -366,6 +496,25 @@ impl SwarmLedger {
              content, not executed. Like a delegation result, the outcome is recorded \
              in this ledger and becomes visible to you on your NEXT turn, not this \
              one.\n",
+        );
+
+        out.push_str(
+            "\n### File read protocol\n\
+             The project folder — the only part of the filesystem you can reach \
+             through this protocol — can also be listed and read, not just written \
+             to. To list a directory's immediate entries, emit a line of exactly \
+             this form:\n\
+             `ACTION: list_files(<relative path>)`\n\
+             An empty path (`ACTION: list_files()`) lists the project root. Listing \
+             is never recursive — to see inside a subdirectory it names, emit a \
+             further `list_files` call naming that subdirectory. To read a file's \
+             full contents, emit a line of exactly this form:\n\
+             `ACTION: read_file(<relative path>)`\n\
+             Emit nothing after either line. Paths are relative to the project root; \
+             a path that escapes it (via `..`, an absolute path, or a symlink) is \
+             refused. Like a delegation result, the listing or content (or, on \
+             failure, the error) is recorded in this ledger and becomes visible to \
+             you on your NEXT turn, not this one.\n",
         );
 
         out
@@ -428,6 +577,73 @@ impl SwarmLedger {
                 continue;
             }
             found.push(name);
+        }
+
+        found
+    }
+
+    /// Extracts every `ACTION: read_file(path)` line from a reply. Sibling of
+    /// `parse_read_skill`, following the same conventions: strip a wrapping
+    /// backtick, tolerate a quoted argument, and silently ignore a line that does
+    /// not parse. Unlike `read_skill`, an empty path has no sensible meaning for a
+    /// single-file read (there is no "root file"), so it is skipped here rather than
+    /// resolved to anything.
+    ///
+    /// MUST be run on the *stripped* text `parse_file_writes` returns, never on a
+    /// raw reply — otherwise an `ACTION: read_file(...)` line that only appears
+    /// inside a `write_file` block's content (a model documenting this very protocol,
+    /// say) would be executed as a real request instead of treated as file content,
+    /// exactly the hazard `parse_file_writes`'s doc comment describes for
+    /// `parse_delegations`/`parse_read_skill`. `Orchestrator::handle_prompt` is where
+    /// this ordering is enforced.
+    pub fn parse_read_files(reply: &str) -> Vec<String> {
+        const MARKER: &str = "ACTION: read_file(";
+        let mut found = Vec::new();
+
+        for line in reply.lines() {
+            let line = line.trim().trim_start_matches('`').trim_end_matches('`');
+            let Some(start) = line.find(MARKER) else {
+                continue;
+            };
+            let rest = &line[start + MARKER.len()..];
+            let Some(close) = rest.find(')') else {
+                continue;
+            };
+            let path = rest[..close].trim().trim_matches(['"', '\'']).to_string();
+            if path.is_empty() {
+                continue;
+            }
+            found.push(path);
+        }
+
+        found
+    }
+
+    /// Extracts every `ACTION: list_files(path)` line from a reply. Same conventions
+    /// as `parse_read_files`, but an empty argument IS legal here — `ACTION:
+    /// list_files()` or `ACTION: list_files( )` — and means the project root, per
+    /// `Workspace::list`'s own treatment of an empty (or `.`) request. It is returned
+    /// as an empty `String`, not skipped, so the caller can tell "list the root" apart
+    /// from "no request found here."
+    ///
+    /// MUST be run on the *stripped* text `parse_file_writes` returns, never on a raw
+    /// reply, for the same reason as `parse_read_files` — see that function's doc
+    /// comment.
+    pub fn parse_list_files(reply: &str) -> Vec<String> {
+        const MARKER: &str = "ACTION: list_files(";
+        let mut found = Vec::new();
+
+        for line in reply.lines() {
+            let line = line.trim().trim_start_matches('`').trim_end_matches('`');
+            let Some(start) = line.find(MARKER) else {
+                continue;
+            };
+            let rest = &line[start + MARKER.len()..];
+            let Some(close) = rest.find(')') else {
+                continue;
+            };
+            let path = rest[..close].trim().trim_matches(['"', '\'']).to_string();
+            found.push(path);
         }
 
         found
@@ -782,6 +998,104 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_simple_read_file_request() {
+        let found = SwarmLedger::parse_read_files("Let me check.\nACTION: read_file(src/main.rs)");
+        assert_eq!(found, vec!["src/main.rs".to_string()]);
+    }
+
+    #[test]
+    fn read_file_tolerates_backticks_and_quotes() {
+        let found = SwarmLedger::parse_read_files("`ACTION: read_file(\"notes.txt\")`");
+        assert_eq!(found, vec!["notes.txt".to_string()]);
+    }
+
+    #[test]
+    fn ignores_malformed_or_absent_read_file_markers() {
+        assert!(SwarmLedger::parse_read_files("just a normal reply").is_empty());
+        assert!(SwarmLedger::parse_read_files("ACTION: read_file(").is_empty());
+        // Unlike list_files, an empty path has no meaning for a single-file read.
+        assert!(SwarmLedger::parse_read_files("ACTION: read_file()").is_empty());
+        assert!(SwarmLedger::parse_read_files("ACTION: read_file(   )").is_empty());
+    }
+
+    #[test]
+    fn parses_list_files_with_an_empty_argument_as_the_project_root() {
+        // Unlike read_file, an empty argument here IS a real, legal request — it
+        // means "list the project root" — and must come back as an empty string
+        // entry, not be silently dropped.
+        let found = SwarmLedger::parse_list_files("ACTION: list_files()");
+        assert_eq!(found, vec!["".to_string()]);
+    }
+
+    #[test]
+    fn parses_a_list_files_request_with_a_path() {
+        let found = SwarmLedger::parse_list_files("ACTION: list_files(src/providers)");
+        assert_eq!(found, vec!["src/providers".to_string()]);
+    }
+
+    #[test]
+    fn ignores_malformed_or_absent_list_files_markers() {
+        assert!(SwarmLedger::parse_list_files("just a normal reply").is_empty());
+        assert!(SwarmLedger::parse_list_files("ACTION: list_files(").is_empty());
+    }
+
+    #[test]
+    fn the_project_files_protocol_text_documents_both_actions_with_next_turn_timing() {
+        let text = SwarmLedger::new().system_prompt();
+        assert!(text.contains("### File read protocol"));
+        assert!(text.contains("ACTION: list_files"));
+        assert!(text.contains("ACTION: read_file"));
+        assert!(text.contains("NEXT turn"));
+    }
+
+    #[test]
+    fn a_loaded_read_is_rendered_in_the_loaded_project_files_section() {
+        let mut ledger = SwarmLedger::new();
+        ledger.record_file_read("notes.txt", "the plan is to ship on friday");
+        let text = ledger.system_prompt();
+        assert!(text.contains("### Loaded project files"));
+        assert!(text.contains("#### notes.txt"));
+        assert!(text.contains("the plan is to ship on friday"));
+    }
+
+    #[test]
+    fn loading_a_read_past_the_cap_evicts_the_oldest() {
+        let mut ledger = SwarmLedger::new();
+        ledger.record_file_read("a.txt", "a");
+        ledger.record_file_read("b.txt", "b");
+        ledger.record_file_read("c.txt", "c");
+        // Cap is MAX_LOADED_READS == 3; this fourth load must evict "a.txt".
+        ledger.record_file_read("d.txt", "d");
+
+        let paths: Vec<&str> = ledger
+            .loaded_reads()
+            .iter()
+            .map(|r| r.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["b.txt", "c.txt", "d.txt"]);
+    }
+
+    #[test]
+    fn a_recorded_listing_is_rendered_under_its_path() {
+        let mut ledger = SwarmLedger::new();
+        ledger.record_file_list("src", "ok (2 entries)\nmain.rs\nlib.rs");
+        let text = ledger.system_prompt();
+        assert!(text.contains("### Project file listings"));
+        assert!(text.contains("- src: ok (2 entries)"));
+        assert!(text.contains("main.rs"));
+    }
+
+    #[test]
+    fn a_recorded_root_listing_is_labelled_with_a_dot() {
+        // An empty path means the root; the rendered ledger must not show a blank
+        // label where the path would otherwise go.
+        let mut ledger = SwarmLedger::new();
+        ledger.record_file_list("", "ok (1 entries)\nCargo.toml");
+        let text = ledger.system_prompt();
+        assert!(text.contains("- .: ok (1 entries)"));
+    }
+
+    #[test]
     fn parses_a_simple_write_file_block() {
         let (writes, stripped) = SwarmLedger::parse_file_writes(
             "Sure, here you go.\nACTION: write_file(notes/todo.md)\nline one\nline two\nACTION: end_file\nDone.",
@@ -842,7 +1156,7 @@ mod tests {
         let mut ledger = SwarmLedger::new();
         ledger.record_file_write("secret_plan.md", "ok (42 bytes)");
         let text = ledger.system_prompt();
-        assert!(text.contains("### Workspace files"));
+        assert!(text.contains("### Files you have written"));
         assert!(text.contains("secret_plan.md: ok (42 bytes)"));
     }
 

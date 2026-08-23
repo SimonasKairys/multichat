@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 138 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 209 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -28,6 +28,7 @@ simon chat                   # choose connections and a commander, then chat
 simon chat -m ollama:llama3  # pick a commander explicitly
 simon chat --classified      # local models only, no network egress
 simon chat --vault           # persist the transcript, encrypted, across sessions
+simon chat --project ~/code/myapp  # confine models to this folder instead of cwd
 simon vault status           # vault path, failed attempts, time to idle self-destruct
 simon vault destroy          # permanently delete the vault (typed "yes" to confirm)
 simon audit                  # verify the audit log's hash chain
@@ -35,6 +36,11 @@ simon audit                  # verify the audit log's hash chain
 
 `-m` accepts a full label (`ollama:llama3`), a bare model name (`llama3`), or a provider
 name (`anthropic`).
+
+`--project <dir>` sets the **project folder** — the one part of the filesystem models
+can list, read, and write through `simon`'s own protocol (see
+[Project files](#project-files)). It defaults to the directory `simon` was started in,
+and is resolved and canonicalized once at startup.
 
 `simon auth` also accepts `claude` and `gemini` as aliases, storing the key under
 `anthropic`/`google` respectively so vendor discovery finds it.
@@ -115,6 +121,13 @@ the delegating model on its next turn, not within the turn that requested it. Su
 replies are not re-scanned for delegations, and at most 3 delegations run per turn, so
 the swarm cannot recurse indefinitely.
 
+None of this has to be inferred from timing: the status line names whichever model is
+actually being called — the sub-agent, not the commander — along with what it's doing
+and how long it's taken so far, and the transcript gets a line the moment a delegation
+is dispatched (naming the agent and its task) and another when it finishes, reporting
+outcome and duration. The full sub-agent reply still arrives afterward as an ordinary
+reply line.
+
 ### Skills
 
 The system prompt also lists every file in the read-only skills directory, each with the
@@ -140,14 +153,40 @@ by a user, so the same `..`/absolute-path/symlink checks apply. The content (or,
 failure, the error) is recorded in the ledger and becomes visible on the model's next
 turn, same timing as a delegation result. At most 3 skills are kept loaded at once, each
 capped in size; loading a fourth evicts the oldest. The skills directory itself stays
-read-only to models — see [Model file writes](#model-file-writes) for the one place
-they may write.
+read-only to models — see [Project files](#project-files) for the one place they may
+write.
 
-### Model file writes
+A successful load also gets a transcript line naming the skill and its size, so a read
+that would otherwise be silent (only a failure previously reached the TUI) is visible
+too; while the read is in flight the status line shows it the same way it shows a
+delegation.
 
-Models may also create or overwrite a file in a dedicated, sandboxed workspace
-directory (`<data dir>/workspace`, a separate tree from the read-only skills
-directory) by emitting a block:
+### Project files
+
+Models can list, read, and write files in the **project folder** — the directory
+`simon` was started in, or whatever `--project <dir>` points at (see
+[Use](#use)). This is a real change from earlier versions: it used to be a private
+scratch directory under `simon`'s own data directory, and is now the user's own
+project. Every access still goes through the same path-traversal hardening as the
+read-only skills directory (`..`, absolute paths, and symlinks escaping the root are
+all rejected) — a model's reply is untrusted input, no different from a path typed by
+a user.
+
+To list a directory's immediate entries:
+
+```
+ACTION: list_files(notes)
+```
+
+An empty path (`ACTION: list_files()`) lists the project root. Listing is never
+recursive — a model descends into a subdirectory it saw with a further `list_files`
+call naming it. To read a file's full contents:
+
+```
+ACTION: read_file(notes/todo.md)
+```
+
+To create or overwrite a file, emit a block:
 
 ```
 ACTION: write_file(notes/todo.md)
@@ -157,18 +196,32 @@ ACTION: end_file
 ```
 
 Everything between the `write_file` line and the `end_file` line is written verbatim as
-the file's content. Paths are relative to the workspace and subdirectories are created
-automatically; `..`, absolute paths, and symlinks escaping the workspace root are all
-rejected, the same traversal hardening as the skills directory. Files are capped at
-256KB, and the workspace holds at most 256 files at once (overwriting an existing file
-never counts against that cap). A line containing `ACTION: delegate_task(...)` or
-`ACTION: read_skill(...)` inside the content is treated as content, not executed — this
-matters because a model writing documentation about its own protocol will naturally
-include example lines that look like real requests. Every write, successful or not, is
-audited (`file.written` / `file.write_failed`) and shown in the TUI as it happens; the
-outcome (path and byte count, or the error — never content) is also recorded in the
-ledger and becomes visible to the model on its next turn, same timing as a delegation
-result.
+the file's content. Paths are relative to the project root and subdirectories are
+created automatically on write; there is no cap on how many files may exist under the
+root, but a single read or write is capped at 256KB and a single listing at 500
+entries (truncation is reported, not silent). A line containing
+`ACTION: delegate_task(...)`, `ACTION: read_skill(...)`, `ACTION: read_file(...)`, or
+`ACTION: list_files(...)` inside a `write_file` block's content is treated as content,
+not executed — this matters because a model writing documentation about its own
+protocol will naturally include example lines that look like real requests. Writes
+into `.git/` are refused outright; reading `.git/` is not special-cased, since only a
+write can corrupt a repository. Every list, read, and write, successful or not, is
+audited (`project.list`/`project.list_failed`, `project.read`/`project.read_failed`,
+`file.written`/`file.write_failed`) and shown in the TUI as it happens — the audit
+entries and the ledger record paths, byte counts, and entry counts only, **never file
+content**. The outcome becomes visible to the requesting model on its next turn, same
+timing as a delegation result; at most 3 loaded reads are kept at once (each
+size-capped), evicting the oldest, the same discipline as loaded skills.
+
+**This is not a sandbox for spawned CLI providers.** A `claude`/`gemini`/`codex` CLI
+configured as a local binary provider is started with its working directory set to
+the project folder (`Command::current_dir`), so it doesn't stumble onto whatever was
+lying around in `simon`'s own launch directory — but that only sets the starting
+point. A CLI agent with its own shell or filesystem tool access can `cd` anywhere the
+invoking user can reach and read or write outside the project folder freely; none of
+that filesystem activity passes through `simon`'s audit log or the `list_files`/
+`read_file`/`write_file` protocol above, which exists only for `simon`'s own
+in-process model calls (the cloud APIs and Ollama).
 
 ## Security posture
 
@@ -206,14 +259,19 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   and symlinks escaping the root are all rejected. This is reachable from model output
   via `ACTION: read_skill(<name>)` (see [Skills](#skills)), not just from trusted
   callers, so the rejection is load-bearing, not defensive dead code.
-- **Model-initiated file writes confined to a dedicated workspace directory** (see
-  [Model file writes](#model-file-writes)) — the same traversal hardening as skills
-  (`..`, absolute paths, and symlinks escaping the root are all rejected), size- and
-  count-capped, and every write is audited and rendered in the TUI so the user sees
-  everything a model has written. The skills directory itself remains read-only to
-  models — a model that could write a skill file could inject its own content into the
-  system prompt sent to every model for the rest of the session — so this is
-  deliberately a separate tree, not a relaxation of that guarantee.
+- **Model-initiated file listing, reading, and writing confined to the project
+  folder** (see [Project files](#project-files)) — the same traversal hardening as
+  skills (`..`, absolute paths, and symlinks escaping the root are all rejected),
+  size-capped per read/write and entry-capped per listing, and every access is
+  audited and rendered in the TUI so the user sees everything a model has listed,
+  read, or written. Writes into `.git/` are refused outright. The skills directory
+  itself remains read-only to models — a model that could write a skill file could
+  inject its own content into the system prompt sent to every model for the rest of
+  the session — so this is deliberately a separate tree, not a relaxation of that
+  guarantee. **This confinement is `simon`'s own protocol only** — it does not extend
+  to a spawned CLI provider (`claude`, `gemini`, `codex`, …), which merely *starts* in
+  the project folder and is free to read or write anywhere its own shell/filesystem
+  access reaches; see [Project files](#project-files) for the honest boundary.
 - **Proxy support** — honours `HTTP_PROXY`/`HTTPS_PROXY` and, via reqwest's `socks`
   feature, `ALL_PROXY=socks5://…`.
 - **`unsafe` confined to one file** — `#![deny(unsafe_code)]` crate-wide with a single
@@ -222,6 +280,12 @@ Be precise about what exists. This table is the source of truth; the numbered fi
 
 ### Not implemented
 
+- **Filesystem sandboxing of spawned CLI providers.** `simon`'s own list/read/write
+  protocol is confined to the project folder, but a local CLI provider (`claude`,
+  `gemini`, `codex`, …) only has its working directory *set* to the project folder at
+  spawn time; it is otherwise an ordinary subprocess with whatever shell and
+  filesystem access the invoking user has, and none of that access is mediated or
+  audited by `simon`. See [Project files](#project-files).
 - **seccomp sandboxing.** A useful filter must permit `socket`/`connect` while denying
   `execve`, which needs a hand-written BPF program. `SECCOMP_MODE_STRICT` would kill the
   process on its first network call. The function is a documented no-op that reports

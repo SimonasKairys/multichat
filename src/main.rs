@@ -22,6 +22,8 @@ pub mod workspace;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use secrecy::SecretString;
+use std::fs;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use crate::app::{App, Line};
@@ -41,6 +43,12 @@ struct Cli {
     /// require memory locking to succeed.
     #[arg(long, global = true)]
     classified: bool,
+
+    /// The project folder models may read, list, and write files in. Defaults to the
+    /// directory `simon` was started in. Resolved and canonicalized once at startup;
+    /// see `resolve_project_root`.
+    #[arg(long, global = true)]
+    project: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -113,10 +121,56 @@ async fn main() -> Result<()> {
         Some(Commands::Audit) => verify_audit(&paths),
         Some(Commands::Vault { action }) => vault_command(&paths, action),
         Some(Commands::Chat { model, vault }) => {
-            chat(&paths, &settings, model.as_deref(), cli.classified, vault).await
+            let project_root = resolve_project_root(cli.project)?;
+            chat(
+                &paths,
+                &settings,
+                model.as_deref(),
+                cli.classified,
+                vault,
+                &project_root,
+            )
+            .await
         }
-        None => chat(&paths, &settings, None, cli.classified, false).await,
+        None => {
+            let project_root = resolve_project_root(cli.project)?;
+            chat(
+                &paths,
+                &settings,
+                None,
+                cli.classified,
+                false,
+                &project_root,
+            )
+            .await
+        }
     }
+}
+
+/// Resolves the project folder models get confined to: `--project <dir>` if given,
+/// otherwise the directory `simon` was started in. Canonicalized once here so every
+/// later prefix comparison (`Workspace`'s traversal checks) runs against a stable,
+/// symlink-resolved path rather than re-resolving on every call.
+///
+/// Deliberately separate from `Paths::resolve_with_env`: the project root is not
+/// application state, it is the user's own project folder, and it moves independently
+/// of where `simon` keeps its config, vault, audit log, and skills.
+fn resolve_project_root(project: Option<PathBuf>) -> Result<PathBuf> {
+    let requested = match project {
+        Some(dir) => dir,
+        None => std::env::current_dir().context("failed to determine the current directory")?,
+    };
+    let meta = fs::metadata(&requested).with_context(|| {
+        format!(
+            "project directory {} does not exist or is not accessible",
+            requested.display()
+        )
+    })?;
+    if !meta.is_dir() {
+        bail!("project path {} is not a directory", requested.display());
+    }
+    fs::canonicalize(&requested)
+        .with_context(|| format!("failed to resolve {}", requested.display()))
 }
 
 fn apply_hardening(classified: bool) -> Result<Hardening> {
@@ -219,6 +273,7 @@ async fn chat(
     model: Option<&str>,
     classified: bool,
     vault: bool,
+    project_root: &Path,
 ) -> Result<()> {
     let mut settings = settings.clone();
 
@@ -232,11 +287,11 @@ async fn chat(
         }
     }
 
-    let registry = Registry::build(&settings, model, classified).await?;
+    let registry = Registry::build(&settings, model, classified, project_root).await?;
     let primary = registry.primary().to_string();
     let roster = registry.labels();
 
-    let mut app = App::new(primary, &roster);
+    let mut app = App::new(primary, &roster, project_root.display().to_string());
 
     // Password prompting and all vault I/O happen here — before the picker's result
     // is wired to a running orchestrator and, crucially, before `ui::run` ever calls
@@ -252,7 +307,13 @@ async fn chat(
     let (command_tx, command_rx) = mpsc::channel(32);
     let (event_tx, event_rx) = mpsc::channel(64);
 
-    let orchestrator = Orchestrator::new(registry, paths, classified, event_tx)?;
+    let orchestrator = Orchestrator::new(
+        registry,
+        paths,
+        project_root.to_path_buf(),
+        classified,
+        event_tx,
+    )?;
     let worker = tokio::spawn(orchestrator.run(command_rx));
 
     let ui_result = ui::run(

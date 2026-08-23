@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -32,6 +32,9 @@ pub struct LocalBinaryProvider {
     /// `None` when it has no such flag and the system text must be folded into the
     /// prompt instead.
     system_arg: Option<String>,
+    /// Where the child process is spawned. See `send_with_timeout`'s use of
+    /// `Command::current_dir` for what this does and, importantly, does not do.
+    project_root: PathBuf,
 }
 
 impl LocalBinaryProvider {
@@ -41,6 +44,7 @@ impl LocalBinaryProvider {
         args: Vec<String>,
         model: impl Into<String>,
         system_arg: Option<String>,
+        project_root: PathBuf,
     ) -> Result<Self> {
         let binary_path = binary_path.into();
         let name = name.into();
@@ -63,6 +67,7 @@ impl LocalBinaryProvider {
             args,
             model: model.into(),
             system_arg,
+            project_root,
         })
     }
 }
@@ -135,6 +140,16 @@ impl LocalBinaryProvider {
         // content (and the folded system text above) cannot inject additional
         // commands.
         let mut command = Command::new(&self.binary_path);
+        // Sets where the agent CLI *starts* — the project folder, rather than
+        // whatever directory happened to be `simon`'s own working directory (its own
+        // install location, the user's shell prompt at launch, etc). This is what
+        // stops a CLI agent from casually reading whatever was lying around in the
+        // launch directory unprompted, which is exactly what was observed with the
+        // `claude` CLI reading `Cargo.toml` out of simon's own repo before this fix.
+        // It is NOT a sandbox: a CLI agent with shell or filesystem tool access can
+        // still `cd` anywhere it can reach and read or write outside `project_root`
+        // — this only sets the starting point, nothing more.
+        command.current_dir(&self.project_root);
         command.args(&self.args);
         if let Some((flag, value)) = &system_flag {
             command.arg(flag).arg(value);
@@ -231,27 +246,46 @@ mod tests {
 
     #[test]
     fn rejects_a_nonexistent_path() {
-        let err =
-            LocalBinaryProvider::new("fake", "./definitely/not/here/binary", vec![], "m", None)
-                .unwrap_err()
-                .to_string();
+        let err = LocalBinaryProvider::new(
+            "fake",
+            "./definitely/not/here/binary",
+            vec![],
+            "m",
+            None,
+            PathBuf::from("."),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("does not exist"), "unexpected error: {err}");
     }
 
     #[test]
     fn rejects_an_empty_path() {
-        assert!(LocalBinaryProvider::new("fake", "  ", vec![], "m", None).is_err());
+        assert!(
+            LocalBinaryProvider::new("fake", "  ", vec![], "m", None, PathBuf::from(".")).is_err()
+        );
     }
 
     #[test]
     fn bare_command_names_are_allowed_and_resolved_by_path() {
         // `gh` may not be installed in CI, but a bare name is a legitimate config.
-        assert!(LocalBinaryProvider::new("gh", "gh", vec!["copilot".into()], "m", None).is_ok());
+        assert!(
+            LocalBinaryProvider::new(
+                "gh",
+                "gh",
+                vec!["copilot".into()],
+                "m",
+                None,
+                PathBuf::from("."),
+            )
+            .is_ok()
+        );
     }
 
     #[test]
     fn cli_tools_count_as_remote_for_classified_mode() {
-        let p = LocalBinaryProvider::new("gh", "gh", vec![], "copilot", None).unwrap();
+        let p = LocalBinaryProvider::new("gh", "gh", vec![], "copilot", None, PathBuf::from("."))
+            .unwrap();
         assert!(p.is_remote());
     }
 
@@ -260,7 +294,15 @@ mod tests {
         // `claude`, `agy`, `codex` with no configured model all end up with
         // model == name (see `construct_provider`'s CLI branch), which used to render
         // as the meaningless `claude:claude`. A harness name is not a model name.
-        let p = LocalBinaryProvider::new("claude", "claude", vec![], "claude", None).unwrap();
+        let p = LocalBinaryProvider::new(
+            "claude",
+            "claude",
+            vec![],
+            "claude",
+            None,
+            PathBuf::from("."),
+        )
+        .unwrap();
         assert_eq!(p.label(), "claude");
     }
 
@@ -268,7 +310,15 @@ mod tests {
     fn a_configured_model_keeps_the_binary_colon_model_form() {
         // `agy` is a multi-vendor gateway: the binary name alone doesn't say which
         // model is behind it, so once the user configures one, keep showing both.
-        let p = LocalBinaryProvider::new("agy", "agy", vec![], "gemini-3-pro", None).unwrap();
+        let p = LocalBinaryProvider::new(
+            "agy",
+            "agy",
+            vec![],
+            "gemini-3-pro",
+            None,
+            PathBuf::from("."),
+        )
+        .unwrap();
         assert_eq!(p.label(), "agy:gemini-3-pro");
     }
 
@@ -344,7 +394,15 @@ mod tests {
         // `LocalBinaryProvider::new` rejects a path that does not exist on disk
         // (see `rejects_a_nonexistent_path`), so this would fail construction, not
         // just the assertions, on the `windows-latest` CI runner.
-        let p = LocalBinaryProvider::new("slow", "/bin/sleep", vec![], "slow", None).unwrap();
+        let p = LocalBinaryProvider::new(
+            "slow",
+            "/bin/sleep",
+            vec![],
+            "slow",
+            None,
+            PathBuf::from("."),
+        )
+        .unwrap();
         let err = p
             .send_with_timeout(None, "5", Duration::from_millis(50))
             .await
@@ -359,11 +417,55 @@ mod tests {
     async fn a_child_that_finishes_within_the_timeout_still_succeeds() {
         // Unix-only: depends on `/bin/echo`, a Unix path that `LocalBinaryProvider::new`
         // would reject as nonexistent on Windows.
-        let p = LocalBinaryProvider::new("echoer", "/bin/echo", vec![], "echoer", None).unwrap();
+        let p = LocalBinaryProvider::new(
+            "echoer",
+            "/bin/echo",
+            vec![],
+            "echoer",
+            None,
+            PathBuf::from("."),
+        )
+        .unwrap();
         let reply = p
             .send_with_timeout(None, "hello", Duration::from_secs(5))
             .await
             .unwrap();
         assert_eq!(reply.text, "hello");
+    }
+
+    // Unix-only: depends on `pwd` and `/bin/echo`-style bare-argv spawning; the
+    // reasoning is the same as the sibling tests above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_child_is_spawned_inside_the_configured_project_root() {
+        // Regression guard for the fix this test is named after: before it, the child
+        // inherited whatever directory `simon` itself happened to be running in,
+        // which is how a `claude` CLI provider was observed reading `Cargo.toml` out
+        // of simon's own repo unprompted. `pwd` printing the directory it was
+        // actually spawned in is a direct behavioral check, not just a check that a
+        // field got set.
+        let project = tempfile::tempdir().unwrap();
+        // Canonicalize so the comparison isn't defeated by `/tmp` vs `/private/tmp`
+        // (macOS) or similar symlink-resolution differences between what `tempdir()`
+        // returns and what the child's own `pwd` reports back.
+        let expected = std::fs::canonicalize(project.path()).unwrap();
+        // `/bin/sh -c pwd` rather than `/bin/pwd` directly: `send_with_timeout` always
+        // appends the prompt as one more argv entry, and `pwd` itself would reject
+        // that as an unexpected operand. Under `sh -c`, an argument after the command
+        // string becomes `$0` inside the script instead, which `pwd` never sees.
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            vec!["-c".into(), "pwd".into()],
+            "sh",
+            None,
+            project.path().to_path_buf(),
+        )
+        .unwrap();
+        let reply = p
+            .send_with_timeout(None, "ignored", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(reply.text.trim(), expected.to_string_lossy());
     }
 }

@@ -1,43 +1,64 @@
-//! The one place models may write files.
+//! The project folder: the one part of the filesystem models may read, list, and
+//! write through simon's own protocol.
 //!
-//! `skills.rs` is deliberately read-only: its module doc says so, and that stays
-//! true here too — a model that could write a skill file could inject content
-//! straight into the system prompt sent to every model for the rest of the session.
-//! This module is a *separate* tree from the skills root for exactly that reason.
-//! Every write goes through the same traversal-hardening pattern as
-//! `SkillsDir::resolve` (reject `..`/absolute/symlink escapes), plus a size cap and a
-//! file-count cap so an unbounded model cannot fill the disk. Every successful or
-//! failed write is audited by the orchestrator and surfaced in the TUI — the user
-//! must be able to see everything a model has written, since this directory is never
-//! rendered back into a prompt the way skills are.
+//! This used to be a private scratch tree under simon's own data directory; it is now
+//! the user's project — whatever folder `simon` was started in, or `--project <dir>`
+//! (see `main::resolve_project_root`). That change is why every entry point here still
+//! takes a model-supplied *relative* path and never trusts it at face value: the
+//! threat model is unchanged even though the root moved. `skills.rs` stays read-only
+//! for a different reason (a model that could write a skill file could inject content
+//! straight into the system prompt sent to every model for the rest of the session),
+//! and remains a *separate* tree from this one.
+//!
+//! Every access goes through the same traversal-hardening pattern as
+//! `SkillsDir::resolve` (reject `..`/absolute/symlink escapes), plus a size cap on
+//! reads and writes so a single operation cannot move an unbounded amount of data.
+//! There is deliberately no cap on how many files may exist under the root any more —
+//! see `write`'s doc comment for why. Every successful or failed access is audited by
+//! the orchestrator and surfaced in the TUI — the user must be able to see everything
+//! a model has read, listed, or written in their project.
 
 use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-/// Largest file a single write may create or overwrite. Mirrors `skills::MAX_SKILL_BYTES`
-/// in spirit — a bound on how much a single filesystem operation can move — but this
-/// caps model-authored *output*, not something read back into a prompt, so the number
+/// Largest file a single read or write may move. Mirrors `skills::MAX_SKILL_BYTES` in
+/// spirit — a bound on how much a single filesystem operation can move — but this
+/// caps arbitrary project content, not something curated for a prompt, so the number
 /// is chosen for "a generous file," not "a generous prompt injection."
 const MAX_FILE_BYTES: usize = 256 * 1024;
 
-/// Ceiling on how many files may exist under the workspace root at once. Without this,
-/// a model in a long session could write an unbounded number of files — each one
-/// individually under `MAX_FILE_BYTES` but unbounded in aggregate. Overwriting an
-/// existing file never counts against this cap; it is audited scratch space, not a
-/// quota on total bytes ever written.
-const MAX_WORKSPACE_FILES: usize = 256;
+/// Ceiling on how many entries a single `list` call returns. A real project directory
+/// can hold far more than that; this bounds one filesystem operation's result the same
+/// way `MAX_FILE_BYTES` bounds one read or write, not a claim about the directory
+/// itself. Truncation is reported, not silent — see `list`.
+const MAX_LIST_ENTRIES: usize = 500;
 
 pub struct Workspace {
     root: PathBuf,
 }
 
 impl Workspace {
-    /// Opens the directory, resolving the root once so later prefix comparisons are
-    /// canonical. Mirrors `SkillsDir::new`.
+    /// Opens `root` — the project folder — resolving it once so later prefix
+    /// comparisons are canonical.
+    ///
+    /// Deliberately does NOT create `root`: the old scratch-space workspace lived
+    /// under simon's own data directory, where silently creating it on first use was
+    /// harmless and convenient. `root` here is the user's own project folder; silently
+    /// creating a directory that doesn't exist there would be surprising, not helpful.
+    /// The caller (`main::resolve_project_root`) is expected to have already validated
+    /// that `root` exists and is a directory before this is ever called, but this
+    /// checks again rather than trusting that — `Workspace::new` is a public
+    /// constructor, not something only that one caller can reach.
     pub fn new(root: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&root)
-            .with_context(|| format!("failed to create workspace directory {}", root.display()))?;
+        let meta = fs::metadata(&root)
+            .with_context(|| format!("project directory {} does not exist", root.display()))?;
+        if !meta.is_dir() {
+            return Err(anyhow!(
+                "project path {} is not a directory",
+                root.display()
+            ));
+        }
         let root = fs::canonicalize(&root)
             .with_context(|| format!("failed to resolve {}", root.display()))?;
         Ok(Self { root })
@@ -47,30 +68,120 @@ impl Workspace {
         &self.root
     }
 
-    /// Counts files recursively under `root`. Walked with `file_type()` rather than
-    /// `Path::is_file()` so a directory entry that is itself a symlink is counted (or
-    /// skipped) by what it *is*, not by following it — the same reasoning `list()` in
-    /// `skills.rs` got wrong before `read_description` was hardened to route through
-    /// `resolve()`.
-    fn count_files(&self) -> usize {
-        fn walk(dir: &Path, count: &mut usize) {
-            let Ok(entries) = fs::read_dir(dir) else {
-                return;
-            };
-            for entry in entries.filter_map(|e| e.ok()) {
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if file_type.is_dir() {
-                    walk(&entry.path(), count);
-                } else if file_type.is_file() {
-                    *count += 1;
+    /// Lexical component check shared by every entry point that accepts a
+    /// model-supplied relative path: reject empty, `..`, absolute, and drive-prefixed
+    /// paths before ever touching the filesystem. Mirrors `SkillsDir::resolve`'s
+    /// equivalent loop; `write` below has its own variant of this because it must
+    /// tolerate a final path that doesn't exist yet (see that method's doc comment).
+    fn reject_traversal(requested: &str) -> Result<()> {
+        if requested.trim().is_empty() {
+            return Err(anyhow!("empty project path"));
+        }
+        for component in Path::new(requested).components() {
+            match component {
+                Component::Normal(_) | Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(anyhow!(
+                        "project path `{requested}` escapes the project folder"
+                    ));
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(anyhow!("project path `{requested}` must be relative"));
                 }
             }
         }
-        let mut count = 0;
-        walk(&self.root, &mut count);
-        count
+        Ok(())
+    }
+
+    /// Resolves a model-supplied relative path that must already exist — the shared
+    /// core of `read` and (for a non-root target) `list`. Unlike `write`'s resolution,
+    /// this can canonicalize the full path directly rather than working through the
+    /// parent, because both callers require the target to already be there.
+    fn resolve(&self, requested: &str) -> Result<PathBuf> {
+        Self::reject_traversal(requested)?;
+        let joined = self.root.join(requested);
+        let resolved = fs::canonicalize(&joined)
+            .with_context(|| format!("project path `{requested}` not found"))?;
+        // Second check: canonicalize follows symlinks, so a link inside the root that
+        // points outside it is only caught here, same as `SkillsDir::resolve`.
+        if !resolved.starts_with(&self.root) {
+            return Err(anyhow!(
+                "project path `{requested}` resolves outside the project folder"
+            ));
+        }
+        Ok(resolved)
+    }
+
+    /// Reads a project file. `requested` is untrusted model output — the same threat
+    /// `SkillsDir::read` was hardened against — so it goes through the same
+    /// traversal/symlink-escape checks via `resolve`.
+    pub fn read(&self, requested: &str) -> Result<String> {
+        let path = self.resolve(requested)?;
+        let meta = fs::metadata(&path)
+            .with_context(|| format!("failed to read project file `{requested}`"))?;
+        if !meta.is_file() {
+            return Err(anyhow!("project path `{requested}` is not a file"));
+        }
+        if meta.len() > MAX_FILE_BYTES as u64 {
+            return Err(anyhow!(
+                "project file `{requested}` is {} bytes, over the {MAX_FILE_BYTES}-byte limit",
+                meta.len()
+            ));
+        }
+        fs::read_to_string(&path)
+            .with_context(|| format!("failed to read project file `{requested}`"))
+    }
+
+    /// Lists one directory's immediate entries — never recursively, so a model must
+    /// spend a further `list` call to descend into a subdirectory it saw. `requested`
+    /// empty (or `.`) means the project root itself; anything else goes through the
+    /// same traversal/symlink-escape checks as `read`.
+    ///
+    /// Entries are sorted, directories are distinguished with a trailing `/`, and the
+    /// result is capped at `MAX_LIST_ENTRIES` with the truncation reported as the
+    /// final entry rather than silently cutting the listing short.
+    pub fn list(&self, requested: &str) -> Result<Vec<String>> {
+        let trimmed = requested.trim();
+        let dir = if trimmed.is_empty() || trimmed == "." {
+            self.root.clone()
+        } else {
+            self.resolve(requested)?
+        };
+
+        let meta = fs::metadata(&dir)
+            .with_context(|| format!("failed to list project directory `{requested}`"))?;
+        if !meta.is_dir() {
+            return Err(anyhow!("project path `{requested}` is not a directory"));
+        }
+
+        let mut entries: Vec<String> = fs::read_dir(&dir)
+            .with_context(|| format!("failed to list project directory `{requested}`"))?
+            .filter_map(|e| e.ok())
+            .filter_map(|entry| {
+                // `file_type()` reports what the directory entry itself is, without
+                // following a symlink — matters only for the trailing-`/` distinction
+                // here, not for escaping the root (this never leaves `dir`, which is
+                // already confirmed to be inside `self.root`).
+                let file_type = entry.file_type().ok()?;
+                let name = entry.file_name().into_string().ok()?;
+                Some(if file_type.is_dir() {
+                    format!("{name}/")
+                } else {
+                    name
+                })
+            })
+            .collect();
+        entries.sort();
+
+        let total = entries.len();
+        if total > MAX_LIST_ENTRIES {
+            entries.truncate(MAX_LIST_ENTRIES);
+            entries.push(format!(
+                "... {} more entries not shown (truncated at {MAX_LIST_ENTRIES})",
+                total - MAX_LIST_ENTRIES
+            ));
+        }
+        Ok(entries)
     }
 
     /// Resolves a model-supplied relative path and writes `content` to it, creating
@@ -82,48 +193,20 @@ impl Workspace {
     /// usually doesn't exist yet, so the *parent* is canonicalised and prefix-checked
     /// instead of the final path itself.
     pub fn write(&self, requested: &str, content: &str) -> Result<PathBuf> {
-        if requested.trim().is_empty() {
-            return Err(anyhow!("empty workspace path"));
-        }
-
-        // Same lexical check as `SkillsDir::resolve`: reject anything that could
-        // escape the root before ever touching the filesystem.
+        Self::reject_traversal(requested)?;
         let candidate = Path::new(requested);
-        for component in candidate.components() {
-            match component {
-                Component::Normal(_) | Component::CurDir => {}
-                Component::ParentDir => {
-                    return Err(anyhow!(
-                        "workspace path `{requested}` escapes the workspace directory"
-                    ));
-                }
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(anyhow!("workspace path `{requested}` must be relative"));
-                }
-            }
-        }
 
         if content.len() > MAX_FILE_BYTES {
             return Err(anyhow!(
-                "workspace file `{requested}` is {} bytes, over the {MAX_FILE_BYTES}-byte limit",
+                "project file `{requested}` is {} bytes, over the {MAX_FILE_BYTES}-byte limit",
                 content.len()
             ));
         }
 
         let joined = self.root.join(candidate);
 
-        // Overwriting an existing file never counts against the cap — it is audited
-        // scratch space, not a quota on total bytes ever written. Only a write that
-        // would create a *new* file is refused once the count is already at the cap.
-        if !joined.exists() && self.count_files() >= MAX_WORKSPACE_FILES {
-            return Err(anyhow!(
-                "workspace already holds {MAX_WORKSPACE_FILES} files, the maximum; \
-                 overwrite an existing file instead"
-            ));
-        }
-
         let Some(parent) = joined.parent() else {
-            return Err(anyhow!("workspace path `{requested}` has no parent"));
+            return Err(anyhow!("project path `{requested}` has no parent"));
         };
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -131,14 +214,32 @@ impl Workspace {
             .with_context(|| format!("failed to resolve {}", parent.display()))?;
         if !resolved_parent.starts_with(&self.root) {
             return Err(anyhow!(
-                "workspace path `{requested}` resolves outside the workspace directory"
+                "project path `{requested}` resolves outside the project folder"
             ));
         }
 
         let Some(file_name) = joined.file_name() else {
-            return Err(anyhow!("workspace path `{requested}` has no file name"));
+            return Err(anyhow!("project path `{requested}` has no file name"));
         };
         let resolved = resolved_parent.join(file_name);
+
+        // A write anywhere inside a `.git` directory can corrupt the repository in
+        // ways the user cannot easily undo (rewritten refs, a mangled index, objects
+        // overwritten with model-authored garbage), and no legitimate use of this
+        // protocol needs one — a model that wants to interact with git has the shell
+        // access of a delegated CLI provider for that, not this write path. Checked
+        // against the resolved absolute path, not just the lexical `requested`
+        // string, so a symlink whose target lands inside `.git` is caught too, not
+        // just a request that spells `.git` out directly. Reading `.git` is not
+        // special-cased — only a write can corrupt it.
+        if resolved
+            .components()
+            .any(|c| matches!(c, Component::Normal(name) if name == ".git"))
+        {
+            return Err(anyhow!(
+                "project path `{requested}` would write into `.git`, which is refused"
+            ));
+        }
 
         // A symlink at the final path — even one whose parent is legitimately inside
         // the root — could redirect the write outside it. `symlink_metadata` never
@@ -148,12 +249,12 @@ impl Workspace {
             && meta.file_type().is_symlink()
         {
             return Err(anyhow!(
-                "workspace path `{requested}` is a symlink, refusing to write through it"
+                "project path `{requested}` is a symlink, refusing to write through it"
             ));
         }
 
         fs::write(&resolved, content)
-            .with_context(|| format!("failed to write workspace file `{requested}`"))?;
+            .with_context(|| format!("failed to write project file `{requested}`"))?;
         Ok(resolved)
     }
 }
@@ -162,9 +263,14 @@ impl Workspace {
 mod tests {
     use super::*;
 
+    /// The project root is created here rather than by `Workspace::new`, which
+    /// deliberately refuses a root that doesn't exist — see its doc comment. `dir` is
+    /// returned so callers can also reach the parent, one level *above* the project,
+    /// which is what the escape tests need.
     fn workspace() -> (tempfile::TempDir, Workspace) {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("workspace");
+        let root = dir.path().join("project");
+        fs::create_dir_all(&root).unwrap();
         let w = Workspace::new(root).unwrap();
         (dir, w)
     }
@@ -232,23 +338,5 @@ mod tests {
         w.write("notes.txt", "first").unwrap();
         let path = w.write("notes.txt", "second").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "second");
-    }
-
-    #[test]
-    fn the_file_count_cap_refuses_new_files_but_allows_overwrites() {
-        let (_guard, w) = workspace();
-        for i in 0..MAX_WORKSPACE_FILES {
-            w.write(&format!("f{i}.txt"), "x").unwrap();
-        }
-        // Overwriting an already-existing file at the cap must still succeed.
-        w.write("f0.txt", "overwritten").unwrap();
-        assert_eq!(
-            fs::read_to_string(w.root().join("f0.txt")).unwrap(),
-            "overwritten"
-        );
-        // But a brand-new file must be refused once the cap is reached.
-        let err = w.write("new.txt", "x").unwrap_err().to_string();
-        assert!(err.contains("maximum"), "unexpected error: {err}");
-        assert!(!w.root().join("new.txt").exists());
     }
 }

@@ -6,9 +6,12 @@
 
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
+use crate::app::ActivityKind;
 use crate::audit::AuditLogger;
 use crate::config::{ConnectionSpec, Credentials, Paths, Settings, Transport};
 use crate::providers::{
@@ -56,13 +59,50 @@ impl std::fmt::Debug for Command {
 pub enum Event {
     /// A model produced a reply.
     Reply { label: String, text: String },
-    /// A delegation was dispatched.
-    Delegated { from: String, to: String },
+    /// A delegation was dispatched. `task` is the sub-agent's prompt, truncated to
+    /// `MAX_TASK_DISPLAY_CHARS` for display — the audit log already records the
+    /// delegation by size and label only (see `run_delegations`'s `task.delegated`
+    /// call), and that must stay true; this field exists for the TUI transcript
+    /// only, never for a `self.audit.log(...)` detail string.
+    Delegated {
+        from: String,
+        to: String,
+        task: String,
+    },
+    /// A delegation finished, successfully or not. Emitted from both the `Ok` and
+    /// `Err` arms of `run_delegations`'s provider call, so the status line's activity
+    /// indicator always has a terminal event to clear on (see `App::apply`) — a
+    /// delegation that only reported success would leave a failed one spinning
+    /// forever.
+    DelegationFinished {
+        to: String,
+        ok: bool,
+        chars: usize,
+        millis: u64,
+    },
+    /// A skill was read successfully. A failed read still goes through `Event::Error`
+    /// (unchanged), which is enough on its own to clear the activity indicator.
+    SkillLoaded { name: String, chars: usize },
+    /// The session started waiting on `label` for the reason in `kind`. There is no
+    /// matching "activity stopped" event — every other `Event` variant clears it (see
+    /// `App::apply`), so a `TurnComplete`, `Reply`, `Error`, `DelegationFinished`, or
+    /// `SkillLoaded` that follows is what ends it, not a paired stop event here.
+    ActivityStarted { label: String, kind: ActivityKind },
     /// A model wrote a file into the sandboxed workspace via `ACTION: write_file`.
     /// Carries only the path — never content, same reasoning as `WrittenFile` in
     /// `swarm.rs` — so the user can see that a write happened without this event
     /// itself becoming a way to smuggle file content through the TUI.
     FileWritten { path: String },
+    /// A project file was read successfully via `ACTION: read_file(...)`. Carries
+    /// only the path and a size, never content — same reasoning as `FileWritten`. A
+    /// failed read still goes through `Event::Error` (unchanged), which is enough on
+    /// its own to clear the activity indicator.
+    FileRead { path: String, chars: usize },
+    /// A project directory was listed successfully via `ACTION: list_files(...)`.
+    /// `path` is the requested directory, empty for the project root; `entries` is
+    /// the entry count, never the entries themselves — same reasoning as
+    /// `FileWritten`. Same failure handling as `FileRead`.
+    FilesListed { path: String, entries: usize },
     /// Something went wrong; the session continues.
     Error(String),
     /// The orchestrator has finished handling a turn.
@@ -81,6 +121,23 @@ pub enum Event {
         label: String,
         connection_id: Option<String>,
     },
+}
+
+/// Ceiling on how much of a delegated task's prompt is shown in the TUI transcript —
+/// mirrors `MAX_DELEGATIONS_PER_TURN`'s bound-the-noise reasoning, just for one line's
+/// length instead of a turn's total effort.
+const MAX_TASK_DISPLAY_CHARS: usize = 120;
+
+/// Truncates `s` to at most `max_chars` characters, appending `…` when cut. Same
+/// char-boundary-safe approach as `swarm::record_result`/`providers::truncate_error_detail`
+/// (and the panic class commit `923b934` fixed in `cloud.rs`): `s` here is a
+/// delegated task's prompt, which is free-form model output and may contain
+/// multi-byte UTF-8, so slicing on a raw byte index can land mid-character and panic.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}…", &s[..cut]),
+        None => s.to_string(),
+    }
 }
 
 /// Whether a candidate connection can actually be constructed right now.
@@ -487,6 +544,7 @@ fn construct_provider(
     conn: &ConnectionSpec,
     client: &reqwest::Client,
     settings: &Settings,
+    project_root: &Path,
 ) -> Result<Arc<dyn Provider>> {
     match transport {
         None => Ok(Arc::new(OllamaProvider::new(
@@ -531,6 +589,7 @@ fn construct_provider(
                 cli.args.clone(),
                 &model,
                 cli.system_arg.clone(),
+                project_root.to_path_buf(),
             )?;
             Ok(Arc::new(p))
         }
@@ -567,6 +626,7 @@ impl Registry {
         settings: &Settings,
         requested: Option<&str>,
         classified: bool,
+        project_root: &Path,
     ) -> Result<Self> {
         let candidates = discover_candidates(settings, classified).await;
         let client = http_client()?;
@@ -589,7 +649,14 @@ impl Registry {
                     path: option.cli.as_ref().map(|c| c.path.clone()),
                     model: None,
                 };
-                match construct_provider(candidate, option.transport, &conn, &client, settings) {
+                match construct_provider(
+                    candidate,
+                    option.transport,
+                    &conn,
+                    &client,
+                    settings,
+                    project_root,
+                ) {
                     Ok(p) => {
                         let label = p.label();
                         connection_ids.insert(label.clone(), candidate.id.clone());
@@ -630,7 +697,14 @@ impl Registry {
                     eprintln!("[discovery] skipping {id}: {reason}");
                     continue;
                 }
-                match construct_provider(candidate, transport, conn, &client, settings) {
+                match construct_provider(
+                    candidate,
+                    transport,
+                    conn,
+                    &client,
+                    settings,
+                    project_root,
+                ) {
                     Ok(p) => {
                         let label = p.label();
                         connection_ids.insert(label.clone(), id.clone());
@@ -769,19 +843,25 @@ pub struct Orchestrator {
     ledger: SwarmLedger,
     audit: AuditLogger,
     skills: SkillsDir,
-    /// The only place models may write files. Deliberately a separate tree from
-    /// `skills` — see `workspace.rs`'s module doc.
+    /// The only place models may read, list, or write project files. Rooted at
+    /// `project_root` below — see `workspace.rs`'s module doc.
     workspace: Workspace,
     events: mpsc::Sender<Event>,
     /// Carried so a picker reopened mid-chat (`Command::Reconfigure`) rebuilds the
     /// registry under the same air-gap policy the session started with.
     classified: bool,
+    /// The project folder resolved at startup (`main::resolve_project_root`). Carried
+    /// so `reconfigure` can rebuild the registry — and, through it, any CLI providers
+    /// — with the same project root the session started with, without re-reading it
+    /// from anywhere else.
+    project_root: PathBuf,
 }
 
 impl Orchestrator {
     pub fn new(
         registry: Registry,
         paths: &Paths,
+        project_root: PathBuf,
         classified: bool,
         events: mpsc::Sender<Event>,
     ) -> Result<Self> {
@@ -793,9 +873,10 @@ impl Orchestrator {
             ledger,
             audit: AuditLogger::open(paths.audit_log.clone())?,
             skills: SkillsDir::new(paths.skills_dir.clone())?,
-            workspace: Workspace::new(paths.workspace_dir.clone())?,
+            workspace: Workspace::new(project_root.clone())?,
             events,
             classified,
+            project_root,
         })
     }
 
@@ -879,7 +960,7 @@ impl Orchestrator {
     /// reopened mid-chat) and resets the swarm roster so the system prompt matches
     /// reality.
     async fn reconfigure(&mut self, settings: Settings) {
-        match Registry::build(&settings, None, self.classified).await {
+        match Registry::build(&settings, None, self.classified, &self.project_root).await {
             Ok(registry) => {
                 self.registry = registry;
                 self.ledger.set_roster(self.registry.labels());
@@ -946,6 +1027,12 @@ impl Orchestrator {
             return;
         };
 
+        self.emit(Event::ActivityStarted {
+            label: primary_label.clone(),
+            kind: ActivityKind::Primary,
+        })
+        .await;
+
         let system = self.system_prompt();
         let reply = match provider.send(Some(&system), prompt).await {
             Ok(reply) => reply,
@@ -986,7 +1073,9 @@ impl Orchestrator {
         let (writes, stripped) = SwarmLedger::parse_file_writes(&reply.text);
 
         self.run_delegations(&primary_label, &stripped).await;
-        self.run_skill_reads(&stripped).await;
+        self.run_skill_reads(&primary_label, &stripped).await;
+        self.run_file_reads(&primary_label, &stripped).await;
+        self.run_file_lists(&primary_label, &stripped).await;
         self.run_file_writes(writes).await;
     }
 
@@ -1021,12 +1110,20 @@ impl Orchestrator {
             self.emit(Event::Delegated {
                 from: from.to_string(),
                 to: target_label.clone(),
+                task: truncate_chars(&delegation.prompt, MAX_TASK_DISPLAY_CHARS),
+            })
+            .await;
+            self.emit(Event::ActivityStarted {
+                label: target_label.clone(),
+                kind: ActivityKind::Delegating,
             })
             .await;
 
             let system = self.system_prompt();
+            let started = Instant::now();
             match target.send(Some(&system), &delegation.prompt).await {
                 Ok(reply) => {
+                    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     if let Some(budget) = reply.rate_limit.summary() {
                         self.ledger.update_budget(&target_label, &budget);
                     }
@@ -1042,6 +1139,13 @@ impl Orchestrator {
                         "task.completed",
                         &format!("task={task_id} model={target_label}"),
                     );
+                    self.emit(Event::DelegationFinished {
+                        to: target_label.clone(),
+                        ok: true,
+                        chars: reply.text.len(),
+                        millis,
+                    })
+                    .await;
                     self.emit(Event::Reply {
                         label: target_label,
                         text: reply.text,
@@ -1049,6 +1153,7 @@ impl Orchestrator {
                     .await;
                 }
                 Err(e) => {
+                    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     let _ = self
                         .audit
                         .log("task.failed", &format!("task={task_id} error={e}"));
@@ -1062,6 +1167,13 @@ impl Orchestrator {
                     self.ledger.record_result(task_id, &e.to_string());
                     self.ledger
                         .update_status(task_id, crate::swarm::TaskStatus::Failed);
+                    self.emit(Event::DelegationFinished {
+                        to: target_label.clone(),
+                        ok: false,
+                        chars: 0,
+                        millis,
+                    })
+                    .await;
                     self.emit(Event::Error(format!("{target_label}: {e}")))
                         .await;
                 }
@@ -1075,8 +1187,10 @@ impl Orchestrator {
     ///
     /// Like sub-agent replies not being re-scanned for delegations, this is only
     /// called on the primary's own reply — not on delegation replies — so the same
-    /// non-recursion guarantee holds here too.
-    async fn run_skill_reads(&mut self, reply_text: &str) {
+    /// non-recursion guarantee holds here too. `primary_label` is who the read is on
+    /// behalf of; it is what `Event::ActivityStarted` names, since a skill read is
+    /// not a provider call and so has no sub-agent label of its own to report.
+    async fn run_skill_reads(&mut self, primary_label: &str, reply_text: &str) {
         let requests = SwarmLedger::parse_read_skill(reply_text);
 
         // Mirrors `run_delegations` capping to `MAX_DELEGATIONS_PER_TURN`: the
@@ -1085,6 +1199,11 @@ impl Orchestrator {
         // hundreds of `read_skill` lines would still trigger hundreds of filesystem
         // reads, just to have all but the last few evicted immediately after.
         for name in requests.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+            self.emit(Event::ActivityStarted {
+                label: primary_label.to_string(),
+                kind: ActivityKind::ReadingSkill,
+            })
+            .await;
             // `SkillsDir::read` already rejects `..`, absolute paths, and symlinks
             // that escape the skills root (see `skills.rs`). Until now every caller
             // passed it a name the application itself constructed. This is the first
@@ -1108,6 +1227,11 @@ impl Orchestrator {
                         "skill.read",
                         &format!("name={name} chars={}", content.len()),
                     );
+                    self.emit(Event::SkillLoaded {
+                        name: name.clone(),
+                        chars: content.len(),
+                    })
+                    .await;
                 }
                 Err(e) => {
                     let _ = self
@@ -1151,6 +1275,95 @@ impl Orchestrator {
                     self.ledger.record_file_write(&write.path, &e.to_string());
                     self.emit(Event::Error(format!("write `{}`: {e}", write.path)))
                         .await;
+                }
+            }
+        }
+    }
+
+    /// Executes any `read_file` lines the primary emitted, mirroring
+    /// `run_skill_reads` in structure: resolve each request through `Workspace::read`
+    /// and never let one bad read take down the turn.
+    ///
+    /// `reply_text` comes from `parse_file_writes(&reply.text)`'s stripped output in
+    /// `handle_prompt`, never the raw reply, so an `ACTION: read_file(...)` line that
+    /// only appears inside a `write_file` block's content is never executed — same
+    /// non-recursion/non-injection guarantee as `run_skill_reads` and
+    /// `run_file_writes`. Only the primary's own reply is ever scanned; a sub-agent's
+    /// delegation reply is not.
+    async fn run_file_reads(&mut self, primary_label: &str, reply_text: &str) {
+        let requests = SwarmLedger::parse_read_files(reply_text);
+
+        // Mirrors `run_skill_reads` capping to `MAX_DELEGATIONS_PER_TURN`: bounds how
+        // much filesystem effort a single turn can trigger, independent of how many
+        // of the results the ledger ends up keeping (`MAX_LOADED_READS`).
+        for path in requests.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+            self.emit(Event::ActivityStarted {
+                label: primary_label.to_string(),
+                kind: ActivityKind::ReadingProject,
+            })
+            .await;
+            // `Workspace::read` already rejects `..`, absolute paths, and symlinks
+            // that escape the project root (see `workspace.rs`) — `path` here comes
+            // straight from model output, the same untrusted-input case that
+            // hardening exists for.
+            match self.workspace.read(&path) {
+                Ok(content) => {
+                    self.ledger.record_file_read(&path, &content);
+                    // Sizes and counts only, never content — a hard invariant of the
+                    // audit log (see `docs/AUDIT-2026-07-30.md` §3.5).
+                    let _ = self.audit.log(
+                        "project.read",
+                        &format!("path={path} chars={}", content.len()),
+                    );
+                    self.emit(Event::FileRead {
+                        path: path.clone(),
+                        chars: content.len(),
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    let _ = self
+                        .audit
+                        .log("project.read_failed", &format!("path={path} error={e}"));
+                    self.emit(Event::Error(format!("read `{path}`: {e}"))).await;
+                }
+            }
+        }
+    }
+
+    /// Executes any `list_files` lines the primary emitted, mirroring
+    /// `run_file_reads` in structure and sharing the same stripped-text and
+    /// non-recursion guarantees.
+    async fn run_file_lists(&mut self, primary_label: &str, reply_text: &str) {
+        let requests = SwarmLedger::parse_list_files(reply_text);
+
+        for path in requests.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+            self.emit(Event::ActivityStarted {
+                label: primary_label.to_string(),
+                kind: ActivityKind::ReadingProject,
+            })
+            .await;
+            match self.workspace.list(&path) {
+                Ok(entries) => {
+                    let outcome = format!("ok ({} entries)\n{}", entries.len(), entries.join("\n"));
+                    self.ledger.record_file_list(&path, &outcome);
+                    // Path and entry count only, never the entries themselves — same
+                    // audit-log invariant as `run_file_reads`.
+                    let _ = self.audit.log(
+                        "project.list",
+                        &format!("path={path} entries={}", entries.len()),
+                    );
+                    self.emit(Event::FilesListed {
+                        path: path.clone(),
+                        entries: entries.len(),
+                    })
+                    .await;
+                }
+                Err(e) => {
+                    let _ = self
+                        .audit
+                        .log("project.list_failed", &format!("path={path} error={e}"));
+                    self.emit(Event::Error(format!("list `{path}`: {e}"))).await;
                 }
             }
         }
@@ -1377,7 +1590,7 @@ mod tests {
             ..Default::default()
         };
 
-        let registry = Registry::build(&settings, None, false)
+        let registry = Registry::build(&settings, None, false, Path::new("."))
             .await
             .expect("the claude CLI connection must construct");
         assert_eq!(registry.primary(), "claude");
@@ -1421,7 +1634,7 @@ mod tests {
             ..Default::default()
         };
 
-        let registry = Registry::build(&settings, None, false)
+        let registry = Registry::build(&settings, None, false, Path::new("."))
             .await
             .expect("the agy CLI connection must construct");
         assert_eq!(registry.primary(), "agy:gemini-3-pro");
@@ -1465,6 +1678,7 @@ mod tests {
     async fn a_prompt_reaches_a_provider_and_the_reply_comes_back() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
 
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1474,9 +1688,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -1484,14 +1699,16 @@ mod tests {
             orch.handle_prompt("hello there").await;
         });
 
-        let event = event_rx.recv().await.expect("expected a reply event");
-        match event {
-            Event::Reply { label, text } => {
-                assert_eq!(label, "ollama:llama3");
-                assert_eq!(text, "echo: hello there");
+        // `handle_prompt` now also emits `ActivityStarted` before the provider call;
+        // skip past it to the reply, which is what this test is actually about.
+        let reply = loop {
+            match event_rx.recv().await.expect("expected a reply event") {
+                Event::Reply { label, text } => break (label, text),
+                _ => continue,
             }
-            other => panic!("expected Reply, got {other:?}"),
-        }
+        };
+        assert_eq!(reply.0, "ollama:llama3");
+        assert_eq!(reply.1, "echo: hello there");
 
         handle.await.unwrap();
     }
@@ -1500,6 +1717,7 @@ mod tests {
     async fn delegation_dispatches_to_the_named_model() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         let reg = registry_with(
             vec![("ollama", "llama3", false), ("ollama", "mistral", false)],
             "ollama:llama3",
@@ -1511,9 +1729,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
         orch.run_delegations(
@@ -1546,6 +1765,7 @@ mod tests {
     async fn delegating_to_an_unknown_model_is_reported_not_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
 
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1554,9 +1774,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
         orch.run_delegations("ollama:llama3", "ACTION: delegate_task(ghost:model, hi)")
@@ -1573,6 +1794,7 @@ mod tests {
         // running, on a blackboard other models read as fact.
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
 
         let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
         let ok = StubProvider {
@@ -1599,9 +1821,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
         orch.run_delegations(
@@ -1610,8 +1833,17 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(event_rx.try_recv(), Ok(Event::Delegated { .. })));
-        assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(matches!(events[0], Event::Delegated { .. }));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::DelegationFinished { ok: false, .. }))
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::Error(_))));
 
         let task = &orch.ledger.tasks()[0];
         assert_eq!(task.status, crate::swarm::TaskStatus::Failed);
@@ -1626,9 +1858,205 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_delegation_emits_the_task_and_a_finish_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(
+            vec![("ollama", "llama3", false), ("ollama", "mistral", false)],
+            "ollama:llama3",
+        );
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:mistral, summarise the attached diff)",
+        )
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+
+        let delegated = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Delegated { to, task, .. } => Some((to.clone(), task.clone())),
+                _ => None,
+            })
+            .expect("expected an Event::Delegated");
+        assert_eq!(delegated.0, "ollama:mistral");
+        assert_eq!(delegated.1, "summarise the attached diff");
+
+        let finished = events
+            .iter()
+            .find_map(|e| match e {
+                Event::DelegationFinished { to, ok, chars, .. } => Some((to.clone(), *ok, *chars)),
+                _ => None,
+            })
+            .expect("expected an Event::DelegationFinished");
+        assert_eq!(finished.0, "ollama:mistral");
+        assert!(finished.1, "the stub provider always succeeds");
+        assert!(finished.2 > 0, "a successful reply must report its size");
+    }
+
+    #[tokio::test]
+    async fn a_failed_delegation_still_emits_a_finish_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        let ok = StubProvider {
+            provider: "ollama".into(),
+            model: "llama3".into(),
+            remote: false,
+        };
+        providers.insert(ok.label(), Arc::new(ok));
+        let failing = FailingProvider {
+            provider: "ollama".into(),
+            model: "mistral".into(),
+        };
+        providers.insert(failing.label(), Arc::new(failing));
+        let reg = Registry {
+            providers,
+            primary: "ollama:llama3".to_string(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:mistral, do the thing)",
+        )
+        .await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        // A failed delegation must still produce a finish event — the whole point is
+        // that the activity indicator (and, in the ledger, the task's status) always
+        // has a terminal event to clear on, success or failure alike.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::DelegationFinished {
+                to,
+                ok: false,
+                chars: 0,
+                ..
+            } if to == "ollama:mistral"
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_long_task_is_truncated_on_a_char_boundary_not_a_byte_index() {
+        // Same trick as
+        // `providers::mod::error_detail_is_truncated_on_a_char_boundary_not_a_byte_index`:
+        // one ASCII byte followed by enough 3-byte `€` characters that a naive
+        // `&s[..MAX_TASK_DISPLAY_CHARS]` byte slice lands mid-character and panics.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(
+            vec![("ollama", "llama3", false), ("ollama", "mistral", false)],
+            "ollama:llama3",
+        );
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        let long_task = format!("a{}", "€".repeat(130));
+        orch.run_delegations(
+            "ollama:llama3",
+            &format!("ACTION: delegate_task(ollama:mistral, {long_task})"),
+        )
+        .await;
+
+        let task = loop {
+            match event_rx.try_recv() {
+                Ok(Event::Delegated { task, .. }) => break task,
+                Ok(_) => continue,
+                Err(_) => panic!("expected an Event::Delegated"),
+            }
+        };
+        assert!(task.ends_with('…'));
+        // MAX_TASK_DISPLAY_CHARS kept chars, plus the ellipsis marker.
+        assert_eq!(task.chars().count(), MAX_TASK_DISPLAY_CHARS + 1);
+    }
+
+    #[tokio::test]
+    async fn a_successful_skill_read_emits_a_skill_loaded_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(paths.skills_dir.join("notes.md"), "be terse").unwrap();
+
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
+            .await;
+
+        let loaded = loop {
+            match event_rx.try_recv() {
+                Ok(Event::SkillLoaded { name, chars }) => break (name, chars),
+                Ok(_) => continue,
+                Err(_) => panic!("expected an Event::SkillLoaded"),
+            }
+        };
+        assert_eq!(loaded.0, "notes.md");
+        assert_eq!(loaded.1, "be terse".len());
+    }
+
+    #[tokio::test]
     async fn a_read_skill_request_loads_the_named_skill_into_the_ledger() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             paths.skills_dir.join("notes.md"),
             "be terse and cite sources",
@@ -1642,16 +2070,27 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
-        orch.run_skill_reads("ACTION: read_skill(notes.md)").await;
+        orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
+            .await;
 
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
         assert!(
-            event_rx.try_recv().is_err(),
+            !events.iter().any(|e| matches!(e, Event::Error(_))),
             "a successful read must not emit Event::Error"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::SkillLoaded { name, .. } if name == "notes.md"))
         );
         let loaded = orch.ledger.loaded_skills();
         assert_eq!(loaded.len(), 1);
@@ -1669,6 +2108,7 @@ mod tests {
         // root and not a panic that takes down the turn.
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
 
         let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1677,15 +2117,32 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
-        orch.run_skill_reads("ACTION: read_skill(../../../../etc/passwd)")
-            .await;
+        orch.run_skill_reads(
+            "ollama:llama3",
+            "ACTION: read_skill(../../../../etc/passwd)",
+        )
+        .await;
 
-        assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+        // `ActivityStarted` now interleaves with the failure, so this can no longer
+        // assert the error was the *only* event. Asserting no `SkillLoaded` keeps the
+        // part that mattered: a failed read must never also report success.
+        let mut saw_error = false;
+        let mut saw_loaded = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                Event::Error(_) => saw_error = true,
+                Event::SkillLoaded { .. } => saw_loaded = true,
+                _ => {}
+            }
+        }
+        assert!(saw_error);
+        assert!(!saw_loaded, "a failed skill read must not report success");
         assert!(orch.ledger.loaded_skills().is_empty());
     }
 
@@ -1693,6 +2150,7 @@ mod tests {
     async fn a_missing_skill_request_surfaces_as_an_error_not_a_crash() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
 
         let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1701,14 +2159,29 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
-        orch.run_skill_reads("ACTION: read_skill(nope.md)").await;
+        orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(nope.md)")
+            .await;
 
-        assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+        // `ActivityStarted` now interleaves with the failure, so this can no longer
+        // assert the error was the *only* event. Asserting no `SkillLoaded` keeps the
+        // part that mattered: a failed read must never also report success.
+        let mut saw_error = false;
+        let mut saw_loaded = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                Event::Error(_) => saw_error = true,
+                Event::SkillLoaded { .. } => saw_loaded = true,
+                _ => {}
+            }
+        }
+        assert!(saw_error);
+        assert!(!saw_loaded, "a failed skill read must not report success");
         assert!(orch.ledger.loaded_skills().is_empty());
     }
 
@@ -1716,6 +2189,7 @@ mod tests {
     async fn the_system_prompt_renders_a_skills_description_when_present() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         std::fs::write(
             paths.skills_dir.join("notes.md"),
             "---\ndescription: Summarise long documents.\n---\nbody\n",
@@ -1730,9 +2204,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
         let prompt = orch.system_prompt();
@@ -1744,6 +2219,7 @@ mod tests {
     async fn reconfigure_rebuilds_the_registry_and_resets_the_roster() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
 
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1752,9 +2228,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -1788,6 +2265,7 @@ mod tests {
     async fn set_commander_switches_the_primary_and_emits_the_resolved_label() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         let reg = registry_with(
             vec![("ollama", "llama3", false), ("ollama", "mistral", false)],
             "ollama:llama3",
@@ -1799,9 +2277,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
         // Bare model name, not the full label — exercises `set_primary`'s flexible
@@ -1831,6 +2310,7 @@ mod tests {
     async fn set_commander_with_an_unknown_name_emits_an_error_and_leaves_primary_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
 
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1839,9 +2319,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
         orch.set_commander("ghost").await;
@@ -1854,6 +2335,7 @@ mod tests {
     async fn a_write_file_reply_creates_the_file_and_audits_it() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
 
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1862,9 +2344,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
         // `StubProvider::send` echoes `"echo: {prompt}"`, prefixing only the first
@@ -1883,7 +2366,7 @@ mod tests {
         }
         assert!(saw_write, "expected an Event::FileWritten");
 
-        let written = std::fs::read_to_string(paths.workspace_dir.join("hello.txt")).unwrap();
+        let written = std::fs::read_to_string(project_dir.path().join("hello.txt")).unwrap();
         assert_eq!(written, "Hello, world!");
 
         let audit_text = std::fs::read_to_string(&paths.audit_log).unwrap();
@@ -1899,6 +2382,7 @@ mod tests {
         // outside the workspace root and not a panic that takes down the turn.
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
 
         let (event_tx, mut event_rx) = mpsc::channel(16);
@@ -1907,9 +2391,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
         orch.run_file_writes(vec![crate::swarm::FileWrite {
@@ -1919,7 +2404,16 @@ mod tests {
         .await;
 
         assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
-        assert!(!tmp.path().join("escape.txt").exists());
+        // "../escape.txt" would land one directory above the project root if the
+        // traversal check failed to catch it.
+        assert!(
+            !project_dir
+                .path()
+                .parent()
+                .unwrap()
+                .join("escape.txt")
+                .exists()
+        );
         let written = orch.ledger.written_files();
         assert_eq!(written.len(), 1);
         assert!(written[0].outcome.contains("escapes"));
@@ -1929,6 +2423,7 @@ mod tests {
     async fn a_written_file_is_listed_in_the_next_system_prompt() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
         let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
 
         let (event_tx, _event_rx) = mpsc::channel(16);
@@ -1937,9 +2432,10 @@ mod tests {
             ledger: SwarmLedger::new(),
             audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
             skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
-            workspace: Workspace::new(paths.workspace_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
             events: event_tx,
             classified: false,
+            project_root: project_dir.path().to_path_buf(),
         };
 
         orch.run_file_writes(vec![crate::swarm::FileWrite {
@@ -1949,10 +2445,192 @@ mod tests {
         .await;
 
         let prompt = orch.system_prompt();
-        assert!(prompt.contains("### Workspace files"));
+        assert!(prompt.contains("### Files you have written"));
         assert!(prompt.contains("notes.txt: ok (5 bytes)"));
         // The write's content ("hello") must never itself be echoed into the ledger —
         // only the path and byte-count outcome (see `WrittenFile`'s doc comment).
         assert!(!prompt.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn a_successful_read_emits_file_read_and_records_in_the_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(project_dir.path().join("notes.txt"), "hello there").unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.run_file_reads("ollama:llama3", "ACTION: read_file(notes.txt)")
+            .await;
+
+        let mut saw_read = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::FileRead { path, chars } = event {
+                assert_eq!(path, "notes.txt");
+                assert_eq!(chars, "hello there".len());
+                saw_read = true;
+            }
+        }
+        assert!(saw_read, "expected an Event::FileRead");
+
+        let loaded = orch.ledger.loaded_reads();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].path, "notes.txt");
+        assert_eq!(loaded[0].content, "hello there");
+    }
+
+    #[tokio::test]
+    async fn a_read_traversal_attempt_surfaces_as_an_error_not_a_crash() {
+        // Mirrors `a_read_skill_traversal_attempt_surfaces_as_an_error_not_a_crash`
+        // and `a_write_traversal_attempt_surfaces_as_an_error_not_a_crash`: the path
+        // comes straight from model output, so it must go through `Workspace::read`'s
+        // hardening and surface as `Event::Error`, never a path outside the project
+        // root and never a panic that takes down the turn.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project_dir.path().parent().unwrap().join("secret.txt"),
+            "top secret",
+        )
+        .unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.run_file_reads("ollama:llama3", "ACTION: read_file(../secret.txt)")
+            .await;
+
+        let mut saw_error = false;
+        let mut saw_read = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                Event::Error(_) => saw_error = true,
+                Event::FileRead { .. } => saw_read = true,
+                _ => {}
+            }
+        }
+        assert!(saw_error);
+        assert!(!saw_read, "a failed read must not emit Event::FileRead");
+        assert!(
+            orch.ledger.loaded_reads().is_empty(),
+            "a failed read must not also record success in the ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_file_line_inside_a_write_block_is_not_executed() {
+        // Security-critical: an `ACTION: read_file(...)` line that only appears
+        // inside a `write_file` block's content (a model documenting this very
+        // protocol, say) must be treated as file content, not a real request. This
+        // is only true because `handle_prompt` feeds `run_file_reads` the *stripped*
+        // text `parse_file_writes` returns, never the raw reply — see
+        // `parse_read_files`'s doc comment for why that ordering matters.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(project_dir.path().join("secret.txt"), "top secret").unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.handle_prompt(
+            "ACTION: write_file(README.md)\n\
+             Here is how to read a file:\n\
+             ACTION: read_file(secret.txt)\n\
+             ACTION: end_file",
+        )
+        .await;
+
+        let mut saw_read = false;
+        let mut saw_error = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                Event::FileRead { .. } => saw_read = true,
+                Event::Error(_) => saw_error = true,
+                _ => {}
+            }
+        }
+        assert!(
+            !saw_read,
+            "a read_file line inside write_file content must not execute"
+        );
+        assert!(
+            !saw_error,
+            "an unexecuted read_file line must not surface as an error either"
+        );
+        assert!(orch.ledger.loaded_reads().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_list_of_the_root_returns_the_projects_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(project_dir.path().join("a.txt"), "a").unwrap();
+        std::fs::write(project_dir.path().join("b.txt"), "b").unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+        };
+
+        orch.run_file_lists("ollama:llama3", "ACTION: list_files()")
+            .await;
+
+        let mut saw_list = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::FilesListed { path, entries } = event {
+                assert_eq!(path, "");
+                assert_eq!(entries, 2);
+                saw_list = true;
+            }
+        }
+        assert!(saw_list, "expected an Event::FilesListed");
+
+        let listings = orch.ledger.file_listings();
+        assert_eq!(listings.len(), 1);
+        assert!(listings[0].outcome.contains("a.txt"));
+        assert!(listings[0].outcome.contains("b.txt"));
     }
 }

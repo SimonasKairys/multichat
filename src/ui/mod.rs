@@ -19,6 +19,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::io::{self, Stdout};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
 
@@ -87,9 +88,24 @@ pub async fn run(
 ) -> Result<App> {
     let mut guard = TerminalGuard::enter()?;
     let mut input = EventStream::new();
+    // Drives the busy status line's spinner/elapsed-seconds display. ~200ms is fast
+    // enough to read as "live" without redrawing so often it fights the terminal for
+    // CPU; the tick itself does nothing unless `app.activity` is set (see below), so
+    // this interval firing is cheap even across a long idle session.
+    let mut ticker = tokio::time::interval(Duration::from_millis(200));
+    // Set by the previous iteration's `select!` outcome: `false` only when that
+    // iteration was an idle tick (nothing in `app` changed), so this iteration's draw
+    // is skipped. `Terminal::draw` already diffs against the previous buffer
+    // internally, but rebuilding the widget tree every 200ms even while nothing
+    // changed is exactly the "pointless full redraw" this avoids. Every other branch
+    // leaves it at `true`.
+    let mut needs_redraw = true;
 
     loop {
-        guard.terminal.draw(|frame| draw(frame, &app))?;
+        if needs_redraw {
+            guard.terminal.draw(|frame| draw(frame, &app))?;
+        }
+        needs_redraw = true;
 
         tokio::select! {
             maybe_term = input.next() => {
@@ -135,6 +151,16 @@ pub async fn run(
                     Some(event) => app.apply(event),
                     // Orchestrator shut down; nothing more can arrive.
                     None => break,
+                }
+            }
+            // Kept deliberately minimal — `tokio::select!` polls a ready branch at
+            // random, so anything heavier here would be a chance to starve input or
+            // orchestrator events, not just a perf concern.
+            _ = ticker.tick() => {
+                if app.activity.is_some() {
+                    app.advance_spinner();
+                } else {
+                    needs_redraw = false;
                 }
             }
         }

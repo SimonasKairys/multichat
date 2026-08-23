@@ -22,7 +22,6 @@ pub struct Paths {
     pub vault_file: PathBuf,
     pub audit_log: PathBuf,
     pub skills_dir: PathBuf,
-    pub workspace_dir: PathBuf,
 }
 
 impl Paths {
@@ -42,17 +41,13 @@ impl Paths {
         fs::create_dir_all(&skills_dir).with_context(|| {
             format!("failed to create skills directory {}", skills_dir.display())
         })?;
-        // Deliberately a separate tree from `skills_dir`: that directory is read-only
-        // to models (see `skills.rs`'s module doc), and a model that could write there
-        // could inject its own content into every future system prompt. `workspace`
-        // is the one place models may write — see `workspace.rs`.
-        let workspace_dir = data_dir.join("workspace");
-        fs::create_dir_all(&workspace_dir).with_context(|| {
-            format!(
-                "failed to create workspace directory {}",
-                workspace_dir.display()
-            )
-        })?;
+        // The workspace root is deliberately NOT part of `Paths`: it used to be a
+        // scratch tree under the data dir, but it is now the user's project folder
+        // (see `workspace.rs`'s module doc and `resolve_project_root` in `main.rs`),
+        // which lives wherever the user's project lives, not under application state.
+        // Entangling the two would mean a `--project` override had to reach through
+        // `Paths` to take effect, when nothing else in `Paths` has any reason to know
+        // about it.
         restrict_to_owner(&data_dir)?;
 
         Ok(Self {
@@ -60,7 +55,6 @@ impl Paths {
             vault_file: data_dir.join("vault.enc"),
             audit_log: data_dir.join("audit.log"),
             skills_dir,
-            workspace_dir,
             data_dir,
         })
     }

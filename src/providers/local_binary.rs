@@ -938,12 +938,22 @@ mod tests {
         // be swallowed as prompt text. `echo` reports argv back, so this checks the
         // real command line rather than a struct field.
         let project = tempfile::tempdir().unwrap();
-        let expected = std::fs::canonicalize(project.path()).unwrap();
+        // Canonicalize BEFORE constructing, and assert against the same value: the
+        // flag carries `project_root` verbatim, so a test that hands over a raw
+        // tempdir path but expects a canonical one only passes where the two happen
+        // to be equal. They are not on macOS, where `tempdir()` returns a path under
+        // `/var/folders/...` that is a symlink to `/private/var/folders/...` — which
+        // is exactly how this test passed on Linux and Windows while failing CI on
+        // macOS. Canonicalizing here also mirrors production: `resolve_project_root`
+        // in `main.rs` canonicalizes once at startup, so a real `project_root` is
+        // already canonical by the time a provider sees it.
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let expected = root.clone();
         let p = LocalBinaryProvider::new(
             "echo",
             "/bin/echo",
             "echo",
-            project.path().to_path_buf(),
+            root,
             CliInvocation {
                 args: vec!["--configured-arg".into()],
                 system_arg: None,
@@ -961,6 +971,48 @@ mod tests {
             expected.to_string_lossy()
         );
         assert_eq!(reply.text.trim(), expected_line);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_workspace_flag_carries_its_root_verbatim_even_through_a_symlink() {
+        // Exercises the macOS condition on every platform. `/tmp` is a real directory
+        // on Linux, so a plain `tempdir()` can never catch a raw-vs-canonical path
+        // mismatch there; macOS CI could, and did. Building the symlink by hand makes
+        // the contract explicit and platform-independent: the flag passes on exactly
+        // the root the provider was constructed with, resolving nothing.
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_ne!(
+            link,
+            std::fs::canonicalize(&link).unwrap(),
+            "the symlink must actually differ from its target, or this proves nothing"
+        );
+
+        let p = LocalBinaryProvider::new(
+            "echo",
+            "/bin/echo",
+            "echo",
+            link.clone(),
+            CliInvocation {
+                args: vec![],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: Some("--add-dir".into()),
+            },
+        )
+        .unwrap();
+        let reply = p
+            .send_with_timeout(None, "p", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.text.trim(),
+            format!("--add-dir {} p", link.to_string_lossy())
+        );
     }
 
     #[cfg(unix)]

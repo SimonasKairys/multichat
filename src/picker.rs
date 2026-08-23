@@ -449,6 +449,7 @@ mod tests {
                         args: vec![],
                         system_arg: None,
                         dialect: None,
+                        workspace_arg: None,
                     }),
                     needs_key: false,
                 },

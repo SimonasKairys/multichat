@@ -18,7 +18,7 @@ use crate::providers::{
     ProgressSink, Provider,
     cloud::CloudProvider,
     http_client,
-    local_binary::{LocalBinaryProvider, StreamDialect},
+    local_binary::{CliInvocation, LocalBinaryProvider, StreamDialect},
     ollama::OllamaProvider,
 };
 use crate::skills::SkillsDir;
@@ -238,6 +238,10 @@ pub struct CliSpec {
     /// `LocalBinarySpec::stream_format`) so `construct_provider` never has to
     /// re-parse or re-validate it.
     pub dialect: Option<StreamDialect>,
+    /// The flag this CLI uses to declare an extra allowed working directory, or
+    /// `None` when it has none. Set to `--add-dir` for both known agentic CLIs — see
+    /// `CliDefaults::workspace_arg` for why it matters.
+    pub workspace_arg: Option<String>,
 }
 
 /// One way to reach a [`Candidate`]: a specific transport, its availability, and
@@ -312,24 +316,66 @@ fn cli_vendor_id(binary_name: &str) -> String {
 /// `codex` and `llm` are unverified best guesses, treated the same as before: no
 /// args, no system flag, and no streaming dialect until someone confirms their real
 /// shape.
-fn known_cli_default(binary_name: &str) -> (Vec<String>, Option<String>, Option<StreamDialect>) {
+/// What a known agentic CLI needs on its command line, resolved in one place.
+///
+/// A struct rather than a tuple because there are now four of these and a
+/// `(Vec<String>, Option<String>, Option<StreamDialect>, Option<String>)` at every
+/// call site says nothing about which `Option<String>` is which.
+struct CliDefaults {
+    args: Vec<String>,
+    system_arg: Option<String>,
+    dialect: Option<StreamDialect>,
+    /// The flag that declares an additional directory the CLI may work in.
+    ///
+    /// Not cosmetic. An agentic CLI that does not know where its project is will go
+    /// looking: asked to read `src/` and `data.csv`, `agy` ran
+    /// `find /home/main -name "data.csv" -o -name "src"` — a scan of the user's entire
+    /// home directory — and only its own permission check stopped it. Passing
+    /// `--add-dir <project root>` tells it where the work actually is, which both
+    /// makes it succeed and keeps it from wandering. `Command::current_dir` alone was
+    /// not enough to convey this.
+    workspace_arg: Option<String>,
+}
+
+fn known_cli_default(binary_name: &str) -> CliDefaults {
     match binary_name {
-        "claude" => (
-            vec![
+        "claude" => CliDefaults {
+            args: vec![
                 "-p".into(),
                 "--output-format".into(),
                 "stream-json".into(),
                 "--verbose".into(),
             ],
-            Some("--system-prompt".into()),
-            Some(StreamDialect::ClaudeJson),
-        ),
-        "agy" => (
-            vec!["--output-format".into(), "stream-json".into(), "-p".into()],
-            None,
-            Some(StreamDialect::AgyJson),
-        ),
-        _ => (Vec::new(), None, None),
+            system_arg: Some("--system-prompt".into()),
+            dialect: Some(StreamDialect::ClaudeJson),
+            workspace_arg: Some("--add-dir".into()),
+        },
+        // `--sandbox` runs agy under its own terminal restrictions, which is what
+        // lets it work without prompting for permission on every command. Its
+        // `--print-timeout` defaults to 5m, short enough to clip a real delegated
+        // task; raised well past that so simon's own idle/total limits (see
+        // `local_binary`) are the ones that actually govern. Note the flag order:
+        // agy's `-p` takes the NEXT argument as its prompt, so every flag must
+        // precede it.
+        "agy" => CliDefaults {
+            args: vec![
+                "--sandbox".into(),
+                "--print-timeout".into(),
+                "30m".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "-p".into(),
+            ],
+            system_arg: None,
+            dialect: Some(StreamDialect::AgyJson),
+            workspace_arg: Some("--add-dir".into()),
+        },
+        _ => CliDefaults {
+            args: Vec::new(),
+            system_arg: None,
+            dialect: None,
+            workspace_arg: None,
+        },
     }
 }
 
@@ -370,6 +416,12 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
             args: spec.args.clone(),
             system_arg: spec.system_arg.clone(),
             dialect,
+            // Tied to the declared dialect rather than the entry's name: declaring
+            // `stream_format = "claude"` or `"agy"` is a statement that this binary
+            // IS that CLI, and both of them spell the flag `--add-dir`. A custom CLI
+            // with no dialect gets nothing, since an unknown binary handed an
+            // unknown flag would just fail to start.
+            workspace_arg: dialect.map(|_| "--add-dir".to_string()),
         });
     }
 
@@ -378,13 +430,14 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
             continue;
         }
         if let Some(path) = which_on_path(name) {
-            let (args, system_arg, dialect) = known_cli_default(name);
+            let defaults = known_cli_default(name);
             found.push(CliSpec {
                 binary_name: name.to_string(),
                 path,
-                args,
-                system_arg,
-                dialect,
+                args: defaults.args,
+                system_arg: defaults.system_arg,
+                dialect: defaults.dialect,
+                workspace_arg: defaults.workspace_arg,
             });
         }
     }
@@ -703,11 +756,14 @@ fn construct_provider(
             let p = LocalBinaryProvider::new(
                 &cli.binary_name,
                 &path,
-                cli.args.clone(),
                 &model,
-                cli.system_arg.clone(),
                 project_root.to_path_buf(),
-                cli.dialect,
+                CliInvocation {
+                    args: cli.args.clone(),
+                    system_arg: cli.system_arg.clone(),
+                    dialect: cli.dialect,
+                    workspace_arg: cli.workspace_arg.clone(),
+                },
             )?;
             Ok(Arc::new(p))
         }
@@ -1707,28 +1763,28 @@ mod tests {
 
     #[test]
     fn agy_is_auto_detected_with_streaming_flags_before_p_and_no_system_flag() {
-        let (args, system_arg, dialect) = known_cli_default("agy");
+        let defaults = known_cli_default("agy");
         // Flags must precede `-p` for `agy`: `agy -p --output-format ...` is broken
         // (it takes `--output-format` as the prompt), so `-p` has to be last.
-        assert_eq!(
-            args,
-            vec![
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "-p".to_string()
-            ]
-        );
+        assert_eq!(defaults.args.last().unwrap(), "-p");
+        assert!(defaults.args.contains(&"stream-json".to_string()));
+        // `--sandbox` is what lets agy run its own tools without prompting for a
+        // permission it cannot ask for in print mode.
+        assert!(defaults.args.contains(&"--sandbox".to_string()));
+        // agy's own print timeout defaults to 5m, short enough to clip a real task.
+        assert!(defaults.args.contains(&"--print-timeout".to_string()));
         // Verified against `agy --help` on this machine: there is no system-prompt
         // flag, so the system text has to be folded into the prompt.
-        assert!(system_arg.is_none());
-        assert_eq!(dialect, Some(StreamDialect::AgyJson));
+        assert!(defaults.system_arg.is_none());
+        assert_eq!(defaults.dialect, Some(StreamDialect::AgyJson));
+        assert_eq!(defaults.workspace_arg, Some("--add-dir".to_string()));
     }
 
     #[test]
     fn claude_is_auto_detected_with_streaming_flags_and_a_system_flag() {
-        let (args, system_arg, dialect) = known_cli_default("claude");
+        let defaults = known_cli_default("claude");
         assert_eq!(
-            args,
+            defaults.args,
             vec![
                 "-p".to_string(),
                 "--output-format".to_string(),
@@ -1736,16 +1792,19 @@ mod tests {
                 "--verbose".to_string()
             ]
         );
-        assert_eq!(system_arg, Some("--system-prompt".to_string()));
-        assert_eq!(dialect, Some(StreamDialect::ClaudeJson));
+        assert_eq!(defaults.system_arg, Some("--system-prompt".to_string()));
+        assert_eq!(defaults.dialect, Some(StreamDialect::ClaudeJson));
+        assert_eq!(defaults.workspace_arg, Some("--add-dir".to_string()));
     }
 
     #[test]
     fn an_unrecognised_binary_gets_no_streaming_dialect() {
-        let (args, system_arg, dialect) = known_cli_default("some-random-cli");
-        assert!(args.is_empty());
-        assert!(system_arg.is_none());
-        assert!(dialect.is_none());
+        let defaults = known_cli_default("some-random-cli");
+        assert!(defaults.args.is_empty());
+        assert!(defaults.system_arg.is_none());
+        assert!(defaults.dialect.is_none());
+        // An unknown binary handed an unknown flag would just fail to start.
+        assert!(defaults.workspace_arg.is_none());
     }
 
     // Unix-only: both this test and its sibling below hardcode `/bin/echo`, which

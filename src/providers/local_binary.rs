@@ -82,22 +82,61 @@ pub struct LocalBinaryProvider {
     /// Where the child process is spawned. See `send_with_timeout`'s use of
     /// `Command::current_dir` for what this does and, importantly, does not do.
     project_root: PathBuf,
+    /// The flag this CLI uses to declare an additional allowed working directory
+    /// (`--add-dir` for both known agentic CLIs), or `None`. When set, it is passed
+    /// with `project_root` — see `apply_workspace_arg`.
+    workspace_arg: Option<String>,
     /// `Some` when this CLI's stdout is NDJSON progress that can be parsed and
     /// streamed to a `ProgressSink` as it arrives; `None` keeps the original
     /// buffered-until-exit behaviour.
     dialect: Option<StreamDialect>,
 }
 
+/// Adds the CLI's "additional allowed directory" flag, pointing at the project root.
+///
+/// Called BEFORE the CLI's own configured args, which matters: agy's `-p` takes the
+/// next argument as its prompt, so a flag appended after the arg list would be
+/// swallowed as the prompt text instead of parsed. Placing workspace flags first is
+/// safe for both known CLIs.
+fn apply_workspace_arg(command: &mut Command, workspace_arg: Option<&str>, project_root: &Path) {
+    if let Some(flag) = workspace_arg {
+        command.arg(flag).arg(project_root);
+    }
+}
+
+/// How to build a CLI's command line, grouped into one value.
+///
+/// These four travel together — they come from the same `CliSpec`, and they are all
+/// about the shape of the argv this CLI expects. Passing them as four positional
+/// parameters meant a constructor call ending in three bare `None`s whose meaning
+/// depended entirely on counting commas.
+#[derive(Debug, Clone, Default)]
+pub struct CliInvocation {
+    /// Fixed arguments this CLI needs before the prompt (`-p`, `--output-format`, …).
+    pub args: Vec<String>,
+    /// The flag carrying a system prompt, or `None` when the CLI has none and the
+    /// system text must be folded into the prompt instead.
+    pub system_arg: Option<String>,
+    /// The NDJSON progress dialect this CLI's stdout speaks, if any.
+    pub dialect: Option<StreamDialect>,
+    /// The flag declaring an additional allowed working directory, if any.
+    pub workspace_arg: Option<String>,
+}
+
 impl LocalBinaryProvider {
     pub fn new(
         name: impl Into<String>,
         binary_path: impl Into<String>,
-        args: Vec<String>,
         model: impl Into<String>,
-        system_arg: Option<String>,
         project_root: PathBuf,
-        dialect: Option<StreamDialect>,
+        invocation: CliInvocation,
     ) -> Result<Self> {
+        let CliInvocation {
+            args,
+            system_arg,
+            dialect,
+            workspace_arg,
+        } = invocation;
         let binary_path = binary_path.into();
         let name = name.into();
 
@@ -121,6 +160,7 @@ impl LocalBinaryProvider {
             system_arg,
             project_root,
             dialect,
+            workspace_arg,
         })
     }
 }
@@ -203,6 +243,11 @@ impl LocalBinaryProvider {
         // still `cd` anywhere it can reach and read or write outside `project_root`
         // — this only sets the starting point, nothing more.
         command.current_dir(&self.project_root);
+        apply_workspace_arg(
+            &mut command,
+            self.workspace_arg.as_deref(),
+            &self.project_root,
+        );
         command.args(&self.args);
         if let Some((flag, value)) = &system_flag {
             command.arg(flag).arg(value);
@@ -271,6 +316,11 @@ impl LocalBinaryProvider {
         // See `send_with_timeout`'s identical line for why `current_dir` is set and,
         // importantly, what it does not guarantee.
         command.current_dir(&self.project_root);
+        apply_workspace_arg(
+            &mut command,
+            self.workspace_arg.as_deref(),
+            &self.project_root,
+        );
         command.args(&self.args);
         if let Some((flag, value)) = &system_flag {
             command.arg(flag).arg(value);
@@ -647,11 +697,14 @@ mod tests {
         let err = LocalBinaryProvider::new(
             "fake",
             "./definitely/not/here/binary",
-            vec![],
             "m",
-            None,
             PathBuf::from("."),
-            None,
+            CliInvocation {
+                args: vec![],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
         )
         .unwrap_err()
         .to_string();
@@ -661,8 +714,19 @@ mod tests {
     #[test]
     fn rejects_an_empty_path() {
         assert!(
-            LocalBinaryProvider::new("fake", "  ", vec![], "m", None, PathBuf::from("."), None)
-                .is_err()
+            LocalBinaryProvider::new(
+                "fake",
+                "  ",
+                "m",
+                PathBuf::from("."),
+                CliInvocation {
+                    args: vec![],
+                    system_arg: None,
+                    dialect: None,
+                    workspace_arg: None,
+                },
+            )
+            .is_err()
         );
     }
 
@@ -673,11 +737,14 @@ mod tests {
             LocalBinaryProvider::new(
                 "gh",
                 "gh",
-                vec!["copilot".into()],
                 "m",
-                None,
                 PathBuf::from("."),
-                None,
+                CliInvocation {
+                    args: vec!["copilot".into()],
+                    system_arg: None,
+                    dialect: None,
+                    workspace_arg: None,
+                },
             )
             .is_ok()
         );
@@ -688,11 +755,14 @@ mod tests {
         let p = LocalBinaryProvider::new(
             "gh",
             "gh",
-            vec![],
             "copilot",
-            None,
             PathBuf::from("."),
-            None,
+            CliInvocation {
+                args: vec![],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
         )
         .unwrap();
         assert!(p.is_remote());
@@ -706,11 +776,14 @@ mod tests {
         let p = LocalBinaryProvider::new(
             "claude",
             "claude",
-            vec![],
             "claude",
-            None,
             PathBuf::from("."),
-            None,
+            CliInvocation {
+                args: vec![],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
         )
         .unwrap();
         assert_eq!(p.label(), "claude");
@@ -723,11 +796,14 @@ mod tests {
         let p = LocalBinaryProvider::new(
             "agy",
             "agy",
-            vec![],
             "gemini-3-pro",
-            None,
             PathBuf::from("."),
-            None,
+            CliInvocation {
+                args: vec![],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
         )
         .unwrap();
         assert_eq!(p.label(), "agy:gemini-3-pro");
@@ -808,11 +884,14 @@ mod tests {
         let p = LocalBinaryProvider::new(
             "slow",
             "/bin/sleep",
-            vec![],
             "slow",
-            None,
             PathBuf::from("."),
-            None,
+            CliInvocation {
+                args: vec![],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
         )
         .unwrap();
         let err = p
@@ -832,11 +911,14 @@ mod tests {
         let p = LocalBinaryProvider::new(
             "echoer",
             "/bin/echo",
-            vec![],
             "echoer",
-            None,
             PathBuf::from("."),
-            None,
+            CliInvocation {
+                args: vec![],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
         )
         .unwrap();
         let reply = p
@@ -848,6 +930,63 @@ mod tests {
 
     // Unix-only: depends on `pwd` and `/bin/echo`-style bare-argv spawning; the
     // reasoning is the same as the sibling tests above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_workspace_flag_reaches_the_command_line_before_the_cli_own_args() {
+        // Order is the point, not just presence: `agy`'s `-p` takes the NEXT argument
+        // as its prompt, so a workspace flag appended after the configured args would
+        // be swallowed as prompt text. `echo` reports argv back, so this checks the
+        // real command line rather than a struct field.
+        let project = tempfile::tempdir().unwrap();
+        let expected = std::fs::canonicalize(project.path()).unwrap();
+        let p = LocalBinaryProvider::new(
+            "echo",
+            "/bin/echo",
+            "echo",
+            project.path().to_path_buf(),
+            CliInvocation {
+                args: vec!["--configured-arg".into()],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: Some("--add-dir".into()),
+            },
+        )
+        .unwrap();
+        let reply = p
+            .send_with_timeout(None, "the-prompt", Duration::from_secs(5))
+            .await
+            .unwrap();
+        let expected_line = format!(
+            "--add-dir {} --configured-arg the-prompt",
+            expected.to_string_lossy()
+        );
+        assert_eq!(reply.text.trim(), expected_line);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn no_workspace_flag_leaves_the_command_line_untouched() {
+        let project = tempfile::tempdir().unwrap();
+        let p = LocalBinaryProvider::new(
+            "echo",
+            "/bin/echo",
+            "echo",
+            project.path().to_path_buf(),
+            CliInvocation {
+                args: vec!["--configured-arg".into()],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+        let reply = p
+            .send_with_timeout(None, "the-prompt", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(reply.text.trim(), "--configured-arg the-prompt");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn the_child_is_spawned_inside_the_configured_project_root() {
@@ -869,11 +1008,14 @@ mod tests {
         let p = LocalBinaryProvider::new(
             "sh",
             "/bin/sh",
-            vec!["-c".into(), "pwd".into()],
             "sh",
-            None,
             project.path().to_path_buf(),
-            None,
+            CliInvocation {
+                args: vec!["-c".into(), "pwd".into()],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
         )
         .unwrap();
         let reply = p
@@ -1024,15 +1166,18 @@ mod tests {
         let p = LocalBinaryProvider::new(
             "sh",
             "/bin/sh",
-            vec![
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec![
                 "-c".into(),
                 r#"printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"description":"Read the readme"}}]}}' '{"type":"result","subtype":"success","is_error":false,"result":"all good"}'"#
                     .into(),
             ],
-            "sh",
-            None,
-            PathBuf::from("."),
-            Some(StreamDialect::ClaudeJson),
+                system_arg: None,
+                dialect: Some(StreamDialect::ClaudeJson),
+                workspace_arg: None,
+            },
         )
         .unwrap();
 
@@ -1055,15 +1200,18 @@ mod tests {
         let p = LocalBinaryProvider::new(
             "sh",
             "/bin/sh",
-            vec![
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec![
                 "-c".into(),
                 r#"printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"partial reply"}]}}'"#
                     .into(),
             ],
-            "sh",
-            None,
-            PathBuf::from("."),
-            Some(StreamDialect::ClaudeJson),
+                system_arg: None,
+                dialect: Some(StreamDialect::ClaudeJson),
+                workspace_arg: None,
+            },
         )
         .unwrap();
 

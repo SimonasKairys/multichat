@@ -15,7 +15,10 @@ use crate::app::ActivityKind;
 use crate::audit::AuditLogger;
 use crate::config::{ConnectionSpec, Credentials, Paths, Settings, Transport};
 use crate::providers::{
-    Provider, cloud::CloudProvider, http_client, local_binary::LocalBinaryProvider,
+    ProgressSink, Provider,
+    cloud::CloudProvider,
+    http_client,
+    local_binary::{LocalBinaryProvider, StreamDialect},
     ollama::OllamaProvider,
 };
 use crate::skills::SkillsDir;
@@ -88,6 +91,14 @@ pub enum Event {
     /// `App::apply`), so a `TurnComplete`, `Reply`, `Error`, `DelegationFinished`, or
     /// `SkillLoaded` that follows is what ends it, not a paired stop event here.
     ActivityStarted { label: String, kind: ActivityKind },
+    /// A streaming CLI provider reported progress (a tool call, a step) while its
+    /// call is still in flight. `label` matches the `ActivityStarted` this updates —
+    /// see `App::apply`, which folds this into the existing activity in place rather
+    /// than treating it as a new one. Never logged to the audit trail: this is
+    /// high-volume, third-party CLI output, not something simon itself decided to
+    /// do — see the audit log's existing rule against putting tool output or file
+    /// contents into the log.
+    ActivityProgress { label: String, detail: String },
     /// A model wrote a file into the sandboxed workspace via `ACTION: write_file`.
     /// Carries only the path — never content, same reasoning as `WrittenFile` in
     /// `swarm.rs` — so the user can see that a write happened without this event
@@ -128,6 +139,12 @@ pub enum Event {
 /// length instead of a turn's total effort.
 const MAX_TASK_DISPLAY_CHARS: usize = 120;
 
+/// Ceiling on how much of a single streaming-CLI progress detail is kept before it
+/// reaches an `Event::ActivityProgress`. Mirrors `MAX_TASK_DISPLAY_CHARS`'s reasoning,
+/// just for a status-line detail instead of a transcript line — short enough that it
+/// never wraps the status line on its own.
+const MAX_PROGRESS_DETAIL_CHARS: usize = 80;
+
 /// Truncates `s` to at most `max_chars` characters, appending `…` when cut. Same
 /// char-boundary-safe approach as `swarm::record_result`/`providers::truncate_error_detail`
 /// (and the panic class commit `923b934` fixed in `cloud.rs`): `s` here is a
@@ -138,6 +155,19 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
         Some((cut, _)) => format!("{}…", &s[..cut]),
         None => s.to_string(),
     }
+}
+
+/// Sanitises one streaming-CLI progress detail before it reaches an
+/// `Event::ActivityProgress`. This is third-party process output — a `tool_use`
+/// description, a step's `text_delta` — not text simon itself produced, so it is
+/// treated the same as any other untrusted model/tool output reaching the TUI:
+/// control characters (which includes `\n`/`\r`) are stripped so a detail line can
+/// never smuggle a terminal escape sequence or turn one status line into several, and
+/// the result is truncated with `truncate_chars`, never a raw byte index — the same
+/// panic class commit `923b934` fixed in `cloud.rs`.
+fn sanitize_progress_detail(raw: &str) -> String {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    truncate_chars(cleaned.trim(), MAX_PROGRESS_DETAIL_CHARS)
 }
 
 /// Whether a candidate connection can actually be constructed right now.
@@ -162,6 +192,11 @@ pub struct CliSpec {
     pub path: String,
     pub args: Vec<String>,
     pub system_arg: Option<String>,
+    /// `Some` when this CLI's stdout is a recognised NDJSON progress dialect;
+    /// resolved once here (from `known_cli_default` or a validated
+    /// `LocalBinarySpec::stream_format`) so `construct_provider` never has to
+    /// re-parse or re-validate it.
+    pub dialect: Option<StreamDialect>,
 }
 
 /// One way to reach a [`Candidate`]: a specific transport, its availability, and
@@ -221,17 +256,39 @@ fn cli_vendor_id(binary_name: &str) -> String {
     }
 }
 
-/// Args and system-prompt flag for a CLI this build knows how to auto-detect.
-/// Verified against `--help` and a live call on this machine:
-/// `claude` takes `--system-prompt <prompt>`; `agy` (Antigravity) has `-p` but no
-/// system flag at all, so its system text is folded into the prompt (see
-/// `LocalBinaryProvider::send`). `codex` and `llm` are unverified best guesses,
-/// treated the same as `agy` until someone confirms their real flags.
-fn known_cli_default(binary_name: &str) -> (Vec<String>, Option<String>) {
+/// Args, system-prompt flag, and NDJSON dialect for a CLI this build knows how to
+/// auto-detect. Verified live on this machine (see the ground truth captured on the
+/// task this streaming support was built from):
+///
+/// - `claude`: flags before the prompt — `-p --output-format stream-json --verbose`
+///   — plus `--system-prompt <text>`, streaming the `ClaudeJson` dialect.
+/// - `agy` (Antigravity): flags must precede `-p` — `--output-format stream-json -p`
+///   — with `-p` anywhere after them breaks nothing, but `-p --output-format ...`
+///   does: `agy` takes `--output-format` itself as the prompt in that order. No
+///   system-prompt flag at all, so its system text is folded into the prompt (see
+///   `LocalBinaryProvider::send`). Streams the `AgyJson` dialect.
+///
+/// `codex` and `llm` are unverified best guesses, treated the same as before: no
+/// args, no system flag, and no streaming dialect until someone confirms their real
+/// shape.
+fn known_cli_default(binary_name: &str) -> (Vec<String>, Option<String>, Option<StreamDialect>) {
     match binary_name {
-        "claude" => (vec!["-p".into()], Some("--system-prompt".into())),
-        "agy" => (vec!["-p".into()], None),
-        _ => (Vec::new(), None),
+        "claude" => (
+            vec![
+                "-p".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+            ],
+            Some("--system-prompt".into()),
+            Some(StreamDialect::ClaudeJson),
+        ),
+        "agy" => (
+            vec!["--output-format".into(), "stream-json".into(), "-p".into()],
+            None,
+            Some(StreamDialect::AgyJson),
+        ),
+        _ => (Vec::new(), None, None),
     }
 }
 
@@ -249,11 +306,29 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
 
     for (name, spec) in &settings.local_binaries {
         configured.insert(name.clone());
+        // A hand-configured CLI keeps dialect `None` (the plain-text path) unless the
+        // user opts in via `stream_format`. An unrecognised value is a clear
+        // discovery-time error, not a silent fallback to non-streaming — the whole
+        // point of validating here rather than swallowing it into `None` — so the
+        // entry is skipped entirely and explained on stderr, the same visibility
+        // `Registry::build`'s `eprintln!("[discovery] skipping ...")` gives a bad
+        // path or a missing key.
+        let dialect = match &spec.stream_format {
+            None => None,
+            Some(fmt) => match StreamDialect::parse(fmt) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    eprintln!("[discovery] local binary `{name}`: {e}");
+                    continue;
+                }
+            },
+        };
         found.push(CliSpec {
             binary_name: name.clone(),
             path: spec.path.clone(),
             args: spec.args.clone(),
             system_arg: spec.system_arg.clone(),
+            dialect,
         });
     }
 
@@ -262,12 +337,13 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
             continue;
         }
         if let Some(path) = which_on_path(name) {
-            let (args, system_arg) = known_cli_default(name);
+            let (args, system_arg, dialect) = known_cli_default(name);
             found.push(CliSpec {
                 binary_name: name.to_string(),
                 path,
                 args,
                 system_arg,
+                dialect,
             });
         }
     }
@@ -590,6 +666,7 @@ fn construct_provider(
                 &model,
                 cli.system_arg.clone(),
                 project_root.to_path_buf(),
+                cli.dialect,
             )?;
             Ok(Arc::new(p))
         }
@@ -885,6 +962,34 @@ impl Orchestrator {
         let _ = self.events.send(event).await;
     }
 
+    /// Sets up progress reporting for one provider call: a `ProgressSink` to hand to
+    /// `send_with_progress`, and a background task that forwards whatever it
+    /// receives into `Event::ActivityProgress { label, .. }`, sanitising each detail
+    /// first (see `sanitize_progress_detail`).
+    ///
+    /// The forwarding task ends on its own once the call is over: the returned
+    /// `ProgressSink` is the only sender for its channel, so once the caller drops it
+    /// (falling out of scope at the end of the `send_with_progress` call is enough —
+    /// see both call sites), `rx.recv()` returns `None` and the task's loop exits.
+    /// Nothing here needs to be joined or cancelled explicitly.
+    fn spawn_progress_forwarder(&self, label: String) -> ProgressSink {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            while let Some(detail) = rx.recv().await {
+                // A closed UI channel here just means the session is shutting down;
+                // dropping the rest of the progress stream is correct, same as `emit`.
+                let _ = events
+                    .send(Event::ActivityProgress {
+                        label: label.clone(),
+                        detail: sanitize_progress_detail(&detail),
+                    })
+                    .await;
+            }
+        });
+        ProgressSink::new(tx)
+    }
+
     /// Assembles the system prompt: ledger blackboard plus any skills on disk.
     fn system_prompt(&self) -> String {
         let mut prompt = self.ledger.system_prompt();
@@ -1034,7 +1139,11 @@ impl Orchestrator {
         .await;
 
         let system = self.system_prompt();
-        let reply = match provider.send(Some(&system), prompt).await {
+        let progress = self.spawn_progress_forwarder(primary_label.clone());
+        let reply = match provider
+            .send_with_progress(Some(&system), prompt, &progress)
+            .await
+        {
             Ok(reply) => reply,
             Err(e) => {
                 let _ = self
@@ -1045,6 +1154,10 @@ impl Orchestrator {
                 return;
             }
         };
+        // Drops the sink, closing the forwarding task's channel — see
+        // `spawn_progress_forwarder`'s doc comment for why that's all the cleanup it
+        // needs.
+        drop(progress);
 
         if let Some(budget) = reply.rate_limit.summary() {
             self.ledger.update_budget(&primary_label, &budget);
@@ -1121,7 +1234,14 @@ impl Orchestrator {
 
             let system = self.system_prompt();
             let started = Instant::now();
-            match target.send(Some(&system), &delegation.prompt).await {
+            let progress = self.spawn_progress_forwarder(target_label.clone());
+            let outcome = target
+                .send_with_progress(Some(&system), &delegation.prompt, &progress)
+                .await;
+            // Drops the sink, closing the forwarding task's channel — see
+            // `spawn_progress_forwarder`'s doc comment.
+            drop(progress);
+            match outcome {
                 Ok(reply) => {
                     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     if let Some(budget) = reply.rate_limit.summary() {
@@ -1538,12 +1658,46 @@ mod tests {
     }
 
     #[test]
-    fn agy_is_auto_detected_with_print_mode_and_no_system_flag() {
-        let (args, system_arg) = known_cli_default("agy");
-        assert_eq!(args, vec!["-p".to_string()]);
+    fn agy_is_auto_detected_with_streaming_flags_before_p_and_no_system_flag() {
+        let (args, system_arg, dialect) = known_cli_default("agy");
+        // Flags must precede `-p` for `agy`: `agy -p --output-format ...` is broken
+        // (it takes `--output-format` as the prompt), so `-p` has to be last.
+        assert_eq!(
+            args,
+            vec![
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "-p".to_string()
+            ]
+        );
         // Verified against `agy --help` on this machine: there is no system-prompt
         // flag, so the system text has to be folded into the prompt.
         assert!(system_arg.is_none());
+        assert_eq!(dialect, Some(StreamDialect::AgyJson));
+    }
+
+    #[test]
+    fn claude_is_auto_detected_with_streaming_flags_and_a_system_flag() {
+        let (args, system_arg, dialect) = known_cli_default("claude");
+        assert_eq!(
+            args,
+            vec![
+                "-p".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string()
+            ]
+        );
+        assert_eq!(system_arg, Some("--system-prompt".to_string()));
+        assert_eq!(dialect, Some(StreamDialect::ClaudeJson));
+    }
+
+    #[test]
+    fn an_unrecognised_binary_gets_no_streaming_dialect() {
+        let (args, system_arg, dialect) = known_cli_default("some-random-cli");
+        assert!(args.is_empty());
+        assert!(system_arg.is_none());
+        assert!(dialect.is_none());
     }
 
     // Unix-only: both this test and its sibling below hardcode `/bin/echo`, which
@@ -1570,6 +1724,7 @@ mod tests {
                 path: "/bin/echo".into(),
                 args: vec![],
                 system_arg: None,
+                stream_format: None,
             },
         );
         let mut connections = BTreeMap::new();
@@ -1614,6 +1769,7 @@ mod tests {
                 path: "/bin/echo".into(),
                 args: vec![],
                 system_arg: None,
+                stream_format: None,
             },
         );
         let mut connections = BTreeMap::new();

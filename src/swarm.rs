@@ -146,6 +146,48 @@ pub struct ListedFiles {
     pub outcome: String,
 }
 
+/// A one-line cost/context hint for a roster label, or `None` when nothing useful is
+/// known about it.
+///
+/// This exists to make delegation a *cheap* default rather than just an available
+/// one. The commander is told to hand work off (see the delegation protocol in
+/// `system_prompt`), but "delegate" is useless advice without knowing which model to
+/// delegate to — a commander that hands a bulk-reading task to the most expensive
+/// model in the roster has made things worse, not better. Annotating each label with
+/// what it costs and how much context it holds is what lets the instruction "pick the
+/// cheapest model that can do the task" actually be followed.
+///
+/// Deliberately coarse and hand-maintained. Real per-token pricing changes under us
+/// and is not something this project can track; the relative ordering (local < cheap
+/// cloud < frontier) is stable enough to be worth stating, and is all the commander
+/// needs to choose. Matching is on the provider prefix, with the model name as a
+/// fallback, because the same vendor shows up under several labels (`claude:claude`
+/// for the CLI, `anthropic:claude-opus-5` for the API).
+fn model_hint(label: &str) -> Option<&'static str> {
+    let (provider, model) = label.split_once(':').unwrap_or((label, ""));
+
+    match provider {
+        "ollama" => Some("local · free · no quota · smallest context"),
+        "agy" | "google" => Some("cheap · very large context · good for bulk reading and search"),
+        "groq" => Some("cheap · fast · moderate context"),
+        "openai" => Some("mid cost · moderate context"),
+        "claude" | "anthropic" => {
+            Some("most expensive · strongest reasoning · reserve for judgement and synthesis")
+        }
+        _ => {
+            // An OpenRouter (or other aggregate) label carries the real vendor in the
+            // model half, so fall back to that rather than reporting nothing.
+            if model.contains("gemini") {
+                Some("cheap · very large context · good for bulk reading and search")
+            } else if model.contains("claude") {
+                Some("most expensive · strongest reasoning · reserve for judgement and synthesis")
+            } else {
+                None
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SwarmLedger {
     tasks: Vec<Task>,
@@ -367,7 +409,10 @@ impl SwarmLedger {
             out.push_str("No other models are reachable.\n");
         } else {
             for label in &self.roster {
-                out.push_str(&format!("- {label}\n"));
+                match model_hint(label) {
+                    Some(hint) => out.push_str(&format!("- {label} — {hint}\n")),
+                    None => out.push_str(&format!("- {label}\n")),
+                }
             }
         }
 
@@ -459,14 +504,32 @@ impl SwarmLedger {
 
         out.push_str(
             "\n### Delegation protocol\n\
-             You are one model in a multi-model swarm. To hand work to another model, \
-             emit a line of exactly this form:\n\
+             You are the commander of a multi-model swarm, and delegating is your \
+             DEFAULT, not a fallback. The other models exist so that the bulk work — \
+             reading files, searching, summarising, drafting, checking — runs on a \
+             cheaper model than you. Doing that work yourself when a cheaper model in \
+             the roster could have done it is the main way to get this wrong.\n\
+             Keep for yourself only what delegation cannot do: deciding what needs \
+             doing, choosing who does it, judgement calls, and stitching sub-agent \
+             results into the final answer. Delegate everything else.\n\
+             To hand work to another model, emit a line of exactly this form:\n\
              `ACTION: delegate_task(<model label>, <prompt>)`\n\
-             Use a label from the list above. Check the budgets first and prefer a model \
-             with capacity; local models have no quota. Emit nothing after the line. The \
-             result (or, on failure, the error) is recorded in this ledger under the task \
-             and becomes visible to you on your NEXT turn — not this one, since this reply \
-             is already on its way out when the sub-agent runs.\n",
+             Use a label from the \"Available models\" list above, which annotates each \
+             model with what it costs and how much context it holds. Pick the CHEAPEST \
+             model that can do the task, not the strongest one — a large-context, \
+             low-cost model is the right choice for reading and summarising, and the \
+             expensive ones should be reserved for reasoning you cannot delegate. \
+             Check the budgets first and prefer a model with capacity; local models \
+             have no quota and cost nothing.\n\
+             A sub-agent does NOT see this conversation, this ledger, or the user's \
+             question — its prompt is all it gets, so state the full task and the \
+             context it needs in the prompt itself. You may emit up to 3 delegation \
+             lines in one turn; they run one after another, not at the same time. The \
+             result (or, on failure, the error) is recorded in this ledger under the \
+             task and becomes visible to you on your NEXT turn — not this one, since \
+             this reply is already on its way out when the sub-agent runs. So do not \
+             promise the user an answer in the same turn you delegate: say what you \
+             have handed out, and deliver the synthesis next turn.\n",
         );
 
         out.push_str(
@@ -484,18 +547,20 @@ impl SwarmLedger {
 
         out.push_str(
             "\n### File write protocol\n\
-             To create or overwrite a file in your private workspace directory, emit \
-             exactly this form:\n\
+             To create or overwrite a file in the project folder, emit exactly this \
+             form:\n\
              `ACTION: write_file(<relative path>)`\n\
              followed by the file's content, one line at a time, followed by a line of \
-             exactly `ACTION: end_file`. Paths are relative to the workspace; \
-             subdirectories are created automatically. Files are capped at 256KB. A \
-             line exactly `ACTION: end_file` cannot appear inside the content — it \
-             always closes the block there instead. `ACTION: delegate_task(...)` and \
-             `ACTION: read_skill(...)` lines inside the content are treated as \
-             content, not executed. Like a delegation result, the outcome is recorded \
-             in this ledger and becomes visible to you on your NEXT turn, not this \
-             one.\n",
+             exactly `ACTION: end_file`. Paths are relative to the project root; \
+             subdirectories are created automatically. Files are capped at 256KB. \
+             Writes into `.git/` are refused — a bad write there can corrupt the \
+             repository. A line exactly `ACTION: end_file` cannot appear inside the \
+             content — it always closes the block there instead. `ACTION: \
+             delegate_task(...)`, `ACTION: read_skill(...)`, `ACTION: read_file(...)`, \
+             and `ACTION: list_files(...)` lines inside the content are treated as \
+             content, not executed, so you can safely write documentation about this \
+             protocol. Like a delegation result, the outcome is recorded in this \
+             ledger and becomes visible to you on your NEXT turn, not this one.\n",
         );
 
         out.push_str(
@@ -1166,6 +1231,80 @@ mod tests {
         assert!(text.contains("ACTION: write_file"));
         assert!(text.contains("ACTION: end_file"));
         assert!(text.contains("NEXT turn"));
+    }
+
+    #[test]
+    fn the_delegation_protocol_makes_delegating_the_default_not_a_fallback() {
+        let text = SwarmLedger::new().system_prompt();
+        // The whole point of the rewrite: a commander that reads this must come away
+        // knowing it is supposed to hand work off, and to the *cheapest* model that
+        // can do it — not merely that delegation is available to it.
+        assert!(text.contains("DEFAULT, not a fallback"));
+        assert!(text.contains("CHEAPEST"));
+        assert!(text.contains("ACTION: delegate_task"));
+    }
+
+    #[test]
+    fn the_delegation_protocol_warns_that_a_sub_agent_sees_only_its_prompt() {
+        let text = SwarmLedger::new().system_prompt();
+        assert!(text.contains("does NOT see this conversation"));
+        // Sub-agents run sequentially (see `run_delegations`), so the prompt must not
+        // imply they run at the same time.
+        assert!(text.contains("one after another, not at the same time"));
+    }
+
+    #[test]
+    fn the_roster_annotates_each_model_with_cost_and_context() {
+        let mut ledger = SwarmLedger::new();
+        // A CLI provider's label collapses to a bare name (`agy`, `claude`) because
+        // its provider and model halves are the same; an API provider keeps both
+        // halves. Both shapes must resolve, so both are exercised here.
+        ledger.set_roster(vec![
+            "agy".to_string(),
+            "claude".to_string(),
+            "anthropic:claude-opus-5".to_string(),
+            "ollama:llama3.2:3b".to_string(),
+        ]);
+        let text = ledger.system_prompt();
+        assert!(text.contains("- agy — cheap · very large context"));
+        assert!(text.contains("- claude — most expensive"));
+        assert!(text.contains("- anthropic:claude-opus-5 — most expensive"));
+        assert!(text.contains("- ollama:llama3.2:3b — local · free"));
+    }
+
+    #[test]
+    fn an_unknown_model_label_is_listed_without_an_invented_hint() {
+        // Better to say nothing than to guess a cost for a provider this table has
+        // never heard of — a wrong hint would actively mislead the commander's choice.
+        let mut ledger = SwarmLedger::new();
+        ledger.set_roster(vec!["mystery:thing-v1".to_string()]);
+        let text = ledger.system_prompt();
+        assert!(text.contains("- mystery:thing-v1\n"));
+        assert!(!text.contains("mystery:thing-v1 —"));
+    }
+
+    #[test]
+    fn an_aggregate_label_falls_back_to_the_vendor_in_the_model_half() {
+        assert_eq!(
+            model_hint("openrouter:google/gemini-2.5-pro"),
+            model_hint("agy:agy")
+        );
+        assert_eq!(
+            model_hint("openrouter:anthropic/claude-opus-5"),
+            model_hint("anthropic:claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn the_file_write_protocol_text_names_the_project_folder_not_a_workspace() {
+        let text = SwarmLedger::new().system_prompt();
+        assert!(text.contains("in the project folder"));
+        assert!(text.contains("`.git/` are refused"));
+        // Every action a model can emit must be listed as safe inside file content,
+        // or a model writing docs about this protocol will avoid mentioning some.
+        assert!(text.contains("ACTION: read_file(...)`"));
+        assert!(text.contains("ACTION: list_files(...)`"));
+        assert!(!text.contains("private workspace directory"));
     }
 
     #[test]

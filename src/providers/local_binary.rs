@@ -7,20 +7,67 @@
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::providers::{Provider, RateLimit, Reply};
+use crate::providers::{ProgressSink, Provider, RateLimit, Reply};
 
 /// Ceiling on captured output, so a runaway child cannot exhaust memory.
 const MAX_OUTPUT_BYTES: usize = 1 << 20;
 
-/// Ceiling on how long a subprocess call may run. Matches the 300s HTTP timeout in
-/// `providers::http_client` (`src/providers/mod.rs`) so both transports fail on the
-/// same clock — a CLI tool should not be allowed to hang the session indefinitely
-/// just because it has no network timeout of its own.
-const CLI_TIMEOUT: Duration = Duration::from_secs(300);
+/// Ceiling on how long a *non-streaming* CLI call may run. There is nothing to reset
+/// this clock on — a plain `claude -p` (no `--output-format stream-json`) buffers all
+/// output until exit, so simon sees nothing until the child is already done — so this
+/// stays a flat wall-clock timeout, unlike the streaming path below. Raised from the
+/// original 300s (which matched `providers::http_client`'s HTTP timeout) to 900s:
+/// that 300s figure was calibrated for a single network round trip, not for a CLI
+/// that may be doing real agentic work under the hood with no way to show progress.
+const CLI_TIMEOUT_NONSTREAMING: Duration = Duration::from_secs(900);
+
+/// For a *streaming* CLI, idle timeout: the clock resets on every line received on
+/// stdout. An agent that is genuinely working — long tool calls, a slow model behind
+/// it — never trips this as long as it keeps emitting NDJSON progress; a wedged one
+/// (hung on an interactive prompt, deadlocked) still gets killed within this long of
+/// going silent.
+const CLI_IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Absolute backstop for a streaming CLI, independent of the idle timer above: caps
+/// total wall-clock time even if the child never goes quiet for `CLI_IDLE_TIMEOUT` at
+/// a stretch, so a CLI that streams *something* every couple of minutes forever still
+/// cannot hold the session hostage indefinitely.
+const CLI_TOTAL_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Which NDJSON dialect a streaming CLI speaks. `None` (i.e. `Option<StreamDialect>`
+/// on `LocalBinaryProvider`, not a variant here) means the original plain-text path:
+/// buffer the child's stdout to completion and treat it as the whole reply, unchanged
+/// from before this feature existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDialect {
+    /// `claude -p --output-format stream-json --verbose`.
+    ClaudeJson,
+    /// `agy --output-format stream-json -p` (flags must precede `-p` for this CLI).
+    AgyJson,
+}
+
+impl StreamDialect {
+    /// Parses a `stream_format` config value (or `known_cli_default`'s hardcoded
+    /// choice). Rejects anything unrecognised with a clear error instead of silently
+    /// falling back to the non-streaming path — a typo in a hand-written config
+    /// should never quietly downgrade a CLI's behaviour.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "claude" => Ok(StreamDialect::ClaudeJson),
+            "agy" => Ok(StreamDialect::AgyJson),
+            other => Err(anyhow!(
+                "unknown stream_format `{other}`; expected \"claude\" or \"agy\""
+            )),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct LocalBinaryProvider {
@@ -35,6 +82,10 @@ pub struct LocalBinaryProvider {
     /// Where the child process is spawned. See `send_with_timeout`'s use of
     /// `Command::current_dir` for what this does and, importantly, does not do.
     project_root: PathBuf,
+    /// `Some` when this CLI's stdout is NDJSON progress that can be parsed and
+    /// streamed to a `ProgressSink` as it arrives; `None` keeps the original
+    /// buffered-until-exit behaviour.
+    dialect: Option<StreamDialect>,
 }
 
 impl LocalBinaryProvider {
@@ -45,6 +96,7 @@ impl LocalBinaryProvider {
         model: impl Into<String>,
         system_arg: Option<String>,
         project_root: PathBuf,
+        dialect: Option<StreamDialect>,
     ) -> Result<Self> {
         let binary_path = binary_path.into();
         let name = name.into();
@@ -68,6 +120,7 @@ impl LocalBinaryProvider {
             model: model.into(),
             system_arg,
             project_root,
+            dialect,
         })
     }
 }
@@ -197,12 +250,311 @@ impl LocalBinaryProvider {
             rate_limit: RateLimit::default(),
         })
     }
+
+    /// Runs a streaming CLI: spawns with piped stdout/stderr, parses each stdout line
+    /// as one NDJSON event via `dialect`, forwards progress details to `progress`, and
+    /// accumulates the reply text. Mirrors `send_with_timeout`'s shape (compose the
+    /// call, spawn with `kill_on_drop`, honour `MAX_OUTPUT_BYTES`, summarize stderr on
+    /// failure) but with the timeout model described on `CLI_IDLE_TIMEOUT` and
+    /// `CLI_TOTAL_TIMEOUT` instead of a single wall clock.
+    async fn send_streaming(
+        &self,
+        dialect: StreamDialect,
+        system: Option<&str>,
+        prompt: &str,
+        progress: &ProgressSink,
+    ) -> Result<Reply> {
+        let (system_flag, effective_prompt) =
+            compose_call(self.system_arg.as_deref(), system, prompt);
+
+        let mut command = Command::new(&self.binary_path);
+        // See `send_with_timeout`'s identical line for why `current_dir` is set and,
+        // importantly, what it does not guarantee.
+        command.current_dir(&self.project_root);
+        command.args(&self.args);
+        if let Some((flag, value)) = &system_flag {
+            command.arg(flag).arg(value);
+        }
+        command.arg(effective_prompt);
+        command.kill_on_drop(true);
+        // The prompt is passed as an argv entry (above), not over stdin, so the child
+        // needs none — and must not inherit simon's own stdin, which in the TUI is the
+        // terminal in raw mode. `send_with_timeout`'s non-streaming path leaves stdin
+        // inherited (unchanged, pre-existing behaviour); this only affects the new
+        // streaming path.
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to run {}", self.binary_path))?;
+        // `.expect` is safe: both were just set to `Stdio::piped()` above, so tokio
+        // always populates these handles on a successful spawn.
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+
+        // Drained concurrently with stdout so a chatty stderr can never fill its pipe
+        // buffer and deadlock the child against a `send_streaming` that is only
+        // reading stdout. Best-effort: a read error here just yields an empty
+        // summary, which is no worse than today's non-streaming stderr handling on a
+        // process that dies mid-write.
+        let stderr_task: tokio::task::JoinHandle<String> = tokio::spawn(async move {
+            let mut buf = String::new();
+            let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
+            buf
+        });
+
+        let mut lines = BufReader::new(stdout).lines();
+        let mut result_text: Option<String> = None;
+        let mut assistant_text = String::new();
+        let mut accumulated_bytes = 0usize;
+
+        // Not reset on each loop iteration — deliberately: `CLI_TOTAL_TIMEOUT` is a
+        // single absolute backstop across the whole call, unlike the idle timeout
+        // below, which is a fresh `tokio::time::timeout` every iteration so it
+        // resets on every line received.
+        let total_deadline = tokio::time::sleep(CLI_TOTAL_TIMEOUT);
+        tokio::pin!(total_deadline);
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut total_deadline => {
+                    // Dropping `child` here is what actually kills it — see the
+                    // `kill_on_drop` comment on `send_with_timeout`; the same
+                    // property holds here, just triggered by `select!` dropping the
+                    // losing branches instead of `tokio::time::timeout` doing it.
+                    drop(child);
+                    return Err(anyhow!(
+                        "{} timed out after {}s (total time limit for a streaming call)",
+                        self.binary_path,
+                        CLI_TOTAL_TIMEOUT.as_secs()
+                    ));
+                }
+                next = tokio::time::timeout(CLI_IDLE_TIMEOUT, lines.next_line()) => {
+                    match next {
+                        Err(_) => {
+                            drop(child);
+                            return Err(anyhow!(
+                                "{} timed out after {}s of no output",
+                                self.binary_path,
+                                CLI_IDLE_TIMEOUT.as_secs()
+                            ));
+                        }
+                        Ok(Err(e)) => {
+                            return Err(e).with_context(|| {
+                                format!("failed reading {} output", self.binary_path)
+                            });
+                        }
+                        Ok(Ok(None)) => break, // stdout closed: child is finishing up
+                        Ok(Ok(Some(line))) => {
+                            accumulated_bytes += line.len();
+                            match parse_stream_line(dialect, &line) {
+                                StreamLineEffect::Progress(detail) => progress.send(detail),
+                                StreamLineEffect::AssistantText(text) => {
+                                    if accumulated_bytes <= MAX_OUTPUT_BYTES {
+                                        assistant_text.push_str(&text);
+                                    }
+                                }
+                                StreamLineEffect::Result(text) => result_text = Some(text),
+                                // A line that isn't valid JSON, or is JSON of a shape
+                                // this dialect doesn't recognise, is skipped silently
+                                // — this is a third-party CLI's own output format and
+                                // may change under us; it must never fail the call.
+                                StreamLineEffect::Ignore => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let status = tokio::select! {
+            biased;
+            _ = &mut total_deadline => {
+                drop(child);
+                return Err(anyhow!(
+                    "{} timed out after {}s (total time limit for a streaming call)",
+                    self.binary_path,
+                    CLI_TOTAL_TIMEOUT.as_secs()
+                ));
+            }
+            status = child.wait() => {
+                status.with_context(|| format!("failed to run {}", self.binary_path))?
+            }
+        };
+
+        let stderr_text = stderr_task.await.unwrap_or_default();
+
+        if !status.success() {
+            return Err(anyhow!(
+                "{} exited with {}: {}",
+                self.binary_path,
+                status,
+                summarize_stderr(&stderr_text)
+            ));
+        }
+
+        // Prefer the dialect's terminal result event; fall back to whatever
+        // assistant-text events arrived if the stream ended without one (the child
+        // exited cleanly but the CLI's own output never sent a `result`/`result`
+        // event — treat partial progress as better than nothing).
+        let mut text = result_text.unwrap_or(assistant_text);
+        if text.len() > MAX_OUTPUT_BYTES {
+            let mut bytes = text.into_bytes();
+            bytes.truncate(MAX_OUTPUT_BYTES);
+            text = String::from_utf8_lossy(&bytes).into_owned();
+        }
+        let text = text.trim().to_string();
+
+        if text.is_empty() {
+            return Err(anyhow!("{} produced no output", self.binary_path));
+        }
+
+        Ok(Reply {
+            text,
+            rate_limit: RateLimit::default(),
+        })
+    }
+}
+
+/// What one parsed NDJSON progress line means to `send_streaming`. Kept separate from
+/// the parsing itself (`parse_stream_line` and its per-dialect helpers below) so those
+/// stay pure functions of a `&str` line, testable without spawning a process — the
+/// same reasoning `compose_call` and `summarize_stderr` are free functions for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StreamLineEffect {
+    /// A tool call or step in progress; forwarded to the `ProgressSink` verbatim.
+    Progress(String),
+    /// A chunk of assistant-authored reply text, accumulated as a fallback for when
+    /// the stream ends without a terminal result event.
+    AssistantText(String),
+    /// The dialect's terminal event: this is the final reply text, replacing whatever
+    /// `AssistantText` had accumulated so far.
+    Result(String),
+    /// Not JSON, or JSON this dialect doesn't recognise the shape of. Never an error.
+    Ignore,
+}
+
+/// Dispatches one stdout line to the parser for `dialect`.
+fn parse_stream_line(dialect: StreamDialect, line: &str) -> StreamLineEffect {
+    match dialect {
+        StreamDialect::ClaudeJson => parse_claude_line(line),
+        StreamDialect::AgyJson => parse_agy_line(line),
+    }
+}
+
+/// Parses one line of `claude -p --output-format stream-json --verbose`'s NDJSON.
+/// See the module-level ground truth this was built against: `assistant` events carry
+/// either a `tool_use` (progress) or `text` (fallback reply) content item; `result` is
+/// the terminal event; `system`/`rate_limit_event`/`user` (tool results) and anything
+/// unrecognised are ignored.
+fn parse_claude_line(line: &str) -> StreamLineEffect {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return StreamLineEffect::Ignore;
+    };
+    match value.get("type").and_then(Value::as_str) {
+        Some("assistant") => claude_assistant_effect(&value),
+        Some("result") => StreamLineEffect::Result(
+            value
+                .get("result")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        _ => StreamLineEffect::Ignore,
+    }
+}
+
+/// A tool call takes priority over any text in the same content array: an `assistant`
+/// event with a `tool_use` item is progress, not a partial reply.
+fn claude_assistant_effect(value: &Value) -> StreamLineEffect {
+    let Some(content) = value.pointer("/message/content").and_then(Value::as_array) else {
+        return StreamLineEffect::Ignore;
+    };
+    for item in content {
+        if item.get("type").and_then(Value::as_str) == Some("tool_use") {
+            let tool_name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+            // `input.description` is often present and more legible than the raw
+            // command; fall back to `input.command`, then to just the tool name.
+            let detail = item
+                .pointer("/input/description")
+                .and_then(Value::as_str)
+                .or_else(|| item.pointer("/input/command").and_then(Value::as_str));
+            return StreamLineEffect::Progress(match detail {
+                Some(d) => format!("{tool_name}: {d}"),
+                None => tool_name.to_string(),
+            });
+        }
+    }
+    for item in content {
+        if item.get("type").and_then(Value::as_str) == Some("text")
+            && let Some(text) = item.get("text").and_then(Value::as_str)
+        {
+            return StreamLineEffect::AssistantText(text.to_string());
+        }
+    }
+    StreamLineEffect::Ignore
+}
+
+/// Parses one line of `agy --output-format stream-json -p`'s NDJSON. `step_update` is
+/// progress; `result` is the terminal event carrying `result.response`; any other
+/// `event` value is ignored.
+fn parse_agy_line(line: &str) -> StreamLineEffect {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return StreamLineEffect::Ignore;
+    };
+    match value.get("event").and_then(Value::as_str) {
+        Some("step_update") => agy_step_update_effect(&value),
+        Some("result") => StreamLineEffect::Result(
+            value
+                .pointer("/result/response")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        _ => StreamLineEffect::Ignore,
+    }
+}
+
+fn agy_step_update_effect(value: &Value) -> StreamLineEffect {
+    let Some(step) = value.get("step_update") else {
+        return StreamLineEffect::Ignore;
+    };
+    let step_type = step
+        .get("step_type")
+        .and_then(Value::as_str)
+        .unwrap_or("step");
+    let detail = match step.get("tool_name").and_then(Value::as_str) {
+        Some(tool_name) => format!("{step_type}: {tool_name}"),
+        None => step_type.to_string(),
+    };
+    StreamLineEffect::Progress(detail)
 }
 
 #[async_trait]
 impl Provider for LocalBinaryProvider {
     async fn send(&self, system: Option<&str>, prompt: &str) -> Result<Reply> {
-        self.send_with_timeout(system, prompt, CLI_TIMEOUT).await
+        self.send_with_progress(system, prompt, &ProgressSink::disconnected())
+            .await
+    }
+
+    async fn send_with_progress(
+        &self,
+        system: Option<&str>,
+        prompt: &str,
+        progress: &ProgressSink,
+    ) -> Result<Reply> {
+        match self.dialect {
+            Some(dialect) => self.send_streaming(dialect, system, prompt, progress).await,
+            // No dialect configured: the original buffered-until-exit path, on the
+            // longer non-streaming wall clock — see `CLI_TIMEOUT_NONSTREAMING`.
+            None => {
+                self.send_with_timeout(system, prompt, CLI_TIMEOUT_NONSTREAMING)
+                    .await
+            }
+        }
     }
 
     fn model_name(&self) -> &str {
@@ -253,6 +605,7 @@ mod tests {
             "m",
             None,
             PathBuf::from("."),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -262,7 +615,8 @@ mod tests {
     #[test]
     fn rejects_an_empty_path() {
         assert!(
-            LocalBinaryProvider::new("fake", "  ", vec![], "m", None, PathBuf::from(".")).is_err()
+            LocalBinaryProvider::new("fake", "  ", vec![], "m", None, PathBuf::from("."), None)
+                .is_err()
         );
     }
 
@@ -277,6 +631,7 @@ mod tests {
                 "m",
                 None,
                 PathBuf::from("."),
+                None,
             )
             .is_ok()
         );
@@ -284,8 +639,16 @@ mod tests {
 
     #[test]
     fn cli_tools_count_as_remote_for_classified_mode() {
-        let p = LocalBinaryProvider::new("gh", "gh", vec![], "copilot", None, PathBuf::from("."))
-            .unwrap();
+        let p = LocalBinaryProvider::new(
+            "gh",
+            "gh",
+            vec![],
+            "copilot",
+            None,
+            PathBuf::from("."),
+            None,
+        )
+        .unwrap();
         assert!(p.is_remote());
     }
 
@@ -301,6 +664,7 @@ mod tests {
             "claude",
             None,
             PathBuf::from("."),
+            None,
         )
         .unwrap();
         assert_eq!(p.label(), "claude");
@@ -317,6 +681,7 @@ mod tests {
             "gemini-3-pro",
             None,
             PathBuf::from("."),
+            None,
         )
         .unwrap();
         assert_eq!(p.label(), "agy:gemini-3-pro");
@@ -401,6 +766,7 @@ mod tests {
             "slow",
             None,
             PathBuf::from("."),
+            None,
         )
         .unwrap();
         let err = p
@@ -424,6 +790,7 @@ mod tests {
             "echoer",
             None,
             PathBuf::from("."),
+            None,
         )
         .unwrap();
         let reply = p
@@ -460,6 +827,7 @@ mod tests {
             "sh",
             None,
             project.path().to_path_buf(),
+            None,
         )
         .unwrap();
         let reply = p
@@ -467,5 +835,162 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply.text.trim(), expected.to_string_lossy());
+    }
+
+    // --- streaming dialect parsing -----------------------------------------------
+    //
+    // Kept as pure-function tests against `parse_stream_line`/`parse_claude_line`/
+    // `parse_agy_line` directly — no process spawning — mirroring why `compose_call`
+    // and `summarize_stderr` are tested the same way above.
+
+    #[test]
+    fn claude_dialect_extracts_a_tool_use_detail() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cat README.md","description":"Read the readme"}}]}}"#;
+        assert_eq!(
+            parse_claude_line(line),
+            StreamLineEffect::Progress("Bash: Read the readme".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_dialect_falls_back_to_the_command_when_no_description_is_present() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cat README.md"}}]}}"#;
+        assert_eq!(
+            parse_claude_line(line),
+            StreamLineEffect::Progress("Bash: cat README.md".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_dialect_extracts_the_final_result_text() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"OK.","duration_ms":9312}"#;
+        assert_eq!(
+            parse_claude_line(line),
+            StreamLineEffect::Result("OK.".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_dialect_ignores_system_and_rate_limit_lines() {
+        assert_eq!(
+            parse_claude_line(r#"{"type":"system","subtype":"init"}"#),
+            StreamLineEffect::Ignore
+        );
+        assert_eq!(
+            parse_claude_line(r#"{"type":"rate_limit_event","tier":"standard"}"#),
+            StreamLineEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn claude_dialect_ignores_a_malformed_non_json_line() {
+        // Regression guard for the requirement that a third-party CLI's output
+        // changing shape under us must never fail the call — see `send_streaming`.
+        assert_eq!(
+            parse_claude_line("not json at all { broken"),
+            StreamLineEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn agy_dialect_extracts_a_step_update_detail_with_a_tool_name() {
+        let line = r#"{"event":"step_update","step_update":{"step_index":3,"state":"ACTIVE","step_type":"subagent","tool_name":"invoke_subagent","duration_seconds":0.02}}"#;
+        assert_eq!(
+            parse_agy_line(line),
+            StreamLineEffect::Progress("subagent: invoke_subagent".to_string())
+        );
+    }
+
+    #[test]
+    fn agy_dialect_extracts_result_response_as_the_final_text() {
+        let line = r#"{"event":"result","result":{"status":"SUCCESS","response":"OK.\n","duration_seconds":2.58,"num_turns":1}}"#;
+        assert_eq!(
+            parse_agy_line(line),
+            StreamLineEffect::Result("OK.\n".to_string())
+        );
+    }
+
+    #[test]
+    fn agy_dialect_ignores_unknown_event_values() {
+        assert_eq!(
+            parse_agy_line(r#"{"event":"something_else","payload":{}}"#),
+            StreamLineEffect::Ignore
+        );
+    }
+
+    #[test]
+    fn agy_dialect_ignores_a_malformed_non_json_line() {
+        assert_eq!(parse_agy_line("{not valid"), StreamLineEffect::Ignore);
+    }
+
+    #[test]
+    fn stream_dialect_parses_known_names_and_rejects_unknown_ones() {
+        assert_eq!(
+            StreamDialect::parse("claude").unwrap(),
+            StreamDialect::ClaudeJson
+        );
+        assert_eq!(StreamDialect::parse("agy").unwrap(), StreamDialect::AgyJson);
+        let err = StreamDialect::parse("bogus").unwrap_err().to_string();
+        assert!(err.contains("bogus"), "unexpected error: {err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_streaming_call_forwards_progress_and_returns_the_result_text() {
+        // A tiny shell script stands in for a real `claude`/`agy` binary: it prints
+        // one progress line, then one result line, so this exercises the real
+        // `send_streaming` spawn/parse/forward path end to end without depending on
+        // either real CLI being installed.
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                r#"printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"description":"Read the readme"}}]}}' '{"type":"result","subtype":"success","is_error":false,"result":"all good"}'"#
+                    .into(),
+            ],
+            "sh",
+            None,
+            PathBuf::from("."),
+            Some(StreamDialect::ClaudeJson),
+        )
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let progress = ProgressSink::new(tx);
+        let reply = p
+            .send_with_progress(None, "ignored", &progress)
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "all good");
+        drop(progress);
+
+        let detail = rx.recv().await.expect("a progress detail was sent");
+        assert_eq!(detail, "Bash: Read the readme");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_streaming_call_with_no_result_event_falls_back_to_assistant_text() {
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                r#"printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"partial reply"}]}}'"#
+                    .into(),
+            ],
+            "sh",
+            None,
+            PathBuf::from("."),
+            Some(StreamDialect::ClaudeJson),
+        )
+        .unwrap();
+
+        let reply = p
+            .send_with_progress(None, "ignored", &ProgressSink::disconnected())
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "partial reply");
     }
 }

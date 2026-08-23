@@ -448,6 +448,7 @@ mod tests {
                         path: "/usr/bin/x".into(),
                         args: vec![],
                         system_arg: None,
+                        dialect: None,
                     }),
                     needs_key: false,
                 },

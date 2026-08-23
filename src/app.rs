@@ -112,6 +112,13 @@ pub struct Activity {
     /// future caller from building a public API around wall-clock time this struct
     /// was never designed to expose.
     started: Instant,
+    /// The most recent progress detail a streaming CLI reported (`"Bash: Read the
+    /// readme"`, `"subagent: invoke_subagent"`), if any. `None` for a non-streaming
+    /// provider, or before the first `Event::ActivityProgress` of this activity has
+    /// arrived. Already sanitised (control characters and newlines stripped, char-
+    /// boundary truncated) by the orchestrator before it ever reaches an `Event` —
+    /// this is third-party CLI output and must be treated as untrusted.
+    pub detail: Option<String>,
 }
 
 /// Animation frames for the busy status line: a single `●` orbiting a field of `·`,
@@ -211,13 +218,19 @@ impl App {
 
     /// Folds an orchestrator event into the transcript.
     ///
-    /// Every variant except `ActivityStarted` clears `self.activity` first — this is
-    /// what guarantees the busy line always stops spinning: `TurnComplete`, `Reply`,
-    /// `Error`, `DelegationFinished` and `SkillLoaded` all pass through here, and none
-    /// of them has to remember to clear it individually. `ActivityStarted` then sets
-    /// a fresh one in its own arm below.
+    /// Every variant except `ActivityStarted` and `ActivityProgress` clears
+    /// `self.activity` first — this is what guarantees the busy line always stops
+    /// spinning: `TurnComplete`, `Reply`, `Error`, `DelegationFinished` and
+    /// `SkillLoaded` all pass through here, and none of them has to remember to clear
+    /// it individually. `ActivityStarted` then sets a fresh one in its own arm below;
+    /// `ActivityProgress` updates the existing one in place (see its arm) rather than
+    /// starting over, so a streaming CLI's progress line never resets the elapsed
+    /// counter or drops the activity mid-call.
     pub fn apply(&mut self, event: Event) {
-        if !matches!(event, Event::ActivityStarted { .. }) {
+        if !matches!(
+            event,
+            Event::ActivityStarted { .. } | Event::ActivityProgress { .. }
+        ) {
             self.activity = None;
         }
         match event {
@@ -226,7 +239,23 @@ impl App {
                     label,
                     kind,
                     started: Instant::now(),
+                    detail: None,
                 });
+            }
+            // Updates the detail on the existing activity without touching `started`
+            // — the elapsed-seconds counter in `status_line_at` must keep counting up
+            // across progress updates, not restart on every line a streaming CLI
+            // emits. If `label` doesn't match the current activity (a stale message
+            // from a call that already finished, arriving after a new one started),
+            // this is silently ignored rather than overwriting the wrong activity's
+            // detail — same "don't let stray async messages corrupt current state"
+            // reasoning as any other event ordering edge case here.
+            Event::ActivityProgress { label, detail } => {
+                if let Some(activity) = &mut self.activity
+                    && activity.label == label
+                {
+                    activity.detail = Some(detail);
+                }
             }
             Event::Reply { label, text } => self.transcript.push(Line {
                 speaker: Speaker::Model(label),
@@ -373,11 +402,21 @@ impl App {
             Some(activity) => {
                 let elapsed = now.saturating_duration_since(activity.started).as_secs();
                 let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
-                format!(
-                    "{} · {} · {elapsed}s · {spinner} (Esc to quit)",
-                    activity.label,
-                    activity.kind.description()
-                )
+                // With no detail, this must stay byte-identical to the line rendered
+                // before progress streaming existed — every existing caller and test
+                // depends on that exact shape.
+                match &activity.detail {
+                    Some(detail) => format!(
+                        "{} · {} · {detail} · {elapsed}s · {spinner} (Esc to quit)",
+                        activity.label,
+                        activity.kind.description()
+                    ),
+                    None => format!(
+                        "{} · {} · {elapsed}s · {spinner} (Esc to quit)",
+                        activity.label,
+                        activity.kind.description()
+                    ),
+                }
             }
             // No orchestrator event has said what's happening yet (the brief window
             // right after `submit()`), or a locally-handled command set `busy` and
@@ -527,6 +566,89 @@ mod tests {
             app.activity.is_none(),
             "a permanently spinning status line is the failure mode to avoid"
         );
+    }
+
+    #[test]
+    fn status_line_renders_the_detail_when_present() {
+        let mut app = app();
+        app.apply(Event::ActivityStarted {
+            label: "claude:claude".into(),
+            kind: ActivityKind::Primary,
+        });
+        app.apply(Event::ActivityProgress {
+            label: "claude:claude".into(),
+            detail: "Bash: Read the readme".into(),
+        });
+        let line = app.status_line();
+        assert!(
+            line.contains("claude:claude · awaiting reply · Bash: Read the readme · "),
+            "detail must appear between the description and the elapsed time: {line}"
+        );
+    }
+
+    #[test]
+    fn status_line_is_byte_identical_to_before_when_there_is_no_detail() {
+        // Pinned regression guard: `Activity::detail` is a new field, and adding it
+        // must not change a single byte of the status line for every activity that
+        // never gets a progress update (every non-streaming provider, and a
+        // streaming one before its first progress line arrives).
+        let mut app = app();
+        app.apply(Event::ActivityStarted {
+            label: "ollama:llama3".into(),
+            kind: ActivityKind::Primary,
+        });
+        app.activity.as_mut().unwrap().started = Instant::now() - Duration::from_secs(4);
+        let now = Instant::now();
+        assert_eq!(
+            app.status_line_at(now),
+            format!(
+                "ollama:llama3 · awaiting reply · 4s · {} (Esc to quit)",
+                SPINNER_FRAMES[0]
+            )
+        );
+    }
+
+    #[test]
+    fn activity_progress_keeps_the_activity_and_the_original_started_instant_and_sets_the_detail() {
+        let mut app = app();
+        app.apply(Event::ActivityStarted {
+            label: "claude:claude".into(),
+            kind: ActivityKind::Delegating,
+        });
+        let original_started = app.activity.as_ref().unwrap().started;
+
+        app.apply(Event::ActivityProgress {
+            label: "claude:claude".into(),
+            detail: "Bash: Read the readme".into(),
+        });
+
+        let activity = app
+            .activity
+            .as_ref()
+            .expect("activity must survive a progress update");
+        assert_eq!(activity.detail.as_deref(), Some("Bash: Read the readme"));
+        assert_eq!(
+            activity.started, original_started,
+            "the elapsed-seconds counter must keep counting from the original start, \
+             not reset on every progress line"
+        );
+    }
+
+    #[test]
+    fn activity_progress_for_a_different_label_than_the_current_activity_is_ignored() {
+        // A stray forwarding message from a call that already finished (or a
+        // delegation that was superseded) must never overwrite the activity that is
+        // actually in flight now.
+        let mut app = app();
+        app.apply(Event::ActivityStarted {
+            label: "ollama:llama3".into(),
+            kind: ActivityKind::Primary,
+        });
+        app.apply(Event::ActivityProgress {
+            label: "claude:claude".into(),
+            detail: "stale detail".into(),
+        });
+        assert_eq!(app.activity.as_ref().unwrap().detail, None);
     }
 
     #[test]

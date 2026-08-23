@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 209 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 233 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -100,10 +100,44 @@ endpoint.
     }
   },
   "local_binaries": {
-    "copilot": { "path": "gh", "args": ["copilot", "suggest"] }
+    "copilot": { "path": "gh", "args": ["copilot", "suggest"] },
+    "claude": { "path": "/opt/claude/bin/claude", "stream_format": "claude" }
   }
 }
 ```
+
+### CLI provider streaming and timeouts
+
+`claude` and `agy` (Antigravity) are auto-detected with progress streaming already on:
+each is invoked with its NDJSON stream flag (`claude -p --output-format stream-json
+--verbose`; `agy --output-format stream-json -p` — flags must precede `-p` for `agy`,
+which otherwise takes `--output-format` as its prompt), and every tool call or step the
+CLI reports while it works is parsed and shown live in the status line (`claude ·
+awaiting reply · Bash: Read the readme · 42s · ●···`), not just after the call returns.
+A hand-configured entry under `local_binaries` stays on the old buffered-output path
+unless it opts in with `"stream_format": "claude"` or `"stream_format": "agy"` —
+whichever NDJSON shape the binary actually speaks; any other value is a startup error,
+not a silent fallback to buffering. Progress details are third-party process output and
+are sanitized before they ever reach the TUI (control characters and newlines stripped,
+length capped) — never logged to the audit trail, which stays limited to sizes, paths,
+and outcomes, the same rule that already applies to file contents and delegation
+replies.
+
+The two paths are timed differently:
+
+- **Streaming** (a dialect is configured): an **idle timeout of 180s**, reset on every
+  line the CLI emits, so an agent that's genuinely working — a long tool call, a slow
+  model behind it — is never killed just for taking a while, only for going silent. A
+  separate **total timeout of 3600s** is an absolute backstop regardless of how
+  chatty the CLI stays.
+- **Non-streaming** (no dialect — the default for anything not auto-detected or opted
+  in): a flat **900s wall-clock timeout**. There is nothing to reset it on, because a
+  plain `binary -p <prompt>` buffers all of its output until exit, so `simon` sees
+  nothing — and can show nothing — until the process is already done.
+
+Either way, the timeout is what actually kills a wedged child: the subprocess is spawned
+with `kill_on_drop`, which only reaps it once something drops the future awaiting it, so
+the timeout firing (rather than the call finishing normally) is what triggers that drop.
 
 ### Delegation
 
@@ -123,10 +157,12 @@ the swarm cannot recurse indefinitely.
 
 None of this has to be inferred from timing: the status line names whichever model is
 actually being called — the sub-agent, not the commander — along with what it's doing
-and how long it's taken so far, and the transcript gets a line the moment a delegation
-is dispatched (naming the agent and its task) and another when it finishes, reporting
-outcome and duration. The full sub-agent reply still arrives afterward as an ordinary
-reply line.
+and how long it's taken so far (and, for a streaming CLI sub-agent, the latest progress
+detail it reported — see [CLI provider streaming and
+timeouts](#cli-provider-streaming-and-timeouts)), and the transcript gets a line the
+moment a delegation is dispatched (naming the agent and its task) and another when it
+finishes, reporting outcome and duration. The full sub-agent reply still arrives
+afterward as an ordinary reply line.
 
 ### Skills
 

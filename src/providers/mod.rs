@@ -79,10 +79,57 @@ pub struct Reply {
     pub rate_limit: RateLimit,
 }
 
+/// A one-way channel a streaming provider uses to report short, human-readable
+/// progress lines ("Bash: Read the readme", "subagent: invoke_subagent") while a call
+/// is still in flight, so the TUI's status line can show more than a bare "awaiting
+/// reply" for however long an agentic CLI takes.
+///
+/// Sends are non-blocking and failure-tolerant: a dropped receiver (the UI moved on,
+/// or a test never wired one up) must never turn into an error or a block inside the
+/// provider call — that is the entire point of [`ProgressSink::disconnected`].
+#[derive(Clone)]
+pub struct ProgressSink(Option<tokio::sync::mpsc::UnboundedSender<String>>);
+
+impl ProgressSink {
+    /// Wraps a real channel: every `send` reaches `sender` unless the receiving end
+    /// has already been dropped.
+    pub fn new(sender: tokio::sync::mpsc::UnboundedSender<String>) -> Self {
+        Self(Some(sender))
+    }
+
+    /// A no-op sink for tests and for any `Provider` that never streams: sending to
+    /// it silently discards the message rather than erroring.
+    pub fn disconnected() -> Self {
+        Self(None)
+    }
+
+    /// Reports one progress detail. Never blocks and never fails the caller: an
+    /// `UnboundedSender::send` only errors when the receiver was dropped, which is
+    /// exactly the case this sink is meant to tolerate silently.
+    pub fn send(&self, detail: impl Into<String>) {
+        if let Some(tx) = &self.0 {
+            let _ = tx.send(detail.into());
+        }
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Sends a prompt with an optional system prompt and returns the reply.
     async fn send(&self, system: Option<&str>, prompt: &str) -> Result<Reply>;
+
+    /// Like `send`, but for a provider that can report progress while the call is
+    /// still running (a streaming CLI). The default implementation just calls `send`
+    /// and never touches `progress`, so every provider except `LocalBinaryProvider`
+    /// is unaffected by this method existing.
+    async fn send_with_progress(
+        &self,
+        system: Option<&str>,
+        prompt: &str,
+        _progress: &ProgressSink,
+    ) -> Result<Reply> {
+        self.send(system, prompt).await
+    }
 
     /// Model identifier, as the user would type it.
     fn model_name(&self) -> &str;

@@ -51,11 +51,15 @@ const HEADER_FIXED_LEN: usize = 8 + 1 + 1 + 8 + 1; // magic..salt_len inclusive
 
 /// Consecutive wrong passwords before the vault is destroyed.
 pub const MAX_ATTEMPTS: u8 = 5;
-/// Idle window after which the vault self-destructs on next open.
+/// Idle window after which the vault is reported as stale on next open.
+///
+/// Passing this limit no longer destroys anything — see the comment in
+/// [`EncryptedVault::load`] for why. It sets [`VaultStatus::idle_expired`], which the
+/// caller turns into a warning, and a successful unlock resets the window.
 pub const MAX_IDLE_SECS: u64 = 24 * 60 * 60;
 /// How close to `MAX_IDLE_SECS` counts as "close enough to warn the user about" at
 /// unlock time. Four hours gives someone who works in a normal daily rhythm a real
-/// chance to notice before a missed day silently wipes the transcript.
+/// chance to notice before a missed day quietly puts the vault past its window.
 pub const IDLE_WARNING_THRESHOLD_SECS: u64 = 4 * 60 * 60;
 
 #[derive(Debug, thiserror::Error)]
@@ -205,8 +209,8 @@ impl EncryptedVault {
     /// Decrypts the vault.
     ///
     /// Enforces the anti-brute-force policy: after [`MAX_ATTEMPTS`] consecutive wrong
-    /// passwords, or [`MAX_IDLE_SECS`] without a successful unlock, the file is
-    /// destroyed.
+    /// passwords the file is destroyed. Sitting idle past [`MAX_IDLE_SECS`] does *not*
+    /// destroy it — see the comment in the body.
     ///
     /// Note the limitation: the attempt counter lives in the (unauthenticated) header
     /// of the same file, so an attacker who can copy the file can reset it by restoring
@@ -228,15 +232,23 @@ impl EncryptedVault {
             )));
         }
 
-        let idle = now_secs().saturating_sub(header.last_unlock);
-        if idle > MAX_IDLE_SECS {
-            self.destroy();
-            return Err(VaultError::Destroyed(format!(
-                "not unlocked for {} hours (limit is {})",
-                idle / 3600,
-                MAX_IDLE_SECS / 3600
-            )));
-        }
+        // Idle expiry is deliberately NOT enforced here. It used to `destroy()` the
+        // file at this point, before the password was even checked. The window is pure
+        // wall-clock arithmetic, and a forward clock jump — NTP correcting a clock that
+        // was behind, a VM resuming with a stale clock — is indistinguishable from time
+        // that genuinely passed, so no detection can rescue it: the vault was deleted
+        // irreversibly while the user typed the right password.
+        //
+        // Weigh the two sides. The payload is AES-256-GCM encrypted, so deleting it
+        // after 24 hours adds little confidentiality over what the encryption already
+        // gives; it defends only against an attacker who obtains the password *later*.
+        // The old behaviour, meanwhile, *guaranteed* total unrecoverable loss of the
+        // user's transcript every time the clock moved forward. So the vault now opens
+        // normally, the success path below resets `last_unlock`, and the staleness is
+        // surfaced as a warning via [`VaultStatus::idle_expired`].
+        //
+        // The attempt-based wipe above is untouched: it is the anti-brute-force
+        // property and does not depend on the clock at all.
 
         let aad = header.aad();
         let nonce_end = header.body_offset + NONCE_LEN;
@@ -306,12 +318,20 @@ impl EncryptedVault {
             Err(e) => return Err(VaultError::Corrupt(e.to_string())),
         };
         let header = Self::parse_header(&raw)?;
-        let idle_secs = now_secs().saturating_sub(header.last_unlock);
+        let now = now_secs();
+        // `saturating_sub` below is fail-safe for a clock that has moved *backwards*
+        // (idle reads as 0 rather than as an absurd number), but on its own it would
+        // report a cheerful full window remaining for a clock we can prove is wrong.
+        // Report the discrepancy instead of hiding it; it is a diagnostic, not an error.
+        let clock_behind_secs = header.last_unlock.checked_sub(now).filter(|d| *d > 0);
+        let idle_secs = now.saturating_sub(header.last_unlock);
         Ok(VaultStatus {
             path: self.path.clone(),
             failed_attempts: header.attempts,
             idle_secs,
             idle_secs_remaining: MAX_IDLE_SECS.saturating_sub(idle_secs),
+            idle_expired: idle_secs > MAX_IDLE_SECS,
+            clock_behind_secs,
         })
     }
 }
@@ -328,10 +348,20 @@ pub struct VaultStatus {
     pub path: PathBuf,
     pub failed_attempts: u8,
     pub idle_secs: u64,
-    /// Seconds until the next `load()` finds the vault past `MAX_IDLE_SECS` and
-    /// destroys it outright, before even checking a password. Zero means that has
-    /// already happened and the next open — right password or not — wipes it.
+    /// Seconds until the vault passes `MAX_IDLE_SECS`. Zero means it is at or past the
+    /// limit; nothing is destroyed at that point — see `idle_expired`.
     pub idle_secs_remaining: u64,
+    /// The vault has sat unopened for longer than `MAX_IDLE_SECS`.
+    ///
+    /// This is a warning, not a verdict: it is derived from the wall clock, so a system
+    /// clock that jumped forward produces it with no real time having passed. Unlocking
+    /// with the right password succeeds either way and resets the window.
+    pub idle_expired: bool,
+    /// How far the system clock sits *behind* the vault's recorded last-unlock time, if
+    /// it does. `Some(_)` means the clock is provably wrong (the vault cannot have been
+    /// opened in the future), so `idle_secs`/`idle_secs_remaining` above are
+    /// meaningless for this vault until the clock is fixed.
+    pub clock_behind_secs: Option<u64>,
 }
 
 fn random_salt() -> Vec<u8> {
@@ -355,6 +385,15 @@ mod tests {
 
     fn vault_in(dir: &tempfile::TempDir) -> EncryptedVault {
         EncryptedVault::new(dir.path().join("vault.enc"))
+    }
+
+    /// Rewrites the plaintext last-unlock timestamp in place, the same way the tests
+    /// below have always simulated elapsed time: bytes 10..18 of the header are outside
+    /// the AAD precisely so they can be rewritten without touching the ciphertext.
+    fn set_last_unlock(vault: &EncryptedVault, unix_secs: u64) {
+        let mut raw = fs::read(vault.path()).unwrap();
+        raw[10..18].copy_from_slice(&unix_secs.to_be_bytes());
+        fs::write(vault.path(), &raw).unwrap();
     }
 
     #[test]
@@ -436,20 +475,109 @@ mod tests {
     }
 
     #[test]
-    fn idle_vault_self_destructs() {
+    fn an_idle_expired_vault_is_not_destroyed_and_still_opens_with_the_right_password() {
+        // The regression this replaces: `load()` used to delete the file here, before
+        // the password was checked, so a clock that jumped forward wiped the transcript
+        // with no way to recover it.
         let dir = tempfile::tempdir().unwrap();
         let vault = vault_in(&dir);
         let pw = SecretString::from("pw".to_string());
         vault.save(b"payload", &pw).unwrap();
 
-        // Backdate the last-unlock timestamp past the idle limit.
-        let mut raw = fs::read(vault.path()).unwrap();
-        let stale = now_secs() - (MAX_IDLE_SECS + 60);
-        raw[10..18].copy_from_slice(&stale.to_be_bytes());
-        fs::write(vault.path(), &raw).unwrap();
+        set_last_unlock(&vault, now_secs() - (MAX_IDLE_SECS + 60));
 
-        assert!(matches!(vault.load(&pw), Err(VaultError::Destroyed(_))));
-        assert!(!vault.exists());
+        assert_eq!(vault.load(&pw).unwrap(), b"payload");
+        assert!(vault.exists(), "idle expiry must not destroy the vault");
+    }
+
+    #[test]
+    fn unlocking_an_idle_expired_vault_resets_the_idle_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"payload", &pw).unwrap();
+
+        set_last_unlock(&vault, now_secs() - (MAX_IDLE_SECS + 60));
+        assert!(vault.status().unwrap().idle_expired);
+
+        vault.load(&pw).unwrap();
+
+        let after = vault.status().unwrap();
+        assert!(
+            !after.idle_expired,
+            "a successful unlock clears the warning"
+        );
+        assert!(
+            after.idle_secs_remaining > MAX_IDLE_SECS - 60,
+            "the window should be fresh, not merely nonzero"
+        );
+    }
+
+    #[test]
+    fn a_wrong_password_on_an_idle_expired_vault_still_counts_toward_the_wipe() {
+        // Idle expiry stopped being destructive; the attempt limit did not. Being past
+        // the idle window must not become a way to guess passwords for free.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("right".to_string());
+        let wrong = SecretString::from("wrong".to_string());
+        vault.save(b"payload", &pw).unwrap();
+
+        let stale = now_secs() - (MAX_IDLE_SECS + 60);
+        set_last_unlock(&vault, stale);
+
+        for expected_remaining in (1..MAX_ATTEMPTS).rev() {
+            match vault.load(&wrong) {
+                Err(VaultError::WrongPassword { remaining }) => {
+                    assert_eq!(remaining, expected_remaining)
+                }
+                other => panic!("expected WrongPassword, got {other:?}"),
+            }
+            // Each failed attempt rewrites the header, so re-stale it: the point is
+            // that the wipe below comes from the attempt count, not from the clock.
+            set_last_unlock(&vault, stale);
+        }
+
+        assert!(matches!(vault.load(&wrong), Err(VaultError::Destroyed(_))));
+        assert!(!vault.exists(), "the attempt-based wipe still applies");
+    }
+
+    #[test]
+    fn status_reports_idle_expiry_for_a_vault_past_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"payload", &pw).unwrap();
+
+        set_last_unlock(&vault, now_secs() - (MAX_IDLE_SECS + 7200));
+
+        let status = vault.status().unwrap();
+        assert!(status.idle_expired);
+        assert_eq!(status.idle_secs_remaining, 0);
+        assert!(status.idle_secs > MAX_IDLE_SECS);
+        assert_eq!(status.clock_behind_secs, None);
+    }
+
+    #[test]
+    fn status_reports_a_clock_behind_the_last_unlock_rather_than_a_full_window() {
+        // A vault cannot have been opened in the future: this says the system clock is
+        // wrong, and the idle numbers derived from it mean nothing until it is fixed.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"payload", &pw).unwrap();
+
+        set_last_unlock(&vault, now_secs() + 3600);
+
+        let status = vault.status().unwrap();
+        assert!(
+            matches!(status.clock_behind_secs, Some(secs) if secs > 3000),
+            "expected the backwards clock to be reported, got {:?}",
+            status.clock_behind_secs
+        );
+        // Still fail-safe underneath: no wrap-around, no bogus expiry.
+        assert_eq!(status.idle_secs, 0);
+        assert!(!status.idle_expired);
     }
 
     #[test]
@@ -465,8 +593,8 @@ mod tests {
     #[test]
     fn a_truncated_file_is_reported_as_corrupt_not_silently_destroyed() {
         // Corruption (bad magic, truncated header, unsupported version) must not
-        // trigger the self-destruct path — that is reserved for exhausted attempts
-        // or idle expiry. Conflating the two would delete a vault a user might
+        // trigger the self-destruct path — that is reserved for exhausted attempts.
+        // Conflating the two would delete a vault a user might
         // otherwise be able to recover (e.g. from a backup of the file).
         let dir = tempfile::tempdir().unwrap();
         let vault = vault_in(&dir);
@@ -500,6 +628,8 @@ mod tests {
             status.idle_secs_remaining > MAX_IDLE_SECS - 60,
             "a freshly saved vault should be nowhere near idle expiry"
         );
+        assert!(!status.idle_expired);
+        assert_eq!(status.clock_behind_secs, None);
     }
 
     #[test]

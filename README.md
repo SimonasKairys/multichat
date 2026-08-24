@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 272 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 276 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -29,7 +29,7 @@ simon chat -m ollama:llama3  # pick a commander explicitly
 simon chat --classified      # local models only, no network egress
 simon chat --vault           # persist the transcript, encrypted, across sessions
 simon chat --project ~/code/myapp  # confine models to this folder instead of cwd
-simon vault status           # vault path, failed attempts, time to idle self-destruct
+simon vault status           # vault path, failed attempts, idle window
 simon vault destroy          # permanently delete the vault (typed "yes" to confirm)
 simon audit                  # verify the audit log's hash chain
 ```
@@ -391,7 +391,7 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   decryption. This is **user-visible history, not model memory** — no model ever
   receives the transcript or any prior turn as context; every prompt is still sent
   alone (see [Delegation](#delegation)). `simon vault status` reports the vault's path,
-  failed-attempt count, and time left before idle self-destruct without ever asking for
+  failed-attempt count, and where it stands in its idle window without ever asking for
   a password (those two fields are plaintext header data — see
   [Known limits](#known-limits-of-what-is-implemented)). `simon vault destroy` deletes
   it after a typed `yes`.
@@ -455,13 +455,23 @@ Be precise about what exists. This table is the source of truth; the numbered fi
 ### Known limits of what is implemented
 
 - **The vault's self-destruct is a data-loss feature, not just a security one.** 5
-  consecutive wrong passwords, or 24 hours since the vault was last opened, wipes the
-  saved transcript — permanently, with no recovery. The idle check in particular runs
-  **before** the password is even checked (`EncryptedVault::load`, `src/vault.rs`), so
-  typing the correct password after a 24-hour gap does not save it; the file is already
-  gone by the time the password would have been checked. `simon vault status` shows time
-  remaining before this happens, and `simon chat --vault` warns at unlock time if the
-  vault is within a few hours of it.
+  consecutive wrong passwords wipes the saved transcript — automatically, permanently,
+  with no recovery. That is the anti-brute-force property and it is unchanged: a correct
+  password typed after the 5th failure does not bring the file back. `simon vault status`
+  shows the count so far.
+- **Sitting idle past 24 hours warns; it no longer destroys the vault.** It used to:
+  `EncryptedVault::load` checked the idle window **before** the password, so a 24-hour
+  gap deleted the transcript with the right password powerless to stop it. The window is
+  measured against the wall clock, and a forward clock jump — an NTP correction to a
+  clock that was behind, a VM resuming with a stale clock — is indistinguishable from
+  time that really passed, so that check could and did destroy a transcript
+  irreversibly when no time had passed at all. The payload is AES-256-GCM encrypted;
+  deleting it after a day bought little beyond what the encryption already gives, and
+  cost guaranteed unrecoverable loss whenever the clock moved. Now `simon chat --vault`
+  warns before prompting (saying plainly that a wrong clock can cause it), unlocking
+  works normally, and a successful unlock resets the timer. `simon vault status` reports
+  the idle window, whether it has been passed, and a system clock that is behind the
+  vault's own last-unlock time.
 - **Only a clean exit saves.** `simon chat --vault` serializes and encrypts the
   transcript once, after the TUI loop returns normally — not after every turn, because
   Argon2id key derivation is deliberately slow and running it per-message would stall

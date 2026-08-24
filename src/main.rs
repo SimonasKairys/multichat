@@ -383,9 +383,9 @@ fn vault_unlock_for_chat(paths: &Paths, app: &mut App) -> Result<VaultSession> {
         println!(
             "This will hold your saved chat transcript, encrypted under the password \
              you choose now. WARNING: the vault self-destructs — wiping that \
-             transcript for good — after {} consecutive wrong passwords, or after {} \
-             hours without being opened. A correct password typed after either limit \
-             does not recover it.",
+             transcript for good — after {} consecutive wrong passwords. A correct \
+             password typed after that limit does not recover it. Leaving it unopened \
+             for more than {} hours only warns you; unlocking it resets the timer.",
             crate::vault::MAX_ATTEMPTS,
             crate::vault::MAX_IDLE_SECS / 3600
         );
@@ -396,8 +396,35 @@ fn vault_unlock_for_chat(paths: &Paths, app: &mut App) -> Result<VaultSession> {
 
     // Captured *before* unlocking: a successful `load()` immediately refreshes
     // `last_unlock` to now (vault.rs), so reading this after the fact would always
-    // show a full idle window remaining and the warning below could never fire.
-    let idle_remaining_before_unlock = vault.status().ok().map(|s| s.idle_secs_remaining);
+    // show a full idle window remaining and the warnings here could never fire.
+    let status_before_unlock = vault.status().ok();
+    let idle_remaining_before_unlock = status_before_unlock.as_ref().map(|s| s.idle_secs_remaining);
+
+    // Printed *before* the prompt, unlike the near-expiry warning further down: this is
+    // the case where the old build would already have deleted the file by now, so the
+    // user deserves the explanation while they still have the password in their head.
+    if let Some(status) = status_before_unlock.as_ref() {
+        if status.idle_expired {
+            println!(
+                "Notice: this vault has sat unopened for {} — past its {} idle limit. \
+                 Nothing has been deleted: unlocking it below works normally and resets \
+                 the timer. If your system clock was wrong (an NTP correction, a VM \
+                 resuming with a stale clock), this is a false alarm — the idle window \
+                 is measured against the wall clock and cannot tell the two apart.",
+                fmt_hms(status.idle_secs),
+                fmt_hms(crate::vault::MAX_IDLE_SECS)
+            );
+        }
+        if let Some(behind) = status.clock_behind_secs {
+            println!(
+                "Notice: this system's clock is {} behind the vault's recorded \
+                 last-unlock time. A vault cannot have been opened in the future, so \
+                 the clock is wrong; the idle numbers are not meaningful until it is \
+                 fixed. Unlocking still works.",
+                fmt_hms(behind)
+            );
+        }
+    }
 
     // Bounded by construction, not by a counter kept here: `EncryptedVault::load`
     // self-destructs the file once `MAX_ATTEMPTS` is reached, which turns every
@@ -410,12 +437,15 @@ fn vault_unlock_for_chat(paths: &Paths, app: &mut App) -> Result<VaultSession> {
 
         match vault.load(&password) {
             Ok(bytes) => {
+                // Only for a vault that had not yet passed the limit — the expired
+                // case already got its own, stronger notice before the prompt.
                 if let Some(remaining) = idle_remaining_before_unlock
+                    && remaining > 0
                     && remaining <= crate::vault::IDLE_WARNING_THRESHOLD_SECS
                 {
                     println!(
-                        "Warning: this vault was only {} away from self-destructing \
-                         from inactivity when you unlocked it just now.",
+                        "Warning: this vault was only {} away from passing its idle \
+                         limit when you unlocked it just now.",
                         fmt_hms(remaining)
                     );
                 }
@@ -456,8 +486,9 @@ fn vault_unlock_for_chat(paths: &Paths, app: &mut App) -> Result<VaultSession> {
             }
             Err(VaultError::Destroyed(reason)) => {
                 let _ = audit.log("vault.destroyed", &reason);
-                // Printed verbatim: `reason` is what distinguishes "too many wrong
-                // passwords" from "idle too long", and that distinction is the point.
+                // Printed verbatim: `reason` names what actually triggered the wipe.
+                // Only the attempt limit destroys a vault now — idle expiry warns
+                // instead (see `EncryptedVault::load`).
                 println!("Vault destroyed: {reason}");
                 println!("Continuing with an empty transcript. Choose a new password:");
                 let password = prompt_new_vault_password()?;
@@ -543,16 +574,26 @@ fn vault_status(vault: &EncryptedVault) -> Result<()> {
                 status.failed_attempts,
                 crate::vault::MAX_ATTEMPTS
             );
-            if status.idle_secs_remaining == 0 {
+            if let Some(behind) = status.clock_behind_secs {
+                // Reporting "24h 0m left" here would be worse than useless: the clock
+                // says the vault was last opened in the future, so say that instead.
                 println!(
-                    "  idle for {} — past the {} idle limit; the next \
-                     `simon chat --vault` will find it already destroyed.",
+                    "  system clock is {} behind the vault's last-unlock time — the \
+                     clock is wrong, so the idle figures below are not meaningful",
+                    fmt_hms(behind)
+                );
+            }
+            if status.idle_expired {
+                println!(
+                    "  idle for {} — past the {} idle limit. Nothing is destroyed by \
+                     this: the next `simon chat --vault` warns you, unlocks normally \
+                     with the right password, and resets the timer.",
                     fmt_hms(status.idle_secs),
                     fmt_hms(crate::vault::MAX_IDLE_SECS)
                 );
             } else {
                 println!(
-                    "  idle for {}; {} left before it self-destructs from inactivity",
+                    "  idle for {}; {} left before it is reported as past its idle limit",
                     fmt_hms(status.idle_secs),
                     fmt_hms(status.idle_secs_remaining)
                 );

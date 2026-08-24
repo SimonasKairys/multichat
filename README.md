@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 259 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 268 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -146,6 +146,20 @@ The orchestrator runs the sub-task and records the reply — or, on failure, the
 on that task in the ledger, tagged `[DONE]` or `[FAILED]`, where the delegating model
 sees it on its next turn. At most 3 delegations run per turn, and they run one after
 another, not concurrently.
+
+**The commander orients and proposes before it delegates.** Given anything more than a
+direct question it works in three steps: look at the project first (listing directories
+and reading the few files that decide the answer, with its own read requests — not by
+delegating discovery, since a sub-agent sees only the prompt it is given); then say what
+it found, what it intends to do, any alternative worth weighing, and which tasks would go
+to which model — and stop there for you to answer; and only then delegate. A plan is far
+cheaper to correct than finished files are. Asked to add word counting to a small project,
+this is the difference between delegating a guess and noticing that the project's notes
+claim tabs while its only source file is indented with spaces.
+
+Because every prompt is sent with no message history, the commander's own previous turn is
+carried in the ledger — without it a proposed plan evaporates before the turn that would
+act on it, and answering "approved, go ahead" produced nothing at all.
 
 **Delegating is the commander's default, not a fallback.** The roster in the system
 prompt annotates each model with roughly what it costs and how much context it holds,

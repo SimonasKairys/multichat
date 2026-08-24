@@ -59,6 +59,13 @@ pub struct FileWrite {
 /// letting one delegation dominate the token budget of every turn that follows.
 const MAX_RESULT_CHARS: usize = 2000;
 
+/// Ceiling on the commander's carried-over previous turn, in characters.
+///
+/// Same bound-the-ledger reasoning as `MAX_RESULT_CHARS`, and the same size for the
+/// same reason: this is one turn's prose, not a document, and it is re-rendered into
+/// every prompt until it is replaced.
+const MAX_PREVIOUS_TURN_CHARS: usize = 2000;
+
 /// How many of the most recent tasks get rendered in the system prompt. The ledger
 /// never forgets a task (older ones may still matter for the transcript), but
 /// rendering all of them into every prompt would make the system prompt grow without
@@ -190,6 +197,12 @@ fn model_hint(label: &str) -> Option<&'static str> {
 
 #[derive(Debug, Default)]
 pub struct SwarmLedger {
+    /// What the commander said last turn, so a plan survives long enough to be acted
+    /// on. Every prompt is sent with no message history — see the vault section of
+    /// the README — so without this the commander proposes an approach, the user
+    /// approves it, and the commander receives "approved" with no idea what was.
+    /// Observed exactly that way before this existed: turn two did nothing at all.
+    last_commander_reply: Option<String>,
     tasks: Vec<Task>,
     next_id: usize,
     /// Model label -> human-readable budget line.
@@ -362,6 +375,29 @@ impl SwarmLedger {
         });
     }
 
+    /// Records the commander's reply so its next turn can see it.
+    ///
+    /// Store the *stripped* text — file content is on disk and in `written_files`
+    /// already, and echoing it here would put a whole file into every later prompt.
+    pub fn record_commander_reply(&mut self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            self.last_commander_reply = None;
+            return;
+        }
+        // Char boundary, not byte index: replies are arbitrary UTF-8 and slicing
+        // mid-character panics. Same rule as `record_skill` and `record_file_read`.
+        let capped = match trimmed.char_indices().nth(MAX_PREVIOUS_TURN_CHARS) {
+            Some((cut, _)) => format!("{}…", &trimmed[..cut]),
+            None => trimmed.to_string(),
+        };
+        self.last_commander_reply = Some(capped);
+    }
+
+    pub fn last_commander_reply(&self) -> Option<&str> {
+        self.last_commander_reply.as_deref()
+    }
+
     pub fn file_listings(&self) -> &[ListedFiles] {
         &self.file_listings
     }
@@ -500,6 +536,15 @@ impl SwarmLedger {
                 let indented = listing.outcome.replace('\n', "\n    ");
                 out.push_str(&format!("- {label}: {indented}\n"));
             }
+        }
+
+        if let Some(previous) = &self.last_commander_reply {
+            // Named for the commander rather than addressed to "you": every model
+            // reads this same ledger, and a sub-agent must not mistake the
+            // commander's plan for something it said itself.
+            out.push_str("\n### The commander's previous turn\n");
+            out.push_str(previous);
+            out.push('\n');
         }
 
         out.push_str(
@@ -1268,6 +1313,42 @@ mod tests {
         assert!(text.contains("ACTION: write_file"));
         assert!(text.contains("ACTION: end_file"));
         assert!(text.contains("NEXT turn"));
+    }
+
+    #[test]
+    fn the_commanders_previous_turn_survives_into_the_next_prompt() {
+        // The bug this fixes, observed live: the commander proposed a plan, the user
+        // answered "approved, go ahead", and turn two did nothing — because every
+        // prompt is sent with no history, so it had no idea what had been approved.
+        let mut ledger = SwarmLedger::new();
+        assert!(!ledger.system_prompt().contains("previous turn"));
+
+        ledger.record_commander_reply("Plan: extend src/util.py with count_words.");
+        let text = ledger.system_prompt();
+        assert!(text.contains("### The commander's previous turn"));
+        assert!(text.contains("extend src/util.py with count_words"));
+    }
+
+    #[test]
+    fn a_previous_turn_is_capped_on_a_char_boundary() {
+        // Multi-byte input: a byte-index cut here would panic, the class of bug fixed
+        // in 923b934.
+        let mut ledger = SwarmLedger::new();
+        ledger.record_commander_reply(&"é".repeat(MAX_PREVIOUS_TURN_CHARS + 500));
+        let kept = ledger.last_commander_reply().unwrap();
+        assert!(kept.ends_with('…'));
+        assert_eq!(kept.chars().count(), MAX_PREVIOUS_TURN_CHARS + 1);
+    }
+
+    #[test]
+    fn an_empty_reply_clears_rather_than_stores_the_previous_turn() {
+        // A turn whose whole text was write blocks strips to nothing; keeping the
+        // turn before it would misreport a stale plan as the latest one.
+        let mut ledger = SwarmLedger::new();
+        ledger.record_commander_reply("the plan");
+        ledger.record_commander_reply("   \n  ");
+        assert!(ledger.last_commander_reply().is_none());
+        assert!(!ledger.system_prompt().contains("previous turn"));
     }
 
     #[test]

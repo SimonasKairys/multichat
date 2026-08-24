@@ -69,15 +69,30 @@ fn commander_preamble(primary: &str, roster: &[String]) -> Option<String> {
 
     Some(format!(
         "[swarm] You are the commander. Connected and available to you: {}.\n\
-         If answering this needs real work — reading files, searching, summarising, \
-         drafting, or WRITING FILES — do NOT do it with your own tools. Hand it to \
-         the cheapest capable model with `ACTION: delegate_task(<label>, \
-         <self-contained prompt>)`, then stop and say what you delegated; their \
-         results reach you on your NEXT turn. A sub-agent can create and edit project \
-         files itself, so \"build X\" is delegated like anything else: tell it exactly \
-         which files to write and what each must contain, and it writes them. Give \
-         one file, or one coherent group of files, per delegation. If the question \
-         just needs a direct answer, answer it directly.\n\
+         If this needs no more than a direct answer, give it and ignore the rest.\n\
+         Otherwise work in three steps and do not jump to the third.\n\
+         1. ORIENT. Look before you decide anything. List the directories that \
+         matter and read the few files that actually determine the answer, using \
+         your own list-files and read-file requests — their results reach you on \
+         your NEXT turn. Do not delegate this part: a sub-agent sees only the prompt \
+         you write for it, so a task written before you looked is a task written \
+         from guesswork. Read only what you need in order to plan; bulk reading is \
+         still work to hand off.\n\
+         2. PROPOSE, and stop. Say what you found, what you intend to do, any real \
+         alternative worth weighing and why you prefer yours, and exactly which \
+         tasks you would give to which model and why that model. Then stop and let \
+         the user answer. They know things the files do not, and a plan is far \
+         cheaper to correct than finished files are.\n\
+         3. DELEGATE, once the plan has been agreed. Hand each piece to the cheapest \
+         capable model with `ACTION: delegate_task(<label>, <self-contained \
+         prompt>)`, then stop and say what you delegated; results reach you on your \
+         NEXT turn. A sub-agent can create and edit project files, so \"build X\" is \
+         delegated like anything else: tell it exactly which files to write and what \
+         each must contain. Give one file, or one coherent group of files, per \
+         delegation. Keep only judgement and synthesis for yourself.\n\
+         If the user has already told you what to do, or already approved a plan, \
+         treat step 2 as done and get on with it — do not re-propose what has been \
+         settled.\n\
          --- the user's message follows ---\n",
         others.join(", ")
     ))
@@ -1486,6 +1501,10 @@ impl Orchestrator {
         // execution order (delegations, then skill reads) unchanged for the two
         // actions that already existed.
         let (writes, stripped) = SwarmLedger::parse_file_writes(&reply.text);
+
+        // Recorded before the actions run, so a plan the commander just proposed is in
+        // the ledger regardless of what any of them do.
+        self.ledger.record_commander_reply(&stripped);
 
         self.run_delegations(&primary_label, &stripped).await;
         self.run_skill_reads(&primary_label, &stripped).await;
@@ -3654,6 +3673,36 @@ mod tests {
     }
 
     #[test]
+    fn the_commander_must_orient_and_propose_before_it_delegates() {
+        // Without this the commander delegated on its very first turn having read
+        // nothing — one real delegated prompt began "You are inspecting a software
+        // project... produce a complete inventory", i.e. it was outsourcing the
+        // discovery it needed in order to write that prompt in the first place. The
+        // user also never saw a plan until files were already landing.
+        let preamble = commander_preamble("claude", &["claude".into(), "agy".into()])
+            .expect("a swarm roster must produce a preamble");
+        assert!(preamble.contains("1. ORIENT"));
+        assert!(preamble.contains("2. PROPOSE, and stop"));
+        assert!(preamble.contains("3. DELEGATE"));
+        assert!(preamble.contains("do not jump to the third"));
+        // Orienting is the commander's own job: a sub-agent sees only its prompt, so
+        // delegating discovery is what produces guesswork prompts.
+        assert!(preamble.contains("Do not delegate this part"));
+        // ...but bulk reading is still handed off, or the expensive model does the
+        // very work delegation exists to avoid.
+        assert!(preamble.contains("bulk reading is still work to hand off"));
+    }
+
+    #[test]
+    fn an_already_settled_plan_is_not_re_proposed() {
+        // The failure mode of a mandatory propose step: the user says "yes, do it"
+        // and the commander proposes the same plan again instead of acting.
+        let preamble = commander_preamble("claude", &["claude".into(), "agy".into()]).unwrap();
+        assert!(preamble.contains("already approved a plan"));
+        assert!(preamble.contains("do not re-propose what has been settled"));
+    }
+
+    #[test]
     fn a_lone_commander_gets_no_delegation_preamble() {
         // Nobody to delegate to: telling the model to hand work off would be advice it
         // cannot follow, and would waste tokens on every single turn.
@@ -3677,8 +3726,8 @@ mod tests {
         assert!(!preamble.contains("claude."));
         assert!(preamble.contains("agy, ollama:l3"));
         // A trivial question must still be answerable directly, or the commander will
-        // delegate greetings.
-        assert!(preamble.contains("answer it directly"));
+        // orient, plan and delegate its way through a greeting.
+        assert!(preamble.contains("needs no more than a direct answer"));
     }
 
     #[test]

@@ -256,9 +256,18 @@ content — and the turn blocks until you answer:
 OVERWRITE src/report.py (353 bytes -> 415 bytes)? [y]es  [n]o  [a]ll
 ```
 
-Nothing reaches disk before you answer. A refusal is recorded in the ledger, so the
-model learns on its next turn that the file was not written rather than building on one
-that does not exist, and is audited as `file.write_denied`.
+Nothing reaches disk **through this protocol** before you answer. A refusal is recorded
+in the ledger, so the model learns on its next turn that the file was not written rather
+than building on one that does not exist, and is audited as `file.write_denied`.
+
+Read that scope literally. The gate governs `write_file` blocks, which is every write by
+a cloud or Ollama model — those have no other way to touch a disk. It does **not** govern
+a spawned CLI provider's own file tools. Observed directly: asked to build a package,
+three delegations to `agy` failed and were recorded as failed, yet four files appeared in
+the project anyway, with no gate prompt and no audit entry. `agy` had written them itself.
+See [This is not a sandbox for spawned CLI providers](#this-is-not-a-sandbox-for-spawned-cli-providers)
+— if you need every write to pass the gate, the commander and the swarm must be API or
+Ollama models, not CLI ones.
 
 If the UI goes away while a question is pending, the write is refused, not applied —
 with nobody left to ask, nobody has consented. A write that `Workspace` would reject
@@ -367,7 +376,9 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   whether it overwrites and how many bytes that destroys, and the head of the content
   are shown, and the turn blocks until the user answers. Nothing reaches disk
   unapproved; a lost UI denies rather than allows, and a refusal is audited as
-  `file.write_denied`. Note the scope of the check: it establishes that the *user*
+  `file.write_denied`. Scope: this covers `write_file` blocks — every write available to
+  a cloud or Ollama model — but **not** a spawned CLI provider's own file tools, which
+  have been observed writing files during a delegation `simon` recorded as failed. Note the scope of the check: it establishes that the *user*
   consented, not that the content is correct — nothing inspects what is being written. The skills directory
   itself remains read-only to models — a model that could write a skill file could
   inject its own content into the system prompt sent to every model for the rest of

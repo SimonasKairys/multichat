@@ -362,11 +362,21 @@ impl LocalBinaryProvider {
         // will kill it. The cap's job is only to keep memory bounded; the timeouts
         // already own liveness.
         let stderr_task: tokio::task::JoinHandle<String> = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
             let mut buf = String::new();
-            let _ = BufReader::new(stderr)
+            let _ = (&mut reader)
                 .take(MAX_OUTPUT_BYTES as u64)
                 .read_to_string(&mut buf)
                 .await;
+            // Keep draining past the cap, discarding the excess. Stopping at the cap
+            // would drop `ChildStderr`, closing the pipe under a child that is still
+            // writing — it takes SIGPIPE and dies, and simon then reports
+            // "exited with signal: 13 (SIGPIPE)" instead of whatever the child was
+            // actually going to exit with. Measured exactly that way: a stub whose
+            // last statement was `exit 1` never reached it. Memory stays bounded
+            // because only the first `MAX_OUTPUT_BYTES` are kept; the time this can
+            // take is bounded by the same idle and total timeouts as everything else.
+            let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
             buf
         });
 

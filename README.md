@@ -509,9 +509,24 @@ repository is still called `multichat`, after the Python project that used to li
 
 The repository previously held a Python/FastAPI implementation, replaced by this Rust
 one in commit `9a51fc6`. That version is recoverable at commit `06c6c76`.
-`docs/AUDIT-2026-07-30.md` is the current audit. The two earlier audits (of the
-initial Rust commit and of `2cca5da`) described trees that no longer exist and were
-removed as superseded; both are recoverable at commit `2e7984e`.
+
+Two audits are current, and they split the tree rather than supersede each other.
+`docs/AUDIT-2026-07-30.md` covers `9540ace` — the delegation, skills, and vault-wiring
+changes — and is the one the source cites: `src/swarm.rs` points at its §3.2,
+`src/orchestrator.rs` at its §3.5. `docs/AUDIT-2026-07-31.md` covers `6da2772`, a tree
+whose `src/` differs from `9540ace` only in comment text, and deliberately reads what
+the first one skimmed or never reached: `picker.rs`, `ui/`, `app.rs`, `config.rs`,
+`main.rs`, and the provider transports.
+
+Both describe a July tree. The code has moved since and later fixes live in the git
+history, not in these documents, so read their findings as claims to re-check rather
+than as current status. Most are still open — the audit log still accepts a truncated
+tail, the ledger still has no whole-prompt budget, `Settings::save` is still not
+atomic.
+
+The two earlier audits (of the initial Rust commit and of `2cca5da`) described trees
+that no longer exist and were removed as superseded; both are recoverable at commit
+`2e7984e`.
 
 ## License
 

@@ -24,5 +24,7 @@
 - `05`–`14`: architecture and security decisions (aspirational; see the note above).
 - `15`–`21`: per-step implementation records, corrected after the audit.
 - `22_status.md`: **authoritative** implemented / not-implemented status.
-- `../AUDIT-2026-07-30.md`: the current audit. Earlier audits were removed as
-  superseded; recoverable at commit `2e7984e`.
+- `../AUDIT-2026-07-30.md` and `../AUDIT-2026-07-31.md`: both current, splitting the
+  tree between them — the first covers delegation, skills, and the vault; the second
+  covers `picker.rs`, `ui/`, `app.rs`, `config.rs`, `main.rs`, and the transports. Two
+  earlier audits were removed as superseded; recoverable at commit `2e7984e`.

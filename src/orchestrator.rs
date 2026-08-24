@@ -78,6 +78,14 @@ fn commander_preamble(primary: &str, roster: &[String]) -> Option<String> {
          you write for it, so a task written before you looked is a task written \
          from guesswork. Read only what you need in order to plan; bulk reading is \
          still work to hand off.\n\
+         Reading and inspecting to orient yourself is fine. CREATING OR EDITING A \
+         FILE WITH YOUR OWN TOOLS IS NOT — not an edit tool, not a shell redirect, \
+         not a heredoc. A file changed that way never reaches the user for approval \
+         and is never recorded, so from where they sit it changed by itself. Every \
+         file you write goes out as a write block in your reply, exactly like a \
+         sub-agent's, and the user approves it before it lands. Do not run the \
+         project's code either; that is the author's job to arrange, not a side \
+         effect of your inspection.\n\
          2. PROPOSE, and stop. Say what you found, what you intend to do, any real \
          alternative worth weighing and why you prefer yours, and exactly which \
          tasks you would give to which model and why that model. Then stop and let \
@@ -3691,6 +3699,24 @@ mod tests {
         // ...but bulk reading is still handed off, or the expensive model does the
         // very work delegation exists to avoid.
         assert!(preamble.contains("bulk reading is still work to hand off"));
+    }
+
+    #[test]
+    fn the_commander_may_not_write_files_with_its_own_tools_either() {
+        // Measured hole, not a hypothetical: a `claude` commander asked to build
+        // something edited the project file directly with its own edit tool and then
+        // narrated the result. The file changed correctly — and with no approval
+        // prompt, no `file.written` audit entry, and no delegation. From the user's
+        // side it changed by itself. `subagent_preamble` had forbidden exactly this
+        // for sub-agents; the commander had no equivalent rule.
+        let preamble = commander_preamble("claude", &["claude".into(), "agy".into()]).unwrap();
+        assert!(preamble.contains("CREATING OR EDITING A FILE WITH YOUR OWN TOOLS IS NOT"));
+        assert!(preamble.contains("never reaches the user for approval"));
+        // Orienting must stay allowed, or the commander cannot do step 1 at all.
+        assert!(preamble.contains("Reading and inspecting to orient yourself is fine"));
+        // A `__pycache__` left behind by the commander running the project proved it
+        // was executing code as well as writing it.
+        assert!(preamble.contains("Do not run the project's code"));
     }
 
     #[test]

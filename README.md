@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 268 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 269 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -156,6 +156,13 @@ to which model — and stop there for you to answer; and only then delegate. A p
 cheaper to correct than finished files are. Asked to add word counting to a small project,
 this is the difference between delegating a guess and noticing that the project's notes
 claim tabs while its only source file is indented with spaces.
+
+The commander is held to the same rule as a sub-agent about *how* files get written: it
+may read and inspect freely to orient itself, but it may not create or edit a file with
+its own tools, and may not run the project's code. Every file it writes goes out as a
+write block and waits for your approval. Without that rule it was observed editing a
+project file correctly and completely invisibly — no prompt, no `file.written` entry,
+and a `__pycache__` left behind showing it had executed the code too.
 
 Because every prompt is sent with no message history, the commander's own previous turn is
 carried in the ledger — without it a proposed plan evaporates before the turn that would

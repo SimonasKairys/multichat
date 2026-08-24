@@ -239,30 +239,50 @@ const MAX_TASK_DISPLAY_CHARS: usize = 120;
 /// failure: simon records a completed task whose content is a promise, and the
 /// commander then synthesises an answer out of nothing.
 ///
-/// The second half addresses a separate failure with the same root. `agy`'s
-/// permission checker refuses shell commands in print mode — there is nobody there to
-/// approve them — so any task that leads it to run `find .`, `git ls-files`, or
-/// `git log` fails outright, while the same task done with its file-reading tools
-/// succeeds. That was measured both ways. simon cannot grant the permission (the only
-/// switch on offer is agy's blanket `--dangerously-skip-permissions`, which would
-/// auto-approve every tool call it ever makes and is deliberately not used), but it
-/// can point the sub-agent at the tools that do not need one.
+/// The second half addresses a separate failure with the same root: `agy`'s permission
+/// system does not function in non-interactive print mode at all — there is nobody
+/// present to approve anything. Captured from the real audit log: `permission check
+/// failed for command "python3 -c ..."` (agy shelling out to check its own work),
+/// `permission check failed for command "git log -p -n 5"` (agy shelling out to read
+/// history), and — the same failure hitting agy's own tools, not just ours —
+/// `declaring permissions: cortex tool write_to_file: convert tool call for
+/// permissions: model output error: invalid tool call error (invalid_args) <path>`.
+/// Reading files needs no permission and was measured to work reliably, so that is all
+/// that is left on offer: shell commands and agy's own writer/editor tools are refused
+/// outright, not merely discouraged, because "prefer not to" still leaves the
+/// tempting cases — run the code to check it, `git log` to see what changed — as live
+/// options that fail the task. simon cannot grant the missing permission itself; the
+/// only switch on offer is agy's blanket `--dangerously-skip-permissions`, which was
+/// deliberately rejected: it would auto-approve every tool call agy makes, and agy's
+/// own file writes already bypass simon's write-approval gate and audit log when
+/// permission checking is out of the way — four such files were observed appearing
+/// during delegations simon had recorded as *failed*. Skipping permissions would make
+/// that worse, not better. Keeping the sub-agent to permission-free tools and routing
+/// every file it produces back through simon's own write protocol closes that hole:
+/// the write is plain text in the reply, so it lands on simon's side of the gate.
 fn subagent_preamble() -> &'static str {
     "[sub-agent] Complete this task fully in THIS reply. Do not dispatch, launch, or \
      delegate to a subagent of your own, and do not answer that you are waiting on \
      one: your reply is the entire result that reaches the requester, so anything you \
      defer is lost. If you genuinely cannot finish, say what you found and what \
      blocked you.\n\
-     Use your own file reading and directory listing tools rather than shell \
-     commands. You are running non-interactively, so there is nobody available to \
-     approve a shell command and one may simply be refused; reading files directly \
-     always works.\n\
-     If this task is to CREATE or EDIT files, write them using the file-write \
-     protocol described in your system prompt: one block per file, with that file's \
-     complete final content in between. That protocol is the only way a file you \
-     produce actually reaches the project — describing a file, or quoting it in prose \
-     outside a write block, writes nothing. Every write is shown to the user for \
-     approval before it lands.\n\
+     Do not run any shell, terminal, or command-line tool for any reason. This \
+     includes running or executing code to check that it works, and inspecting git \
+     history or git log. You are running non-interactively with nobody present to \
+     approve a command, so any attempt to run one is refused and fails this task — \
+     do not try, even once, even to verify something you already wrote.\n\
+     Do not use your own file-writing or file-editing tools either, for the same \
+     reason: a file written that way is invisible to this system and to the user, is \
+     not recorded anywhere, and does not count as this task being done, even if the \
+     tool call itself appears to succeed.\n\
+     Reading files and listing directories needs no permission and is fine to use \
+     freely.\n\
+     If this task is to CREATE or EDIT a file, the only way that file actually \
+     reaches the project is to emit it as plain text in your reply, using the marker \
+     that opens a write block followed by the path in parentheses, then the file's \
+     complete final content, then the matching end-of-file marker — one such block \
+     per file. Describing a file, or quoting it in prose outside such a block, writes \
+     nothing.\n\
      --- the task follows ---\n"
 }
 
@@ -3211,8 +3231,9 @@ mod tests {
             "the sub-agent should have been told to finish in-turn: {sent}"
         );
         assert!(
-            sent.contains("rather than shell commands"),
-            "the sub-agent should be steered off shell commands: {sent}"
+            sent.contains("Do not run any shell, terminal, or command-line tool"),
+            "the sub-agent should be told shell commands are refused outright, not \
+             merely discouraged: {sent}"
         );
         assert!(sent.contains("summarise the diff"));
         // What the user and the commander see stays unaugmented.
@@ -3658,6 +3679,52 @@ mod tests {
         // A trivial question must still be answerable directly, or the commander will
         // delegate greetings.
         assert!(preamble.contains("answer it directly"));
+    }
+
+    #[test]
+    fn subagent_preamble_forbids_shell_commands_outright() {
+        // "Prefer not to" still leaves running the code to check it, or `git log` to
+        // read history, as live options — both are real failures pulled from the
+        // audit log, so the wording must refuse the tool, not just discourage it.
+        let preamble = subagent_preamble();
+        assert!(preamble.contains("Do not run any shell, terminal, or command-line tool"));
+        assert!(preamble.contains("running or executing code to check that it works"));
+        assert!(preamble.contains("git history or git log"));
+    }
+
+    #[test]
+    fn subagent_preamble_forbids_its_own_file_writing_tools() {
+        // agy's own writer already errors while declaring permissions non-interactively,
+        // and separately was observed writing files simon never saw or approved. Both
+        // are closed by refusing the tool outright rather than merely preferring simon's.
+        let preamble = subagent_preamble();
+        assert!(preamble.contains("Do not use your own file-writing or file-editing tools"));
+        assert!(preamble.contains("does not count as this task being done"));
+    }
+
+    #[test]
+    fn subagent_preamble_still_tells_it_to_finish_in_turn_and_not_dispatch_a_subagent() {
+        let preamble = subagent_preamble();
+        assert!(preamble.contains("Complete this task fully in THIS reply"));
+        assert!(
+            preamble.contains("Do not dispatch, launch, or delegate to a subagent of your own")
+        );
+        assert!(preamble.contains("do not answer that you are waiting on"));
+        assert!(preamble.contains("say what you found and what blocked you"));
+    }
+
+    #[test]
+    fn subagent_preamble_never_opens_a_write_block_at_line_start() {
+        // Guards against reintroducing the bug `parse_file_writes` is sensitive to:
+        // a line that STARTS with the write-block marker opens a real block, so this
+        // instructional text must never contain that marker at the start of a line
+        // (mid-sentence is fine — the parser only checks a line's start).
+        for line in subagent_preamble().lines() {
+            assert!(
+                !line.trim().starts_with("ACTION: write_file("),
+                "preamble line would be parsed as a real write block: {line:?}"
+            );
+        }
     }
 
     #[tokio::test]

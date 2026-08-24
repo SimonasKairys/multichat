@@ -161,12 +161,25 @@ the only model connected.
 
 A delegated prompt carries its own short directive, for the same reason. It tells the
 sub-agent to finish in that reply (its answer is the *entire* result that reaches
-`simon`, so anything it defers is lost) and to prefer file-reading tools over shell
-commands (`agy`'s permission checker refuses shell commands in print mode, where nobody
-is present to approve them). `simon` cannot grant that permission — the only switch on
-offer is `agy`'s blanket `--dangerously-skip-permissions`, which would auto-approve
-every tool call it ever makes and is deliberately not used — but it can point the
-sub-agent at the tools that need no approval.
+`simon`, so anything it defers is lost), and it forbids two things outright rather than
+merely discouraging them: running any shell command, and using the sub-agent's own
+file-writing or file-editing tools. Both come from the same root cause, measured against
+the real `agy` binary — its permission system does not function at all in non-interactive
+print mode, because there is nobody present to approve anything. That showed up as
+`permission check failed for command "python3 -c ..."` (agy shelling out to check its own
+work), `permission check failed for command "git log -p -n 5"` (agy shelling out to read
+history), and, hitting agy's own tools rather than ours, `declaring permissions: cortex
+tool write_to_file: convert tool call for permissions: model output error: invalid tool
+call error (invalid_args) <path>`. Reading and listing files needs no permission and
+works reliably, so that is what the sub-agent is left with; when a task is to create or
+edit a file, it is told to emit the content as plain text using `simon`'s own write
+protocol instead of its own writer. `simon` cannot grant the missing permission itself —
+the only switch on offer is `agy`'s blanket `--dangerously-skip-permissions`, which is
+deliberately not used: it would auto-approve every tool call agy makes, and agy's own
+writes were separately observed bypassing `simon`'s write-approval gate and audit log
+entirely — four files appeared during delegations `simon` had recorded as *failed*.
+Routing every write back through `simon`'s protocol closes that hole, since the write
+is then plain text in the reply, not a tool call agy made on its own.
 
 A delegation that fails transiently is retried up to 3 times with a 3s then 8s backoff,
 each retry announced in the transcript with its reason. Agentic CLI sub-agents fail

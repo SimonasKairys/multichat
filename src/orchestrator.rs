@@ -299,7 +299,9 @@ fn subagent_preamble() -> &'static str {
      not recorded anywhere, and does not count as this task being done, even if the \
      tool call itself appears to succeed.\n\
      Reading files and listing directories needs no permission and is fine to use \
-     freely.\n\
+     freely. Prefer listing a directory to searching across one: a project-wide \
+     search is slow enough to time out on its own, and on a task that starts from an \
+     empty or nearly empty folder it has nothing to find anyway.\n\
      If this task is to CREATE or EDIT a file, the only way that file actually \
      reaches the project is to emit it as plain text in your reply, using the marker \
      that opens a write block followed by the path in parentheses, then the file's \
@@ -385,8 +387,14 @@ const DELEGATION_RETRY_BACKOFF: [Duration; MAX_DELEGATION_ATTEMPTS - 1] =
 /// - a misconfigured binary (missing path, empty path) fails identically forever;
 /// - a `--classified` refusal is a policy decision, not a blip.
 fn is_retryable_delegation_error(error: &str) -> bool {
+    // "timed out after", not bare "timed out": every timeout simon raises itself is
+    // formatted "<binary> timed out after <N>s" (see `local_binary`), and those are
+    // the only ones that have already spent the caller's patience. A sub-agent's own
+    // internal tool timeout reads differently — "Grep command timed out due to the
+    // size of the codebase" was observed being classified permanent and abandoned on
+    // its first attempt, when it is exactly the transient blip retrying exists for.
     const PERMANENT: &[&str] = &[
-        "timed out",
+        "timed out after",
         "does not exist",
         "has an empty path",
         "classified",
@@ -3575,6 +3583,21 @@ mod tests {
     }
 
     #[test]
+    fn a_sub_agents_own_internal_timeout_is_retried() {
+        // Captured verbatim from a failed delegation. It was abandoned without a
+        // single retry because the classifier matched on bare "timed out", which is
+        // simon's own timeout wording, not a sub-agent's tool reporting one.
+        assert!(is_retryable_delegation_error(
+            "agy failed: Grep command timed out due to the size of the codebase. \
+             Use a more targeted grep search to avoid a timeout.: context deadline exceeded"
+        ));
+        assert!(is_retryable_delegation_error(
+            "agy failed: declaring permissions: cortex tool view_file: ... \
+             unsupported mime type application/octet-stream"
+        ));
+    }
+
+    #[test]
     fn a_permanent_failure_is_not_retried() {
         // A timeout has already spent the caller's patience — up to an hour for a
         // streaming CLI — so doing it twice more is not a recovery strategy.
@@ -3774,6 +3797,8 @@ mod tests {
         // are closed by refusing the tool outright rather than merely preferring simon's.
         let preamble = subagent_preamble();
         assert!(preamble.contains("Do not use your own file-writing or file-editing tools"));
+        // A broad search timed out on an empty directory, failing the delegation.
+        assert!(preamble.contains("Prefer listing a directory to searching across one"));
         assert!(preamble.contains("does not count as this task being done"));
     }
 

@@ -164,13 +164,30 @@ pub(crate) fn truncate_error_detail(s: &str) -> String {
 }
 
 /// Builds the shared HTTP client. `reqwest` picks up `HTTP_PROXY`/`HTTPS_PROXY` and,
-/// because the `socks` feature is enabled, `ALL_PROXY=socks5://…` as well.
-pub fn http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+/// because the `socks` feature is enabled, `ALL_PROXY=socks5://…` as well — a
+/// documented feature the rest of the app relies on, so it stays on whenever
+/// `classified` is `false`.
+///
+/// When `classified` is `true`, that same default is a hole in the air gap. Under
+/// `--classified`, `discover_candidates` refuses every provider whose traffic leaves
+/// the machine and lets only Ollama through, on the strength of `is_loopback_host`
+/// validating its address as loopback. But a loopback *destination* doesn't stop
+/// reqwest from routing the *request* through a proxy read from the environment —
+/// verified empirically: with `ALL_PROXY=socks5://127.0.0.1:9` (a closed port) set,
+/// `simon --classified models` reports `(none)` instead of the Ollama model that is
+/// actually running, because the request went to the proxy and failed there instead
+/// of going to loopback directly. That is traffic leaving the machine, which is
+/// exactly what `--classified` promises cannot happen — so `.no_proxy()` is required
+/// here, not optional, whenever `classified` is `true`.
+pub fn http_client(classified: bool) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .timeout(std::time::Duration::from_secs(300))
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .build()?)
+        .connect_timeout(std::time::Duration::from_secs(15));
+    if classified {
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?)
 }
 
 #[cfg(test)]
@@ -217,7 +234,19 @@ mod tests {
 
     #[test]
     fn http_client_builds() {
-        assert!(http_client().is_ok());
+        assert!(http_client(false).is_ok());
+    }
+
+    /// Guards only that the classified path still builds a working client — `reqwest`
+    /// exposes no accessor on `Client` or `ClientBuilder` to read back whether
+    /// `.no_proxy()` took effect, so there is no way to assert the proxy setting
+    /// itself from here. The empirical proxy-egress check (`ALL_PROXY` routing a
+    /// `--classified` request that should have stayed on loopback) lives outside the
+    /// test suite, in the fix's audit trail, because it requires an actual proxy
+    /// listener to observe traffic arriving.
+    #[test]
+    fn a_classified_http_client_still_builds() {
+        assert!(http_client(true).is_ok());
     }
 
     #[test]

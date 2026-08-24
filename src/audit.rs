@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Credentials;
+use crate::security::LockedBuffer;
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const KEYRING_SERVICE: &str = "audit-hmac";
@@ -50,7 +51,15 @@ struct MacPayload<'a> {
 pub struct AuditLogger {
     path: PathBuf,
     last_mac: String,
-    key: Vec<u8>,
+    /// The keyed-Blake2s MAC secret, 32 bytes. `LockedBuffer` (see `security.rs`) is
+    /// the same wrapper `vault::derive_key` uses for encryption key material: it
+    /// zeroizes the bytes on drop and best-effort `mlock`s them so this secret does
+    /// not linger in freed heap memory or get written to swap for the lifetime of the
+    /// process, same as every other key in this crate. Before this, `key` was a plain
+    /// `Vec<u8>` — Rust gives no guarantee a `Vec`'s backing allocation is cleared on
+    /// drop, so the MAC key (and everything an attacker could forge with it) could sit
+    /// in a freed heap page or a swapped-out one indefinitely.
+    key: LockedBuffer,
 }
 
 impl AuditLogger {
@@ -59,7 +68,7 @@ impl AuditLogger {
     /// The previous implementation always restarted from the genesis hash, which meant
     /// the chain was per-process rather than per-history.
     pub fn open(path: PathBuf) -> Result<Self> {
-        let key = load_or_create_key()?;
+        let key = LockedBuffer::new(load_or_create_key()?);
         let last_mac = read_last_mac(&path)?.unwrap_or_else(|| GENESIS.to_string());
         Ok(Self {
             path,
@@ -74,7 +83,7 @@ impl AuditLogger {
         Ok(Self {
             path,
             last_mac,
-            key,
+            key: LockedBuffer::new(key),
         })
     }
 
@@ -85,7 +94,7 @@ impl AuditLogger {
             action,
             details,
         })?;
-        let mut mac = <Blake2sMac256 as Mac>::new_from_slice(&self.key)
+        let mut mac = <Blake2sMac256 as Mac>::new_from_slice(self.key.as_slice())
             .map_err(|e| anyhow!("invalid audit key length: {e}"))?;
         mac.update(&payload);
         Ok(hex(&mac.finalize().into_bytes()))

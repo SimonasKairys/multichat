@@ -254,6 +254,43 @@ impl Workspace {
         let Some(parent) = joined.parent() else {
             return Err(anyhow!("project path `{requested}` has no parent"));
         };
+
+        // `create_dir_all` below will happily create directories through a symlink
+        // that escapes the root — e.g. a link `out -> /tmp` committed inside the
+        // project, written to as `out/newdir/f.txt`. The write itself is still
+        // caught by the prefix check a few lines down, but by the time that check
+        // runs, `create_dir_all` has already created `/tmp/newdir` on disk: a
+        // directory outside the project the user never approved, even though the
+        // file content never lands there. So before creating anything, walk up
+        // from `parent` to the deepest ancestor that already exists — the first
+        // directory `create_dir_all` would actually touch — and canonicalize
+        // *that* (canonicalize requires existence, the same reason `write` checks
+        // `parent` rather than `joined` in the first place). If a symlink anywhere
+        // on the way redirects that ancestor outside `self.root`, refuse here,
+        // before `create_dir_all` ever runs, instead of after.
+        let mut anchor = parent;
+        while !anchor.exists() {
+            let Some(next) = anchor.parent() else {
+                // Unreachable in practice: `self.root` itself always exists (`new`
+                // checked that), and `parent` is `self.root` joined with more
+                // components, so this walk reaches `self.root` and stops before
+                // running out of ancestors. A hard error rather than an `unwrap`
+                // so a future change to that invariant fails loudly instead of
+                // panicking.
+                return Err(anyhow!(
+                    "project path `{requested}` has no existing ancestor"
+                ));
+            };
+            anchor = next;
+        }
+        let resolved_anchor = fs::canonicalize(anchor)
+            .with_context(|| format!("failed to resolve {}", anchor.display()))?;
+        if !resolved_anchor.starts_with(&self.root) {
+            return Err(anyhow!(
+                "project path `{requested}` resolves outside the project folder"
+            ));
+        }
+
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
         let resolved_parent = fs::canonicalize(parent)
@@ -373,6 +410,28 @@ mod tests {
         assert!(err.contains("symlink"), "unexpected error: {err}");
         // The link's target must be untouched — the whole point of the refusal.
         assert_eq!(fs::read_to_string(&outside).unwrap(), "original");
+    }
+
+    // Unix-only: same reasoning as `a_symlink_target_is_refused` above — this is the
+    // directory-escape counterpart, guarding the ancestor walk added ahead of
+    // `create_dir_all` in `write`.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_through_a_symlinked_directory_creates_nothing_outside_the_root() {
+        let (guard, w) = workspace();
+        let outside_dir = guard.path().join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_dir, w.root().join("link")).unwrap();
+
+        let err = w
+            .write("link/newdir/f.txt", "clobbered")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("outside"), "unexpected error: {err}");
+        // The whole point: `create_dir_all` must never have run against the
+        // resolved (outside-the-root) path, so `outside/newdir` must not exist.
+        assert!(!outside_dir.join("newdir").exists());
+        assert!(!outside_dir.join("newdir").join("f.txt").exists());
     }
 
     #[test]

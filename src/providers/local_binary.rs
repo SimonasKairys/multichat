@@ -349,9 +349,24 @@ impl LocalBinaryProvider {
         // reading stdout. Best-effort: a read error here just yields an empty
         // summary, which is no worse than today's non-streaming stderr handling on a
         // process that dies mid-write.
+        //
+        // `.take(MAX_OUTPUT_BYTES as u64)` bounds this the same way `MAX_OUTPUT_BYTES`
+        // already bounds stdout below (see `accumulated_bytes`): without it, a child
+        // that floods stderr — a misbehaving CLI dumping a stack trace in a loop, or
+        // one deliberately hostile — grows this `String` without limit, since
+        // `read_to_string` reads until EOF. Once the cap is hit, this task stops
+        // reading, so a child that keeps writing past `MAX_OUTPUT_BYTES` of stderr
+        // can still fill its pipe buffer and block on a further write — but that is
+        // no longer an unbounded hang: `CLI_IDLE_TIMEOUT`/`CLI_TOTAL_TIMEOUT` above
+        // already backstop a child that stalls for any reason, stdout included, and
+        // will kill it. The cap's job is only to keep memory bounded; the timeouts
+        // already own liveness.
         let stderr_task: tokio::task::JoinHandle<String> = tokio::spawn(async move {
             let mut buf = String::new();
-            let _ = BufReader::new(stderr).read_to_string(&mut buf).await;
+            let _ = BufReader::new(stderr)
+                .take(MAX_OUTPUT_BYTES as u64)
+                .read_to_string(&mut buf)
+                .await;
             buf
         });
 

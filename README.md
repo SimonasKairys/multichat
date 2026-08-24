@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 269 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers 272 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -422,7 +422,9 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   the project folder and is free to read or write anywhere its own shell/filesystem
   access reaches; see [Project files](#project-files) for the honest boundary.
 - **Proxy support** — honours `HTTP_PROXY`/`HTTPS_PROXY` and, via reqwest's `socks`
-  feature, `ALL_PROXY=socks5://…`.
+  feature, `ALL_PROXY=socks5://…`. Disabled outright under `--classified`: a proxy
+  routes even a loopback request off the machine, which is the one thing that flag
+  promises cannot happen.
 - **`unsafe` confined to one file** — `#![deny(unsafe_code)]` crate-wide with a single
   audited override in `src/security.rs`, enforced by a CI job that rejects the override
   anywhere else.

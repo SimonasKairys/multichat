@@ -726,7 +726,7 @@ async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate
         }];
     }
 
-    let Ok(client) = http_client() else {
+    let Ok(client) = http_client(classified) else {
         return Vec::new();
     };
     match OllamaProvider::list_models(&settings.ollama_host, &client).await {
@@ -1022,7 +1022,7 @@ impl Registry {
         project_root: &Path,
     ) -> Result<Self> {
         let candidates = discover_candidates(settings, classified).await;
-        let client = http_client()?;
+        let client = http_client(classified)?;
         let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
         let mut applied: BTreeMap<String, ConnectionSpec> = BTreeMap::new();
         let mut connection_ids: BTreeMap<String, String> = BTreeMap::new();

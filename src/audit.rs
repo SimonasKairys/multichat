@@ -872,7 +872,9 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
         return Err(anyhow!("odd-length hex string"));
     }
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Ok((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
         .collect()
 }

@@ -1,0 +1,866 @@
+[
+  {
+    "diff": "--- src/config.rs\n+++ replace Paths::resolve -> Result<Self> with Ok(Default::default())\n@@ -22,19 +22,17 @@\n     pub vault_file: PathBuf,\n     pub audit_log: PathBuf,\n     pub skills_dir: PathBuf,\n }\n \n impl Paths {\n     /// Resolves the per-user application directories, creating them if absent.\n     pub fn resolve() -> Result<Self> {\n-        let dirs = ProjectDirs::from(\"\", \"\", \"simon\")\n-            .context(\"could not determine a home directory for this user\")?;\n-        Self::from_data_dir(dirs.data_dir().to_path_buf())\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Builds paths rooted at an explicit directory. Used by tests and by\n     /// `SIMON_DATA_DIR` overrides.\n     pub fn from_data_dir(data_dir: PathBuf) -> Result<Self> {\n         fs::create_dir_all(&data_dir)\n             .with_context(|| format!(\"failed to create data directory {}\", data_dir.display()))?;\n         let skills_dir = data_dir.join(\"skills\");\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Paths::resolve",
+      "return_type": "-> Result<Self>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 33
+        },
+        "start": {
+          "column": 5,
+          "line": 28
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:30:9: replace Paths::resolve -> Result<Self> with Ok(Default::default())",
+    "package": "simon",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 59,
+        "line": 32
+      },
+      "start": {
+        "column": 9,
+        "line": 30
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Paths::from_data_dir -> Result<Self> with Ok(Default::default())\n@@ -30,38 +30,17 @@\n         let dirs = ProjectDirs::from(\"\", \"\", \"simon\")\n             .context(\"could not determine a home directory for this user\")?;\n         Self::from_data_dir(dirs.data_dir().to_path_buf())\n     }\n \n     /// Builds paths rooted at an explicit directory. Used by tests and by\n     /// `SIMON_DATA_DIR` overrides.\n     pub fn from_data_dir(data_dir: PathBuf) -> Result<Self> {\n-        fs::create_dir_all(&data_dir)\n-            .with_context(|| format!(\"failed to create data directory {}\", data_dir.display()))?;\n-        let skills_dir = data_dir.join(\"skills\");\n-        fs::create_dir_all(&skills_dir).with_context(|| {\n-            format!(\"failed to create skills directory {}\", skills_dir.display())\n-        })?;\n-        // The workspace root is deliberately NOT part of `Paths`: it used to be a\n-        // scratch tree under the data dir, but it is now the user's project folder\n-        // (see `workspace.rs`'s module doc and `resolve_project_root` in `main.rs`),\n-        // which lives wherever the user's project lives, not under application state.\n-        // Entangling the two would mean a `--project` override had to reach through\n-        // `Paths` to take effect, when nothing else in `Paths` has any reason to know\n-        // about it.\n-        restrict_to_owner(&data_dir)?;\n-\n-        Ok(Self {\n-            config_file: data_dir.join(\"config.json\"),\n-            vault_file: data_dir.join(\"vault.enc\"),\n-            audit_log: data_dir.join(\"audit.log\"),\n-            skills_dir,\n-            data_dir,\n-        })\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Honours `SIMON_DATA_DIR` when set, otherwise the platform default.\n     pub fn resolve_with_env() -> Result<Self> {\n         match std::env::var_os(\"SIMON_DATA_DIR\") {\n             Some(dir) => Self::from_data_dir(PathBuf::from(dir)),\n             None => Self::resolve(),\n         }\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Paths::from_data_dir",
+      "return_type": "-> Result<Self>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 60
+        },
+        "start": {
+          "column": 5,
+          "line": 35
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:38:9: replace Paths::from_data_dir -> Result<Self> with Ok(Default::default())",
+    "package": "simon",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 59
+      },
+      "start": {
+        "column": 9,
+        "line": 38
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Paths::resolve_with_env -> Result<Self> with Ok(Default::default())\n@@ -56,20 +56,17 @@\n             audit_log: data_dir.join(\"audit.log\"),\n             skills_dir,\n             data_dir,\n         })\n     }\n \n     /// Honours `SIMON_DATA_DIR` when set, otherwise the platform default.\n     pub fn resolve_with_env() -> Result<Self> {\n-        match std::env::var_os(\"SIMON_DATA_DIR\") {\n-            Some(dir) => Self::from_data_dir(PathBuf::from(dir)),\n-            None => Self::resolve(),\n-        }\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// Tightens directory permissions to owner-only where the platform supports it.\n #[cfg(unix)]\n fn restrict_to_owner(dir: &Path) -> Result<()> {\n     use std::os::unix::fs::PermissionsExt;\n     let mut perms = fs::metadata(dir)?.permissions();\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Paths::resolve_with_env",
+      "return_type": "-> Result<Self>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 68
+        },
+        "start": {
+          "column": 5,
+          "line": 62
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:64:9: replace Paths::resolve_with_env -> Result<Self> with Ok(Default::default())",
+    "package": "simon",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 67
+      },
+      "start": {
+        "column": 9,
+        "line": 64
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace restrict_to_owner -> Result<()> with Ok(())\n@@ -66,22 +66,17 @@\n             None => Self::resolve(),\n         }\n     }\n }\n \n /// Tightens directory permissions to owner-only where the platform supports it.\n #[cfg(unix)]\n fn restrict_to_owner(dir: &Path) -> Result<()> {\n-    use std::os::unix::fs::PermissionsExt;\n-    let mut perms = fs::metadata(dir)?.permissions();\n-    perms.set_mode(0o700);\n-    fs::set_permissions(dir, perms)\n-        .with_context(|| format!(\"failed to restrict permissions on {}\", dir.display()))?;\n-    Ok(())\n+    Ok(()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// On Windows the per-user AppData directory is already ACL'd to the owner; tightening\n /// it further would need explicit ACL manipulation, which is out of scope here.\n #[cfg(not(unix))]\n fn restrict_to_owner(_dir: &Path) -> Result<()> {\n     Ok(())\n }\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "restrict_to_owner",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 80
+        },
+        "start": {
+          "column": 1,
+          "line": 71
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:74:5: replace restrict_to_owner -> Result<()> with Ok(())",
+    "package": "simon",
+    "replacement": "Ok(())",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 79
+      },
+      "start": {
+        "column": 5,
+        "line": 74
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace builtin_endpoint -> Option<CloudEndpoint> with None\n@@ -103,48 +103,17 @@\n     pub api: Api,\n     pub base_url: String,\n     pub default_model: String,\n }\n \n /// Built-in endpoint definitions. Anything not listed here must be configured\n /// explicitly — an unknown provider name is an error, never a silent default.\n pub fn builtin_endpoint(provider: &str) -> Option<CloudEndpoint> {\n-    let e = match provider.to_ascii_lowercase().as_str() {\n-        \"anthropic\" | \"claude\" => CloudEndpoint {\n-            api: Api::Anthropic,\n-            base_url: \"https://api.anthropic.com\".into(),\n-            default_model: \"claude-opus-5\".into(),\n-        },\n-        \"openai\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://api.openai.com/v1\".into(),\n-            default_model: \"gpt-4o\".into(),\n-        },\n-        // Google's OpenAI-compatible surface, so this needs no new `Api` variant.\n-        // Shares the `google` connection id with the `gemini` CLI (see\n-        // `cli_vendor_id`), which gives the picker paired \"via CLI\" / \"via API\" rows.\n-        \"google\" | \"gemini\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://generativelanguage.googleapis.com/v1beta/openai\".into(),\n-            default_model: \"gemini-2.5-pro\".into(),\n-        },\n-        \"openrouter\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://openrouter.ai/api/v1\".into(),\n-            default_model: \"openai/gpt-4o\".into(),\n-        },\n-        \"groq\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://api.groq.com/openai/v1\".into(),\n-            default_model: \"llama-3.3-70b-versatile\".into(),\n-        },\n-        _ => return None,\n-    };\n-    Some(e)\n+    None /* ~ changed by cargo-mutants ~ */\n }\n \n /// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`) to the\n /// canonical id vendor discovery actually looks up in the keyring (`anthropic`,\n /// `google`). A key stored under the alias would be stored successfully but never\n /// found — discovery only ever asks for canonical ids. Kept visibly next to\n /// `builtin_endpoint`'s alias arms so a future alias gets added to both. Anything\n /// that isn't one of the two aliases — including a custom endpoint name — passes\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "builtin_endpoint",
+      "return_type": "-> Option<CloudEndpoint>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 143
+        },
+        "start": {
+          "column": 1,
+          "line": 108
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:111:5: replace builtin_endpoint -> Option<CloudEndpoint> with None",
+    "package": "simon",
+    "replacement": "None",
+    "span": {
+      "end": {
+        "column": 12,
+        "line": 142
+      },
+      "start": {
+        "column": 5,
+        "line": 111
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace builtin_endpoint -> Option<CloudEndpoint> with Some(Default::default())\n@@ -103,48 +103,17 @@\n     pub api: Api,\n     pub base_url: String,\n     pub default_model: String,\n }\n \n /// Built-in endpoint definitions. Anything not listed here must be configured\n /// explicitly — an unknown provider name is an error, never a silent default.\n pub fn builtin_endpoint(provider: &str) -> Option<CloudEndpoint> {\n-    let e = match provider.to_ascii_lowercase().as_str() {\n-        \"anthropic\" | \"claude\" => CloudEndpoint {\n-            api: Api::Anthropic,\n-            base_url: \"https://api.anthropic.com\".into(),\n-            default_model: \"claude-opus-5\".into(),\n-        },\n-        \"openai\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://api.openai.com/v1\".into(),\n-            default_model: \"gpt-4o\".into(),\n-        },\n-        // Google's OpenAI-compatible surface, so this needs no new `Api` variant.\n-        // Shares the `google` connection id with the `gemini` CLI (see\n-        // `cli_vendor_id`), which gives the picker paired \"via CLI\" / \"via API\" rows.\n-        \"google\" | \"gemini\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://generativelanguage.googleapis.com/v1beta/openai\".into(),\n-            default_model: \"gemini-2.5-pro\".into(),\n-        },\n-        \"openrouter\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://openrouter.ai/api/v1\".into(),\n-            default_model: \"openai/gpt-4o\".into(),\n-        },\n-        \"groq\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://api.groq.com/openai/v1\".into(),\n-            default_model: \"llama-3.3-70b-versatile\".into(),\n-        },\n-        _ => return None,\n-    };\n-    Some(e)\n+    Some(Default::default()) /* ~ changed by cargo-mutants ~ */\n }\n \n /// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`) to the\n /// canonical id vendor discovery actually looks up in the keyring (`anthropic`,\n /// `google`). A key stored under the alias would be stored successfully but never\n /// found — discovery only ever asks for canonical ids. Kept visibly next to\n /// `builtin_endpoint`'s alias arms so a future alias gets added to both. Anything\n /// that isn't one of the two aliases — including a custom endpoint name — passes\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "builtin_endpoint",
+      "return_type": "-> Option<CloudEndpoint>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 143
+        },
+        "start": {
+          "column": 1,
+          "line": 108
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:111:5: replace builtin_endpoint -> Option<CloudEndpoint> with Some(Default::default())",
+    "package": "simon",
+    "replacement": "Some(Default::default())",
+    "span": {
+      "end": {
+        "column": 12,
+        "line": 142
+      },
+      "start": {
+        "column": 5,
+        "line": 111
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ delete match arm \"anthropic\" | \"claude\" in builtin_endpoint\n@@ -104,21 +104,17 @@\n     pub base_url: String,\n     pub default_model: String,\n }\n \n /// Built-in endpoint definitions. Anything not listed here must be configured\n /// explicitly — an unknown provider name is an error, never a silent default.\n pub fn builtin_endpoint(provider: &str) -> Option<CloudEndpoint> {\n     let e = match provider.to_ascii_lowercase().as_str() {\n-        \"anthropic\" | \"claude\" => CloudEndpoint {\n-            api: Api::Anthropic,\n-            base_url: \"https://api.anthropic.com\".into(),\n-            default_model: \"claude-opus-5\".into(),\n-        },\n+         /* ~ changed by cargo-mutants ~ */\n         \"openai\" => CloudEndpoint {\n             api: Api::OpenAiCompatible,\n             base_url: \"https://api.openai.com/v1\".into(),\n             default_model: \"gpt-4o\".into(),\n         },\n         // Google's OpenAI-compatible surface, so this needs no new `Api` variant.\n         // Shares the `google` connection id with the `gemini` CLI (see\n         // `cli_vendor_id`), which gives the picker paired \"via CLI\" / \"via API\" rows.\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "builtin_endpoint",
+      "return_type": "-> Option<CloudEndpoint>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 143
+        },
+        "start": {
+          "column": 1,
+          "line": 108
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/config.rs:112:9: delete match arm \"anthropic\" | \"claude\" in builtin_endpoint",
+    "package": "simon",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 116
+      },
+      "start": {
+        "column": 9,
+        "line": 112
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ delete match arm \"openai\" in builtin_endpoint\n@@ -109,21 +109,17 @@\n /// explicitly — an unknown provider name is an error, never a silent default.\n pub fn builtin_endpoint(provider: &str) -> Option<CloudEndpoint> {\n     let e = match provider.to_ascii_lowercase().as_str() {\n         \"anthropic\" | \"claude\" => CloudEndpoint {\n             api: Api::Anthropic,\n             base_url: \"https://api.anthropic.com\".into(),\n             default_model: \"claude-opus-5\".into(),\n         },\n-        \"openai\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://api.openai.com/v1\".into(),\n-            default_model: \"gpt-4o\".into(),\n-        },\n+         /* ~ changed by cargo-mutants ~ */\n         // Google's OpenAI-compatible surface, so this needs no new `Api` variant.\n         // Shares the `google` connection id with the `gemini` CLI (see\n         // `cli_vendor_id`), which gives the picker paired \"via CLI\" / \"via API\" rows.\n         \"google\" | \"gemini\" => CloudEndpoint {\n             api: Api::OpenAiCompatible,\n             base_url: \"https://generativelanguage.googleapis.com/v1beta/openai\".into(),\n             default_model: \"gemini-2.5-pro\".into(),\n         },\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "builtin_endpoint",
+      "return_type": "-> Option<CloudEndpoint>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 143
+        },
+        "start": {
+          "column": 1,
+          "line": 108
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/config.rs:117:9: delete match arm \"openai\" in builtin_endpoint",
+    "package": "simon",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 121
+      },
+      "start": {
+        "column": 9,
+        "line": 117
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ delete match arm \"google\" | \"gemini\" in builtin_endpoint\n@@ -117,21 +117,17 @@\n         \"openai\" => CloudEndpoint {\n             api: Api::OpenAiCompatible,\n             base_url: \"https://api.openai.com/v1\".into(),\n             default_model: \"gpt-4o\".into(),\n         },\n         // Google's OpenAI-compatible surface, so this needs no new `Api` variant.\n         // Shares the `google` connection id with the `gemini` CLI (see\n         // `cli_vendor_id`), which gives the picker paired \"via CLI\" / \"via API\" rows.\n-        \"google\" | \"gemini\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://generativelanguage.googleapis.com/v1beta/openai\".into(),\n-            default_model: \"gemini-2.5-pro\".into(),\n-        },\n+         /* ~ changed by cargo-mutants ~ */\n         \"openrouter\" => CloudEndpoint {\n             api: Api::OpenAiCompatible,\n             base_url: \"https://openrouter.ai/api/v1\".into(),\n             default_model: \"openai/gpt-4o\".into(),\n         },\n         \"groq\" => CloudEndpoint {\n             api: Api::OpenAiCompatible,\n             base_url: \"https://api.groq.com/openai/v1\".into(),\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "builtin_endpoint",
+      "return_type": "-> Option<CloudEndpoint>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 143
+        },
+        "start": {
+          "column": 1,
+          "line": 108
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/config.rs:125:9: delete match arm \"google\" | \"gemini\" in builtin_endpoint",
+    "package": "simon",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 129
+      },
+      "start": {
+        "column": 9,
+        "line": 125
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ delete match arm \"openrouter\" in builtin_endpoint\n@@ -122,21 +122,17 @@\n         // Google's OpenAI-compatible surface, so this needs no new `Api` variant.\n         // Shares the `google` connection id with the `gemini` CLI (see\n         // `cli_vendor_id`), which gives the picker paired \"via CLI\" / \"via API\" rows.\n         \"google\" | \"gemini\" => CloudEndpoint {\n             api: Api::OpenAiCompatible,\n             base_url: \"https://generativelanguage.googleapis.com/v1beta/openai\".into(),\n             default_model: \"gemini-2.5-pro\".into(),\n         },\n-        \"openrouter\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://openrouter.ai/api/v1\".into(),\n-            default_model: \"openai/gpt-4o\".into(),\n-        },\n+         /* ~ changed by cargo-mutants ~ */\n         \"groq\" => CloudEndpoint {\n             api: Api::OpenAiCompatible,\n             base_url: \"https://api.groq.com/openai/v1\".into(),\n             default_model: \"llama-3.3-70b-versatile\".into(),\n         },\n         _ => return None,\n     };\n     Some(e)\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "builtin_endpoint",
+      "return_type": "-> Option<CloudEndpoint>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 143
+        },
+        "start": {
+          "column": 1,
+          "line": 108
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/config.rs:130:9: delete match arm \"openrouter\" in builtin_endpoint",
+    "package": "simon",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 134
+      },
+      "start": {
+        "column": 9,
+        "line": 130
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ delete match arm \"groq\" in builtin_endpoint\n@@ -127,21 +127,17 @@\n             base_url: \"https://generativelanguage.googleapis.com/v1beta/openai\".into(),\n             default_model: \"gemini-2.5-pro\".into(),\n         },\n         \"openrouter\" => CloudEndpoint {\n             api: Api::OpenAiCompatible,\n             base_url: \"https://openrouter.ai/api/v1\".into(),\n             default_model: \"openai/gpt-4o\".into(),\n         },\n-        \"groq\" => CloudEndpoint {\n-            api: Api::OpenAiCompatible,\n-            base_url: \"https://api.groq.com/openai/v1\".into(),\n-            default_model: \"llama-3.3-70b-versatile\".into(),\n-        },\n+         /* ~ changed by cargo-mutants ~ */\n         _ => return None,\n     };\n     Some(e)\n }\n \n /// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`) to the\n /// canonical id vendor discovery actually looks up in the keyring (`anthropic`,\n /// `google`). A key stored under the alias would be stored successfully but never\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "builtin_endpoint",
+      "return_type": "-> Option<CloudEndpoint>",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 143
+        },
+        "start": {
+          "column": 1,
+          "line": 108
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/config.rs:135:9: delete match arm \"groq\" in builtin_endpoint",
+    "package": "simon",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 11,
+        "line": 139
+      },
+      "start": {
+        "column": 9,
+        "line": 135
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace canonical_provider -> &str with \"\"\n@@ -145,21 +145,17 @@\n /// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`) to the\n /// canonical id vendor discovery actually looks up in the keyring (`anthropic`,\n /// `google`). A key stored under the alias would be stored successfully but never\n /// found — discovery only ever asks for canonical ids. Kept visibly next to\n /// `builtin_endpoint`'s alias arms so a future alias gets added to both. Anything\n /// that isn't one of the two aliases — including a custom endpoint name — passes\n /// through unchanged.\n pub fn canonical_provider(name: &str) -> &str {\n-    match name.to_ascii_lowercase().as_str() {\n-        \"claude\" => \"anthropic\",\n-        \"gemini\" => \"google\",\n-        _ => name,\n-    }\n+    \"\" /* ~ changed by cargo-mutants ~ */\n }\n \n /// Which transport carries a connection's traffic. `Api` and `Cli` are the only two\n /// today; Ollama has no choice to make, so its `ConnectionSpec::transport` is `None`.\n #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n #[serde(rename_all = \"snake_case\")]\n pub enum Transport {\n     Cli,\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "canonical_provider",
+      "return_type": "-> &str",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 158
+        },
+        "start": {
+          "column": 1,
+          "line": 145
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:153:5: replace canonical_provider -> &str with \"\"",
+    "package": "simon",
+    "replacement": "\"\"",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 157
+      },
+      "start": {
+        "column": 5,
+        "line": 153
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace canonical_provider -> &str with \"xyzzy\"\n@@ -145,21 +145,17 @@\n /// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`) to the\n /// canonical id vendor discovery actually looks up in the keyring (`anthropic`,\n /// `google`). A key stored under the alias would be stored successfully but never\n /// found — discovery only ever asks for canonical ids. Kept visibly next to\n /// `builtin_endpoint`'s alias arms so a future alias gets added to both. Anything\n /// that isn't one of the two aliases — including a custom endpoint name — passes\n /// through unchanged.\n pub fn canonical_provider(name: &str) -> &str {\n-    match name.to_ascii_lowercase().as_str() {\n-        \"claude\" => \"anthropic\",\n-        \"gemini\" => \"google\",\n-        _ => name,\n-    }\n+    \"xyzzy\" /* ~ changed by cargo-mutants ~ */\n }\n \n /// Which transport carries a connection's traffic. `Api` and `Cli` are the only two\n /// today; Ollama has no choice to make, so its `ConnectionSpec::transport` is `None`.\n #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n #[serde(rename_all = \"snake_case\")]\n pub enum Transport {\n     Cli,\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "canonical_provider",
+      "return_type": "-> &str",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 158
+        },
+        "start": {
+          "column": 1,
+          "line": 145
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:153:5: replace canonical_provider -> &str with \"xyzzy\"",
+    "package": "simon",
+    "replacement": "\"xyzzy\"",
+    "span": {
+      "end": {
+        "column": 6,
+        "line": 157
+      },
+      "start": {
+        "column": 5,
+        "line": 153
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ delete match arm \"claude\" in canonical_provider\n@@ -146,17 +146,17 @@\n /// canonical id vendor discovery actually looks up in the keyring (`anthropic`,\n /// `google`). A key stored under the alias would be stored successfully but never\n /// found — discovery only ever asks for canonical ids. Kept visibly next to\n /// `builtin_endpoint`'s alias arms so a future alias gets added to both. Anything\n /// that isn't one of the two aliases — including a custom endpoint name — passes\n /// through unchanged.\n pub fn canonical_provider(name: &str) -> &str {\n     match name.to_ascii_lowercase().as_str() {\n-        \"claude\" => \"anthropic\",\n+         /* ~ changed by cargo-mutants ~ */\n         \"gemini\" => \"google\",\n         _ => name,\n     }\n }\n \n /// Which transport carries a connection's traffic. `Api` and `Cli` are the only two\n /// today; Ollama has no choice to make, so its `ConnectionSpec::transport` is `None`.\n #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "canonical_provider",
+      "return_type": "-> &str",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 158
+        },
+        "start": {
+          "column": 1,
+          "line": 145
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/config.rs:154:9: delete match arm \"claude\" in canonical_provider",
+    "package": "simon",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 33,
+        "line": 154
+      },
+      "start": {
+        "column": 9,
+        "line": 154
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ delete match arm \"gemini\" in canonical_provider\n@@ -147,17 +147,17 @@\n /// `google`). A key stored under the alias would be stored successfully but never\n /// found — discovery only ever asks for canonical ids. Kept visibly next to\n /// `builtin_endpoint`'s alias arms so a future alias gets added to both. Anything\n /// that isn't one of the two aliases — including a custom endpoint name — passes\n /// through unchanged.\n pub fn canonical_provider(name: &str) -> &str {\n     match name.to_ascii_lowercase().as_str() {\n         \"claude\" => \"anthropic\",\n-        \"gemini\" => \"google\",\n+         /* ~ changed by cargo-mutants ~ */\n         _ => name,\n     }\n }\n \n /// Which transport carries a connection's traffic. `Api` and `Cli` are the only two\n /// today; Ollama has no choice to make, so its `ConnectionSpec::transport` is `None`.\n #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]\n #[serde(rename_all = \"snake_case\")]\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "canonical_provider",
+      "return_type": "-> &str",
+      "span": {
+        "end": {
+          "column": 2,
+          "line": 158
+        },
+        "start": {
+          "column": 1,
+          "line": 145
+        }
+      }
+    },
+    "genre": "MatchArm",
+    "name": "src/config.rs:155:9: delete match arm \"gemini\" in canonical_provider",
+    "package": "simon",
+    "replacement": "",
+    "span": {
+      "end": {
+        "column": 30,
+        "line": 155
+      },
+      "start": {
+        "column": 9,
+        "line": 155
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Settings::load -> Result<Self> with Ok(Default::default())\n@@ -237,24 +237,17 @@\n             connections: Default::default(),\n             commander: None,\n         }\n     }\n }\n \n impl Settings {\n     pub fn load(paths: &Paths) -> Result<Self> {\n-        match fs::read_to_string(&paths.config_file) {\n-            Ok(raw) => serde_json::from_str(&raw)\n-                .with_context(|| format!(\"failed to parse {}\", paths.config_file.display())),\n-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),\n-            Err(e) => {\n-                Err(e).with_context(|| format!(\"failed to read {}\", paths.config_file.display()))\n-            }\n-        }\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Writes `config.json` atomically (temp file + rename), not with a bare\n     /// `fs::write`. `fs::write` truncates the file before writing its new content, so a\n     /// crash, power loss, or full disk in that window — and this file is rewritten on\n     /// every picker submit, so the window recurs constantly — leaves `config.json`\n     /// truncated or empty. `Settings::load` then fails to parse it at startup, taking\n     /// the user's whole connection set and provider endpoints down with it until they\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Settings::load",
+      "return_type": "-> Result<Self>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 253
+        },
+        "start": {
+          "column": 5,
+          "line": 244
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:245:9: replace Settings::load -> Result<Self> with Ok(Default::default())",
+    "package": "simon",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 252
+      },
+      "start": {
+        "column": 9,
+        "line": 245
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace match guard e.kind() == std::io::ErrorKind::NotFound with true in Settings::load\n@@ -240,17 +240,17 @@\n     }\n }\n \n impl Settings {\n     pub fn load(paths: &Paths) -> Result<Self> {\n         match fs::read_to_string(&paths.config_file) {\n             Ok(raw) => serde_json::from_str(&raw)\n                 .with_context(|| format!(\"failed to parse {}\", paths.config_file.display())),\n-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),\n+            Err(e) if true /* ~ changed by cargo-mutants ~ */ => Ok(Self::default()),\n             Err(e) => {\n                 Err(e).with_context(|| format!(\"failed to read {}\", paths.config_file.display()))\n             }\n         }\n     }\n \n     /// Writes `config.json` atomically (temp file + rename), not with a bare\n     /// `fs::write`. `fs::write` truncates the file before writing its new content, so a\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Settings::load",
+      "return_type": "-> Result<Self>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 253
+        },
+        "start": {
+          "column": 5,
+          "line": 244
+        }
+      }
+    },
+    "genre": "MatchArmGuard",
+    "name": "src/config.rs:248:23: replace match guard e.kind() == std::io::ErrorKind::NotFound with true in Settings::load",
+    "package": "simon",
+    "replacement": "true",
+    "span": {
+      "end": {
+        "column": 63,
+        "line": 248
+      },
+      "start": {
+        "column": 23,
+        "line": 248
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace match guard e.kind() == std::io::ErrorKind::NotFound with false in Settings::load\n@@ -240,17 +240,17 @@\n     }\n }\n \n impl Settings {\n     pub fn load(paths: &Paths) -> Result<Self> {\n         match fs::read_to_string(&paths.config_file) {\n             Ok(raw) => serde_json::from_str(&raw)\n                 .with_context(|| format!(\"failed to parse {}\", paths.config_file.display())),\n-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),\n+            Err(e) if false /* ~ changed by cargo-mutants ~ */ => Ok(Self::default()),\n             Err(e) => {\n                 Err(e).with_context(|| format!(\"failed to read {}\", paths.config_file.display()))\n             }\n         }\n     }\n \n     /// Writes `config.json` atomically (temp file + rename), not with a bare\n     /// `fs::write`. `fs::write` truncates the file before writing its new content, so a\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Settings::load",
+      "return_type": "-> Result<Self>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 253
+        },
+        "start": {
+          "column": 5,
+          "line": 244
+        }
+      }
+    },
+    "genre": "MatchArmGuard",
+    "name": "src/config.rs:248:23: replace match guard e.kind() == std::io::ErrorKind::NotFound with false in Settings::load",
+    "package": "simon",
+    "replacement": "false",
+    "span": {
+      "end": {
+        "column": 63,
+        "line": 248
+      },
+      "start": {
+        "column": 23,
+        "line": 248
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace == with != in Settings::load\n@@ -240,17 +240,17 @@\n     }\n }\n \n impl Settings {\n     pub fn load(paths: &Paths) -> Result<Self> {\n         match fs::read_to_string(&paths.config_file) {\n             Ok(raw) => serde_json::from_str(&raw)\n                 .with_context(|| format!(\"failed to parse {}\", paths.config_file.display())),\n-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),\n+            Err(e) if e.kind() != /* ~ changed by cargo-mutants ~ */ std::io::ErrorKind::NotFound => Ok(Self::default()),\n             Err(e) => {\n                 Err(e).with_context(|| format!(\"failed to read {}\", paths.config_file.display()))\n             }\n         }\n     }\n \n     /// Writes `config.json` atomically (temp file + rename), not with a bare\n     /// `fs::write`. `fs::write` truncates the file before writing its new content, so a\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Settings::load",
+      "return_type": "-> Result<Self>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 253
+        },
+        "start": {
+          "column": 5,
+          "line": 244
+        }
+      }
+    },
+    "genre": "BinaryOperator",
+    "name": "src/config.rs:248:32: replace == with != in Settings::load",
+    "package": "simon",
+    "replacement": "!=",
+    "span": {
+      "end": {
+        "column": 34,
+        "line": 248
+      },
+      "start": {
+        "column": 32,
+        "line": 248
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Settings::save -> Result<()> with Ok(())\n@@ -257,21 +257,17 @@\n     /// crash, power loss, or full disk in that window — and this file is rewritten on\n     /// every picker submit, so the window recurs constantly — leaves `config.json`\n     /// truncated or empty. `Settings::load` then fails to parse it at startup, taking\n     /// the user's whole connection set and provider endpoints down with it until they\n     /// repair or delete the file by hand. `vault.rs` already solved exactly this problem\n     /// for `vault.enc`; `write_atomically` there is reused rather than duplicated here,\n     /// per the audit's own observation that the fix was \"lifting an existing function.\"\n     pub fn save(&self, paths: &Paths) -> Result<()> {\n-        let raw = serde_json::to_string_pretty(self)?;\n-        // `write_atomically`'s own errors already name the temp and target paths, so no\n-        // extra `.context(...)` is added here — layering one on would just repeat the\n-        // same path in the message twice.\n-        crate::vault::write_atomically(&paths.config_file, raw.as_bytes())\n+        Ok(()) /* ~ changed by cargo-mutants ~ */\n     }\n \n     /// Resolves a provider name to an endpoint, preferring user overrides.\n     pub fn endpoint(&self, provider: &str) -> Option<CloudEndpoint> {\n         self.custom_endpoints\n             .get(provider)\n             .cloned()\n             .or_else(|| builtin_endpoint(provider))\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Settings::save",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 270
+        },
+        "start": {
+          "column": 5,
+          "line": 255
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:265:9: replace Settings::save -> Result<()> with Ok(())",
+    "package": "simon",
+    "replacement": "Ok(())",
+    "span": {
+      "end": {
+        "column": 75,
+        "line": 269
+      },
+      "start": {
+        "column": 9,
+        "line": 265
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Settings::endpoint -> Option<CloudEndpoint> with None\n@@ -266,20 +266,17 @@\n         // `write_atomically`'s own errors already name the temp and target paths, so no\n         // extra `.context(...)` is added here — layering one on would just repeat the\n         // same path in the message twice.\n         crate::vault::write_atomically(&paths.config_file, raw.as_bytes())\n     }\n \n     /// Resolves a provider name to an endpoint, preferring user overrides.\n     pub fn endpoint(&self, provider: &str) -> Option<CloudEndpoint> {\n-        self.custom_endpoints\n-            .get(provider)\n-            .cloned()\n-            .or_else(|| builtin_endpoint(provider))\n+        None /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// OS keyring access for API keys.\n pub struct Credentials;\n \n impl Credentials {\n     fn entry(service: &str) -> Result<Entry> {\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Settings::endpoint",
+      "return_type": "-> Option<CloudEndpoint>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 278
+        },
+        "start": {
+          "column": 5,
+          "line": 272
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:274:9: replace Settings::endpoint -> Option<CloudEndpoint> with None",
+    "package": "simon",
+    "replacement": "None",
+    "span": {
+      "end": {
+        "column": 52,
+        "line": 277
+      },
+      "start": {
+        "column": 9,
+        "line": 274
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Settings::endpoint -> Option<CloudEndpoint> with Some(Default::default())\n@@ -266,20 +266,17 @@\n         // `write_atomically`'s own errors already name the temp and target paths, so no\n         // extra `.context(...)` is added here — layering one on would just repeat the\n         // same path in the message twice.\n         crate::vault::write_atomically(&paths.config_file, raw.as_bytes())\n     }\n \n     /// Resolves a provider name to an endpoint, preferring user overrides.\n     pub fn endpoint(&self, provider: &str) -> Option<CloudEndpoint> {\n-        self.custom_endpoints\n-            .get(provider)\n-            .cloned()\n-            .or_else(|| builtin_endpoint(provider))\n+        Some(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n /// OS keyring access for API keys.\n pub struct Credentials;\n \n impl Credentials {\n     fn entry(service: &str) -> Result<Entry> {\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Settings::endpoint",
+      "return_type": "-> Option<CloudEndpoint>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 278
+        },
+        "start": {
+          "column": 5,
+          "line": 272
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:274:9: replace Settings::endpoint -> Option<CloudEndpoint> with Some(Default::default())",
+    "package": "simon",
+    "replacement": "Some(Default::default())",
+    "span": {
+      "end": {
+        "column": 52,
+        "line": 277
+      },
+      "start": {
+        "column": 9,
+        "line": 274
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Credentials::entry -> Result<Entry> with Ok(Default::default())\n@@ -278,19 +278,17 @@\n     }\n }\n \n /// OS keyring access for API keys.\n pub struct Credentials;\n \n impl Credentials {\n     fn entry(service: &str) -> Result<Entry> {\n-        let namespaced = format!(\"{KEYRING_PREFIX}:{service}\");\n-        Entry::new(&namespaced, DEFAULT_KEYRING_USER)\n-            .with_context(|| format!(\"failed to open keyring entry for {service}\"))\n+        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */\n     }\n \n     pub fn get(service: &str) -> Result<Option<SecretString>> {\n         match Self::entry(service)?.get_password() {\n             Ok(secret) => Ok(Some(SecretString::from(secret))),\n             Err(keyring::Error::NoEntry) => Ok(None),\n             Err(e) => Err(anyhow!(\n                 \"failed to read {service} credential from keyring: {e}\"\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Credentials::entry",
+      "return_type": "-> Result<Entry>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 289
+        },
+        "start": {
+          "column": 5,
+          "line": 285
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:286:9: replace Credentials::entry -> Result<Entry> with Ok(Default::default())",
+    "package": "simon",
+    "replacement": "Ok(Default::default())",
+    "span": {
+      "end": {
+        "column": 84,
+        "line": 288
+      },
+      "start": {
+        "column": 9,
+        "line": 286
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Credentials::get -> Result<Option<SecretString>> with Ok(None)\n@@ -284,23 +284,17 @@\n impl Credentials {\n     fn entry(service: &str) -> Result<Entry> {\n         let namespaced = format!(\"{KEYRING_PREFIX}:{service}\");\n         Entry::new(&namespaced, DEFAULT_KEYRING_USER)\n             .with_context(|| format!(\"failed to open keyring entry for {service}\"))\n     }\n \n     pub fn get(service: &str) -> Result<Option<SecretString>> {\n-        match Self::entry(service)?.get_password() {\n-            Ok(secret) => Ok(Some(SecretString::from(secret))),\n-            Err(keyring::Error::NoEntry) => Ok(None),\n-            Err(e) => Err(anyhow!(\n-                \"failed to read {service} credential from keyring: {e}\"\n-            )),\n-        }\n+        Ok(None) /* ~ changed by cargo-mutants ~ */\n     }\n \n     pub fn set(service: &str, secret: &str) -> Result<()> {\n         if secret.trim().is_empty() {\n             return Err(anyhow!(\n                 \"refusing to store an empty credential for {service}\"\n             ));\n         }\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Credentials::get",
+      "return_type": "-> Result<Option<SecretString>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 299
+        },
+        "start": {
+          "column": 5,
+          "line": 291
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:292:9: replace Credentials::get -> Result<Option<SecretString>> with Ok(None)",
+    "package": "simon",
+    "replacement": "Ok(None)",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 298
+      },
+      "start": {
+        "column": 9,
+        "line": 292
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Credentials::get -> Result<Option<SecretString>> with Ok(Some(Default::default()))\n@@ -284,23 +284,17 @@\n impl Credentials {\n     fn entry(service: &str) -> Result<Entry> {\n         let namespaced = format!(\"{KEYRING_PREFIX}:{service}\");\n         Entry::new(&namespaced, DEFAULT_KEYRING_USER)\n             .with_context(|| format!(\"failed to open keyring entry for {service}\"))\n     }\n \n     pub fn get(service: &str) -> Result<Option<SecretString>> {\n-        match Self::entry(service)?.get_password() {\n-            Ok(secret) => Ok(Some(SecretString::from(secret))),\n-            Err(keyring::Error::NoEntry) => Ok(None),\n-            Err(e) => Err(anyhow!(\n-                \"failed to read {service} credential from keyring: {e}\"\n-            )),\n-        }\n+        Ok(Some(Default::default())) /* ~ changed by cargo-mutants ~ */\n     }\n \n     pub fn set(service: &str, secret: &str) -> Result<()> {\n         if secret.trim().is_empty() {\n             return Err(anyhow!(\n                 \"refusing to store an empty credential for {service}\"\n             ));\n         }\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Credentials::get",
+      "return_type": "-> Result<Option<SecretString>>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 299
+        },
+        "start": {
+          "column": 5,
+          "line": 291
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:292:9: replace Credentials::get -> Result<Option<SecretString>> with Ok(Some(Default::default()))",
+    "package": "simon",
+    "replacement": "Ok(Some(Default::default()))",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 298
+      },
+      "start": {
+        "column": 9,
+        "line": 292
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Credentials::set -> Result<()> with Ok(())\n@@ -294,24 +294,17 @@\n             Err(keyring::Error::NoEntry) => Ok(None),\n             Err(e) => Err(anyhow!(\n                 \"failed to read {service} credential from keyring: {e}\"\n             )),\n         }\n     }\n \n     pub fn set(service: &str, secret: &str) -> Result<()> {\n-        if secret.trim().is_empty() {\n-            return Err(anyhow!(\n-                \"refusing to store an empty credential for {service}\"\n-            ));\n-        }\n-        Self::entry(service)?\n-            .set_password(secret)\n-            .with_context(|| format!(\"failed to store {service} credential in keyring\"))\n+        Ok(()) /* ~ changed by cargo-mutants ~ */\n     }\n \n     pub fn delete(service: &str) -> Result<()> {\n         match Self::entry(service)?.delete_credential() {\n             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),\n             Err(e) => Err(anyhow!(\"failed to delete {service} credential: {e}\")),\n         }\n     }\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Credentials::set",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 310
+        },
+        "start": {
+          "column": 5,
+          "line": 301
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:302:9: replace Credentials::set -> Result<()> with Ok(())",
+    "package": "simon",
+    "replacement": "Ok(())",
+    "span": {
+      "end": {
+        "column": 89,
+        "line": 309
+      },
+      "start": {
+        "column": 9,
+        "line": 302
+      }
+    }
+  },
+  {
+    "diff": "--- src/config.rs\n+++ replace Credentials::delete -> Result<()> with Ok(())\n@@ -305,20 +305,17 @@\n             ));\n         }\n         Self::entry(service)?\n             .set_password(secret)\n             .with_context(|| format!(\"failed to store {service} credential in keyring\"))\n     }\n \n     pub fn delete(service: &str) -> Result<()> {\n-        match Self::entry(service)?.delete_credential() {\n-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),\n-            Err(e) => Err(anyhow!(\"failed to delete {service} credential: {e}\")),\n-        }\n+        Ok(()) /* ~ changed by cargo-mutants ~ */\n     }\n }\n \n #[cfg(test)]\n mod tests {\n     use super::*;\n \n     #[test]\n",
+    "file": "src/config.rs",
+    "function": {
+      "function_name": "Credentials::delete",
+      "return_type": "-> Result<()>",
+      "span": {
+        "end": {
+          "column": 6,
+          "line": 317
+        },
+        "start": {
+          "column": 5,
+          "line": 312
+        }
+      }
+    },
+    "genre": "FnValue",
+    "name": "src/config.rs:313:9: replace Credentials::delete -> Result<()> with Ok(())",
+    "package": "simon",
+    "replacement": "Ok(())",
+    "span": {
+      "end": {
+        "column": 10,
+        "line": 316
+      },
+      "start": {
+        "column": 9,
+        "line": 313
+      }
+    }
+  }
+]

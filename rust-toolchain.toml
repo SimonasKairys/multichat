@@ -1,4 +1,11 @@
 [toolchain]
+# Deliberately unpinned. CI installs whatever stable is on the day it runs, and the
+# workflow sets `RUSTFLAGS: -D warnings`, so a lint added to a new release fails the
+# build with no commit behind it — that happened on 2026-08-25, when a local toolchain
+# a month behind CI's passed clippy cleanly and CI did not. The trade is deliberate:
+# staying on stable keeps new lints arriving early, which is worth more here than a
+# reproducible build would be. **Run `rustup update` before pushing**, or CI will find
+# the lint for you.
 channel = "stable"
 # `cargo` is listed explicitly: rustup re-syncs the channel when it sees this file, and
 # a components list that omits cargo can leave the toolchain without it.

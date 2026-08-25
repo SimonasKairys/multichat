@@ -347,6 +347,37 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn the_data_directory_is_tightened_to_owner_only() {
+        // Found by mutation testing, not by review: replacing `restrict_to_owner` with
+        // `Ok(())` — deleting the permission tightening outright — was caught by no
+        // test at all. The data directory holds `vault.enc`, `config.json` and the
+        // audit log, and the file-level modes lean on the directory being 0o700, so
+        // this is the check the rest of that reasoning rests on.
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("data");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        // Fixture guard: the directory must start loose, or a pass below would prove
+        // only that it was never tightened by anything.
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "fixture failed to loosen the directory first"
+        );
+
+        Paths::from_data_dir(dir.clone()).unwrap();
+
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "the data directory was left readable by group or others"
+        );
+    }
+
+    #[test]
     fn settings_round_trip_through_disk() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();

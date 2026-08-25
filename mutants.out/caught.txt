@@ -1,0 +1,11 @@
+src/config.rs:111:5: replace builtin_endpoint -> Option<CloudEndpoint> with None
+src/config.rs:112:9: delete match arm "anthropic" | "claude" in builtin_endpoint
+src/config.rs:117:9: delete match arm "openai" in builtin_endpoint
+src/config.rs:153:5: replace canonical_provider -> &str with ""
+src/config.rs:153:5: replace canonical_provider -> &str with "xyzzy"
+src/config.rs:155:9: delete match arm "gemini" in canonical_provider
+src/config.rs:154:9: delete match arm "claude" in canonical_provider
+src/config.rs:245:9: replace Settings::load -> Result<Self> with Ok(Default::default())
+src/config.rs:248:23: replace match guard e.kind() == std::io::ErrorKind::NotFound with false in Settings::load
+src/config.rs:248:32: replace == with != in Settings::load
+src/config.rs:265:9: replace Settings::save -> Result<()> with Ok(())

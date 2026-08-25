@@ -1,0 +1,25 @@
+--- src/config.rs
++++ delete match arm "groq" in builtin_endpoint
+@@ -127,21 +127,17 @@
+             base_url: "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+             default_model: "gemini-2.5-pro".into(),
+         },
+         "openrouter" => CloudEndpoint {
+             api: Api::OpenAiCompatible,
+             base_url: "https://openrouter.ai/api/v1".into(),
+             default_model: "openai/gpt-4o".into(),
+         },
+-        "groq" => CloudEndpoint {
+-            api: Api::OpenAiCompatible,
+-            base_url: "https://api.groq.com/openai/v1".into(),
+-            default_model: "llama-3.3-70b-versatile".into(),
+-        },
++         /* ~ changed by cargo-mutants ~ */
+         _ => return None,
+     };
+     Some(e)
+ }
+ 
+ /// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`) to the
+ /// canonical id vendor discovery actually looks up in the keyring (`anthropic`,
+ /// `google`). A key stored under the alias would be stored successfully but never

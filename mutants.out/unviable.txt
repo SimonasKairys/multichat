@@ -1,0 +1,7 @@
+src/config.rs:30:9: replace Paths::resolve -> Result<Self> with Ok(Default::default())
+src/config.rs:111:5: replace builtin_endpoint -> Option<CloudEndpoint> with Some(Default::default())
+src/config.rs:38:9: replace Paths::from_data_dir -> Result<Self> with Ok(Default::default())
+src/config.rs:64:9: replace Paths::resolve_with_env -> Result<Self> with Ok(Default::default())
+src/config.rs:274:9: replace Settings::endpoint -> Option<CloudEndpoint> with Some(Default::default())
+src/config.rs:286:9: replace Credentials::entry -> Result<Entry> with Ok(Default::default())
+src/config.rs:292:9: replace Credentials::get -> Result<Option<SecretString>> with Ok(Some(Default::default()))

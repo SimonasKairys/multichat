@@ -78,6 +78,65 @@ jobs:
           done
           exit $status
 
+  mutants:
+    name: mutation coverage of changed code
+    runs-on: ubuntu-latest
+    # A missed mutant is code a test executes without checking. This project has shipped
+    # two of them: a stderr flood sent through a `dd | tr` pipeline so the shell survived
+    # and the test proved nothing, and a Ctrl-modifier guard whose test passed with the
+    # guard deleted. Both were found by hand, by removing the fix and re-running. This
+    # job does the same thing mechanically.
+    #
+    # Scoped to the diff, not the crate. A full run is 953 mutants and about 3.6 hours,
+    # and it would fail on day one: `src/config.rs` alone has 9 missed out of 27,
+    # including `restrict_to_owner -> Ok(())` — deleting the permission restriction
+    # entirely is caught by nothing. Those are worth fixing, but blocking every push on
+    # a pre-existing backlog would only teach people to ignore a red job. Requiring it
+    # of *changed* lines stops the backlog growing.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `--in-diff` needs the base commit present to diff against.
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Collect the changed lines
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ]; then base="${{ github.event.before }}"; fi
+          # A new branch reports an all-zero "before", and the first commit in a
+          # repository has no parent at all. Fall back, then give up quietly rather
+          # than failing the job over a diff that cannot exist.
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+          if [ -z "$base" ]; then
+            echo "no base commit to diff against; nothing to mutate"
+            : > changed.diff
+          else
+            echo "diffing $base..HEAD"
+            git diff "$base" HEAD > changed.diff
+          fi
+          wc -l < changed.diff
+
+      - name: Mutate the changed lines
+        run: |
+          if [ ! -s changed.diff ]; then
+            echo "empty diff; nothing to mutate"
+            exit 0
+          fi
+          # `--timeout` bounds a mutant that makes the suite hang rather than fail —
+          # `Workspace::precheck -> Ok(())` does exactly that today.
+          cargo mutants --in-diff changed.diff --jobs 2 --timeout 120
+
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest

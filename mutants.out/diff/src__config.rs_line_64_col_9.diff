@@ -1,0 +1,24 @@
+--- src/config.rs
++++ replace Paths::resolve_with_env -> Result<Self> with Ok(Default::default())
+@@ -56,20 +56,17 @@
+             audit_log: data_dir.join("audit.log"),
+             skills_dir,
+             data_dir,
+         })
+     }
+ 
+     /// Honours `SIMON_DATA_DIR` when set, otherwise the platform default.
+     pub fn resolve_with_env() -> Result<Self> {
+-        match std::env::var_os("SIMON_DATA_DIR") {
+-            Some(dir) => Self::from_data_dir(PathBuf::from(dir)),
+-            None => Self::resolve(),
+-        }
++        Ok(Default::default()) /* ~ changed by cargo-mutants ~ */
+     }
+ }
+ 
+ /// Tightens directory permissions to owner-only where the platform supports it.
+ #[cfg(unix)]
+ fn restrict_to_owner(dir: &Path) -> Result<()> {
+     use std::os::unix::fs::PermissionsExt;
+     let mut perms = fs::metadata(dir)?.permissions();

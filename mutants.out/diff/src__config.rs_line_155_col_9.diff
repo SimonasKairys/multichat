@@ -1,0 +1,21 @@
+--- src/config.rs
++++ delete match arm "gemini" in canonical_provider
+@@ -147,17 +147,17 @@
+ /// `google`). A key stored under the alias would be stored successfully but never
+ /// found — discovery only ever asks for canonical ids. Kept visibly next to
+ /// `builtin_endpoint`'s alias arms so a future alias gets added to both. Anything
+ /// that isn't one of the two aliases — including a custom endpoint name — passes
+ /// through unchanged.
+ pub fn canonical_provider(name: &str) -> &str {
+     match name.to_ascii_lowercase().as_str() {
+         "claude" => "anthropic",
+-        "gemini" => "google",
++         /* ~ changed by cargo-mutants ~ */
+         _ => name,
+     }
+ }
+ 
+ /// Which transport carries a connection's traffic. `Api` and `Cli` are the only two
+ /// today; Ollama has no choice to make, so its `ConnectionSpec::transport` is `None`.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "snake_case")]

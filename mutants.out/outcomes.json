@@ -1,0 +1,1704 @@
+{
+  "outcomes": [
+    {
+      "scenario": "Baseline",
+      "summary": "Success",
+      "log_path": "log/baseline.log",
+      "diff_path": null,
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 61.869137744,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 11.405870382,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:30:9: replace Paths::resolve -> Result<Self> with Ok(Default::default())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Paths::resolve",
+            "return_type": "-> Result<Self>",
+            "span": {
+              "start": {
+                "line": 28,
+                "column": 5
+              },
+              "end": {
+                "line": 33,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 30,
+              "column": 9
+            },
+            "end": {
+              "line": 32,
+              "column": 59
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__config.rs_line_30_col_9.log",
+      "diff_path": "diff/src__config.rs_line_30_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.244003619,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:111:5: replace builtin_endpoint -> Option<CloudEndpoint> with None",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "builtin_endpoint",
+            "return_type": "-> Option<CloudEndpoint>",
+            "span": {
+              "start": {
+                "line": 108,
+                "column": 1
+              },
+              "end": {
+                "line": 143,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 111,
+              "column": 5
+            },
+            "end": {
+              "line": 142,
+              "column": 12
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_111_col_5.log",
+      "diff_path": "diff/src__config.rs_line_111_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 9.454594594,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 25.828180382,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:111:5: replace builtin_endpoint -> Option<CloudEndpoint> with Some(Default::default())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "builtin_endpoint",
+            "return_type": "-> Option<CloudEndpoint>",
+            "span": {
+              "start": {
+                "line": 108,
+                "column": 1
+              },
+              "end": {
+                "line": 143,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 111,
+              "column": 5
+            },
+            "end": {
+              "line": 142,
+              "column": 12
+            }
+          },
+          "replacement": "Some(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__config.rs_line_111_col_5_001.log",
+      "diff_path": "diff/src__config.rs_line_111_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 3.457141807,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:112:9: delete match arm \"anthropic\" | \"claude\" in builtin_endpoint",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "builtin_endpoint",
+            "return_type": "-> Option<CloudEndpoint>",
+            "span": {
+              "start": {
+                "line": 108,
+                "column": 1
+              },
+              "end": {
+                "line": 143,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 112,
+              "column": 9
+            },
+            "end": {
+              "line": 116,
+              "column": 11
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_112_col_9.log",
+      "diff_path": "diff/src__config.rs_line_112_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 10.479843185,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 25.826851079,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:117:9: delete match arm \"openai\" in builtin_endpoint",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "builtin_endpoint",
+            "return_type": "-> Option<CloudEndpoint>",
+            "span": {
+              "start": {
+                "line": 108,
+                "column": 1
+              },
+              "end": {
+                "line": 143,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 117,
+              "column": 9
+            },
+            "end": {
+              "line": 121,
+              "column": 11
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_117_col_9.log",
+      "diff_path": "diff/src__config.rs_line_117_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 7.797078812,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 27.501967799,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:38:9: replace Paths::from_data_dir -> Result<Self> with Ok(Default::default())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Paths::from_data_dir",
+            "return_type": "-> Result<Self>",
+            "span": {
+              "start": {
+                "line": 35,
+                "column": 5
+              },
+              "end": {
+                "line": 60,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 38,
+              "column": 9
+            },
+            "end": {
+              "line": 59,
+              "column": 11
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__config.rs_line_38_col_9.log",
+      "diff_path": "diff/src__config.rs_line_38_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 120.401644497,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:125:9: delete match arm \"google\" | \"gemini\" in builtin_endpoint",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "builtin_endpoint",
+            "return_type": "-> Option<CloudEndpoint>",
+            "span": {
+              "start": {
+                "line": 108,
+                "column": 1
+              },
+              "end": {
+                "line": 143,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 125,
+              "column": 9
+            },
+            "end": {
+              "line": 129,
+              "column": 11
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__config.rs_line_125_col_9.log",
+      "diff_path": "diff/src__config.rs_line_125_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 6.69179658,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.44675144,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:135:9: delete match arm \"groq\" in builtin_endpoint",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "builtin_endpoint",
+            "return_type": "-> Option<CloudEndpoint>",
+            "span": {
+              "start": {
+                "line": 108,
+                "column": 1
+              },
+              "end": {
+                "line": 143,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 135,
+              "column": 9
+            },
+            "end": {
+              "line": 139,
+              "column": 11
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__config.rs_line_135_col_9.log",
+      "diff_path": "diff/src__config.rs_line_135_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 7.557345183,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 26.560748913,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:130:9: delete match arm \"openrouter\" in builtin_endpoint",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "builtin_endpoint",
+            "return_type": "-> Option<CloudEndpoint>",
+            "span": {
+              "start": {
+                "line": 108,
+                "column": 1
+              },
+              "end": {
+                "line": 143,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 130,
+              "column": 9
+            },
+            "end": {
+              "line": 134,
+              "column": 11
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__config.rs_line_130_col_9.log",
+      "diff_path": "diff/src__config.rs_line_130_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 53.529879729,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.933869805,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:64:9: replace Paths::resolve_with_env -> Result<Self> with Ok(Default::default())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Paths::resolve_with_env",
+            "return_type": "-> Result<Self>",
+            "span": {
+              "start": {
+                "line": 62,
+                "column": 5
+              },
+              "end": {
+                "line": 68,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 64,
+              "column": 9
+            },
+            "end": {
+              "line": 67,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__config.rs_line_64_col_9.log",
+      "diff_path": "diff/src__config.rs_line_64_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 200.447876108,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:153:5: replace canonical_provider -> &str with \"\"",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "canonical_provider",
+            "return_type": "-> &str",
+            "span": {
+              "start": {
+                "line": 145,
+                "column": 1
+              },
+              "end": {
+                "line": 158,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 153,
+              "column": 5
+            },
+            "end": {
+              "line": 157,
+              "column": 6
+            }
+          },
+          "replacement": "\"\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_153_col_5.log",
+      "diff_path": "diff/src__config.rs_line_153_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 10.531435471,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 17.40823391,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:153:5: replace canonical_provider -> &str with \"xyzzy\"",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "canonical_provider",
+            "return_type": "-> &str",
+            "span": {
+              "start": {
+                "line": 145,
+                "column": 1
+              },
+              "end": {
+                "line": 158,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 153,
+              "column": 5
+            },
+            "end": {
+              "line": 157,
+              "column": 6
+            }
+          },
+          "replacement": "\"xyzzy\"",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_153_col_5_001.log",
+      "diff_path": "diff/src__config.rs_line_153_col_5_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.079663529,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 18.846368945000002,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:74:5: replace restrict_to_owner -> Result<()> with Ok(())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "restrict_to_owner",
+            "return_type": "-> Result<()>",
+            "span": {
+              "start": {
+                "line": 71,
+                "column": 1
+              },
+              "end": {
+                "line": 80,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 74,
+              "column": 5
+            },
+            "end": {
+              "line": 79,
+              "column": 11
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__config.rs_line_74_col_5.log",
+      "diff_path": "diff/src__config.rs_line_74_col_5.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 208.966776649,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 25.242966744,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:155:9: delete match arm \"gemini\" in canonical_provider",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "canonical_provider",
+            "return_type": "-> &str",
+            "span": {
+              "start": {
+                "line": 145,
+                "column": 1
+              },
+              "end": {
+                "line": 158,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 155,
+              "column": 9
+            },
+            "end": {
+              "line": 155,
+              "column": 30
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_155_col_9.log",
+      "diff_path": "diff/src__config.rs_line_155_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 6.649089276,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 21.683691448,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:154:9: delete match arm \"claude\" in canonical_provider",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "canonical_provider",
+            "return_type": "-> &str",
+            "span": {
+              "start": {
+                "line": 145,
+                "column": 1
+              },
+              "end": {
+                "line": 158,
+                "column": 2
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 154,
+              "column": 9
+            },
+            "end": {
+              "line": 154,
+              "column": 33
+            }
+          },
+          "replacement": "",
+          "genre": "MatchArm"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_154_col_9.log",
+      "diff_path": "diff/src__config.rs_line_154_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 22.853400739,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 22.052278385,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:245:9: replace Settings::load -> Result<Self> with Ok(Default::default())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Settings::load",
+            "return_type": "-> Result<Self>",
+            "span": {
+              "start": {
+                "line": 244,
+                "column": 5
+              },
+              "end": {
+                "line": 253,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 245,
+              "column": 9
+            },
+            "end": {
+              "line": 252,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_245_col_9.log",
+      "diff_path": "diff/src__config.rs_line_245_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 7.814278622,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 19.594212059,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:248:23: replace match guard e.kind() == std::io::ErrorKind::NotFound with false in Settings::load",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Settings::load",
+            "return_type": "-> Result<Self>",
+            "span": {
+              "start": {
+                "line": 244,
+                "column": 5
+              },
+              "end": {
+                "line": 253,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 248,
+              "column": 23
+            },
+            "end": {
+              "line": 248,
+              "column": 63
+            }
+          },
+          "replacement": "false",
+          "genre": "MatchArmGuard"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_248_col_23_001.log",
+      "diff_path": "diff/src__config.rs_line_248_col_23_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 5.82118889,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 26.582628755,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:248:23: replace match guard e.kind() == std::io::ErrorKind::NotFound with true in Settings::load",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Settings::load",
+            "return_type": "-> Result<Self>",
+            "span": {
+              "start": {
+                "line": 244,
+                "column": 5
+              },
+              "end": {
+                "line": 253,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 248,
+              "column": 23
+            },
+            "end": {
+              "line": 248,
+              "column": 63
+            }
+          },
+          "replacement": "true",
+          "genre": "MatchArmGuard"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__config.rs_line_248_col_23.log",
+      "diff_path": "diff/src__config.rs_line_248_col_23.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 7.793617062,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 27.671749566,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:274:9: replace Settings::endpoint -> Option<CloudEndpoint> with Some(Default::default())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Settings::endpoint",
+            "return_type": "-> Option<CloudEndpoint>",
+            "span": {
+              "start": {
+                "line": 272,
+                "column": 5
+              },
+              "end": {
+                "line": 278,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 274,
+              "column": 9
+            },
+            "end": {
+              "line": 277,
+              "column": 52
+            }
+          },
+          "replacement": "Some(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__config.rs_line_274_col_9_001.log",
+      "diff_path": "diff/src__config.rs_line_274_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 3.024681031,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:286:9: replace Credentials::entry -> Result<Entry> with Ok(Default::default())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Credentials::entry",
+            "return_type": "-> Result<Entry>",
+            "span": {
+              "start": {
+                "line": 285,
+                "column": 5
+              },
+              "end": {
+                "line": 289,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 286,
+              "column": 9
+            },
+            "end": {
+              "line": 288,
+              "column": 84
+            }
+          },
+          "replacement": "Ok(Default::default())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__config.rs_line_286_col_9.log",
+      "diff_path": "diff/src__config.rs_line_286_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 2.764871308,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:248:32: replace == with != in Settings::load",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Settings::load",
+            "return_type": "-> Result<Self>",
+            "span": {
+              "start": {
+                "line": 244,
+                "column": 5
+              },
+              "end": {
+                "line": 253,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 248,
+              "column": 32
+            },
+            "end": {
+              "line": 248,
+              "column": 34
+            }
+          },
+          "replacement": "!=",
+          "genre": "BinaryOperator"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_248_col_32.log",
+      "diff_path": "diff/src__config.rs_line_248_col_32.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 8.983126832,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 26.576866142,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:265:9: replace Settings::save -> Result<()> with Ok(())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Settings::save",
+            "return_type": "-> Result<()>",
+            "span": {
+              "start": {
+                "line": 255,
+                "column": 5
+              },
+              "end": {
+                "line": 270,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 265,
+              "column": 9
+            },
+            "end": {
+              "line": 269,
+              "column": 75
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "CaughtMutant",
+      "log_path": "log/src__config.rs_line_265_col_9.log",
+      "diff_path": "diff/src__config.rs_line_265_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 11.277585111,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.133389962,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:292:9: replace Credentials::get -> Result<Option<SecretString>> with Ok(Some(Default::default()))",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Credentials::get",
+            "return_type": "-> Result<Option<SecretString>>",
+            "span": {
+              "start": {
+                "line": 291,
+                "column": 5
+              },
+              "end": {
+                "line": 299,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 292,
+              "column": 9
+            },
+            "end": {
+              "line": 298,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(Some(Default::default()))",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "Unviable",
+      "log_path": "log/src__config.rs_line_292_col_9_001.log",
+      "diff_path": "diff/src__config.rs_line_292_col_9_001.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 4.527146237,
+          "process_status": {
+            "Failure": 101
+          },
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:274:9: replace Settings::endpoint -> Option<CloudEndpoint> with None",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Settings::endpoint",
+            "return_type": "-> Option<CloudEndpoint>",
+            "span": {
+              "start": {
+                "line": 272,
+                "column": 5
+              },
+              "end": {
+                "line": 278,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 274,
+              "column": 9
+            },
+            "end": {
+              "line": 277,
+              "column": 52
+            }
+          },
+          "replacement": "None",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__config.rs_line_274_col_9.log",
+      "diff_path": "diff/src__config.rs_line_274_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 7.2781392369999995,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 23.633214274,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:292:9: replace Credentials::get -> Result<Option<SecretString>> with Ok(None)",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Credentials::get",
+            "return_type": "-> Result<Option<SecretString>>",
+            "span": {
+              "start": {
+                "line": 291,
+                "column": 5
+              },
+              "end": {
+                "line": 299,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 292,
+              "column": 9
+            },
+            "end": {
+              "line": 298,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(None)",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__config.rs_line_292_col_9.log",
+      "diff_path": "diff/src__config.rs_line_292_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 6.502478732,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 24.803895649,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:302:9: replace Credentials::set -> Result<()> with Ok(())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Credentials::set",
+            "return_type": "-> Result<()>",
+            "span": {
+              "start": {
+                "line": 301,
+                "column": 5
+              },
+              "end": {
+                "line": 310,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 302,
+              "column": 9
+            },
+            "end": {
+              "line": 309,
+              "column": 89
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__config.rs_line_302_col_9.log",
+      "diff_path": "diff/src__config.rs_line_302_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 10.111249134,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 19.708623384,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    },
+    {
+      "scenario": {
+        "Mutant": {
+          "name": "src/config.rs:313:9: replace Credentials::delete -> Result<()> with Ok(())",
+          "package": "simon",
+          "file": "src/config.rs",
+          "function": {
+            "function_name": "Credentials::delete",
+            "return_type": "-> Result<()>",
+            "span": {
+              "start": {
+                "line": 312,
+                "column": 5
+              },
+              "end": {
+                "line": 317,
+                "column": 6
+              }
+            }
+          },
+          "span": {
+            "start": {
+              "line": 313,
+              "column": 9
+            },
+            "end": {
+              "line": 316,
+              "column": 10
+            }
+          },
+          "replacement": "Ok(())",
+          "genre": "FnValue"
+        }
+      },
+      "summary": "MissedMutant",
+      "log_path": "log/src__config.rs_line_313_col_9.log",
+      "diff_path": "diff/src__config.rs_line_313_col_9.diff",
+      "phase_results": [
+        {
+          "phase": "Build",
+          "duration": 8.70903134,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--no-run",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        },
+        {
+          "phase": "Test",
+          "duration": 18.895977357,
+          "process_status": "Success",
+          "argv": [
+            "/home/main/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo",
+            "test",
+            "--verbose",
+            "--package=simon@0.1.0"
+          ]
+        }
+      ]
+    }
+  ],
+  "total_mutants": 27,
+  "missed": 9,
+  "caught": 11,
+  "timeout": 0,
+  "unviable": 7,
+  "success": 0,
+  "start_time": "2026-08-25T21:18:13.823560566Z",
+  "end_time": "2026-08-25T21:24:40.425754658Z",
+  "cargo_mutants_version": "27.1.0"
+}

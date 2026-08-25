@@ -560,7 +560,23 @@ cargo test
 cargo audit
 ```
 
-CI runs all of the above on Linux, Windows, and macOS, plus the unsafe-boundary check.
+CI runs all of the above on Linux, Windows, and macOS, plus the unsafe-boundary check
+and mutation coverage of whatever the commit changed.
+
+That last one exists because a passing test is not evidence on its own. Two tests in
+this repository passed with the fix they guarded deleted — one flooded stderr through a
+`dd | tr` pipeline, so the subprocess took the signal and the shell survived to exit
+normally either way; the other asserted a condition that held whether or not the guard
+was there. Both were caught by hand, by removing the fix and re-running.
+`cargo mutants` does that mechanically: it deletes a branch, flips a comparison or
+stubs a function, and reports anything the suite still accepts.
+
+It is scoped to the diff. A full run is 953 mutants, roughly three and a half hours,
+and it would fail immediately — `src/config.rs` alone has nine misses, among them
+`restrict_to_owner -> Ok(())`, which is the entire data-directory permission tightening
+deleted with nothing to notice. Those are worth closing, but blocking every push on a
+backlog that predates the check teaches people to ignore a red job. Requiring it of
+changed lines stops the backlog growing.
 
 ## History
 

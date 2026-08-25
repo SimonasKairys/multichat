@@ -1,0 +1,30 @@
+--- src/audit.rs
++++ replace unhex -> Result<Vec<u8>> with Ok(vec![])
+@@ -862,26 +862,17 @@
+ /// length could still be even while a 2-byte cut lands inside a multi-byte
+ /// codepoint, and `&str` indexing panics with "byte index is not a char boundary"
+ /// rather than returning an error. This crate has shipped exactly this failure class
+ /// before (fixed in 923b934) — the fix here is the same principle: work on
+ /// `as_bytes()` throughout so there is no `&str` index to ever land wrong, and let
+ /// any byte outside `0-9a-fA-F` (which includes every continuation/lead byte of a
+ /// multi-byte UTF-8 sequence) fail the digit match cleanly instead of panicking.
+ fn unhex(s: &str) -> Result<Vec<u8>> {
+-    let bytes = s.as_bytes();
+-    if !bytes.len().is_multiple_of(2) {
+-        return Err(anyhow!("odd-length hex string"));
+-    }
+-    bytes
+-        .as_chunks::<2>()
+-        .0
+-        .iter()
+-        .map(|pair| Ok((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
+-        .collect()
++    Ok(vec![]) /* ~ changed by cargo-mutants ~ */
+ }
+ 
+ /// A single ASCII hex digit's value, or an error for anything else — including any
+ /// byte of a multi-byte UTF-8 sequence, all of which fall outside `0-9a-fA-F`.
+ fn hex_digit(b: u8) -> Result<u8> {
+     match b {
+         b'0'..=b'9' => Ok(b - b'0'),
+         b'a'..=b'f' => Ok(b - b'a' + 10),

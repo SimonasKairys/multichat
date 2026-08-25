@@ -1,0 +1,28 @@
+--- src/config.rs
++++ replace Credentials::set -> Result<()> with Ok(())
+@@ -294,24 +294,17 @@
+             Err(keyring::Error::NoEntry) => Ok(None),
+             Err(e) => Err(anyhow!(
+                 "failed to read {service} credential from keyring: {e}"
+             )),
+         }
+     }
+ 
+     pub fn set(service: &str, secret: &str) -> Result<()> {
+-        if secret.trim().is_empty() {
+-            return Err(anyhow!(
+-                "refusing to store an empty credential for {service}"
+-            ));
+-        }
+-        Self::entry(service)?
+-            .set_password(secret)
+-            .with_context(|| format!("failed to store {service} credential in keyring"))
++        Ok(()) /* ~ changed by cargo-mutants ~ */
+     }
+ 
+     pub fn delete(service: &str) -> Result<()> {
+         match Self::entry(service)?.delete_credential() {
+             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+             Err(e) => Err(anyhow!("failed to delete {service} credential: {e}")),
+         }
+     }

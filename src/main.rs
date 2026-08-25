@@ -93,6 +93,17 @@ enum Commands {
         /// log still has entries the reset itself is recorded into the chain first.
         #[arg(long)]
         reset_anchor: bool,
+        /// Discard whatever value is currently stored in the OS keyring under the
+        /// audit MAC key's service name — valid, corrupt, or absent — and generate a
+        /// fresh one on next use. This is the recovery path for when `simon` refuses
+        /// to start because the keyring holds a value it didn't write (wrong length,
+        /// or not hex): see the error `simon audit` gives in that case. Every entry
+        /// written under the discarded key becomes permanently unverifiable — this is
+        /// a separate, more drastic reset than `--reset-anchor` (which only affects
+        /// the anchors, not the key itself), so pair it with `--reset-anchor` to
+        /// re-baseline afterwards. Never happens implicitly.
+        #[arg(long)]
+        reset_key: bool,
     },
     /// Inspect or destroy the encrypted transcript vault.
     Vault {
@@ -134,7 +145,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Auth { service, delete }) => auth(&service, delete, &settings),
         Some(Commands::Models) => list_models(&settings, cli.classified).await,
-        Some(Commands::Audit { reset_anchor }) => verify_audit(&paths, reset_anchor),
+        Some(Commands::Audit {
+            reset_anchor,
+            reset_key,
+        }) => verify_audit(&paths, reset_anchor, reset_key),
         Some(Commands::Vault { action }) => vault_command(&paths, action),
         Some(Commands::Chat {
             model,
@@ -282,7 +296,23 @@ async fn list_models(settings: &Settings, classified: bool) -> Result<()> {
     Ok(())
 }
 
-fn verify_audit(paths: &Paths, reset_anchor: bool) -> Result<()> {
+fn verify_audit(paths: &Paths, reset_anchor: bool, reset_key: bool) -> Result<()> {
+    // Handled before `AuditLogger::open` below, and deliberately not by that logger's
+    // own `reset_anchor` method: a corrupt key means `open` never succeeds in the
+    // first place (see `audit::validate_key`), so there is no logger yet to call a
+    // method on. This has to work directly against the keyring, before any log
+    // instance exists.
+    if reset_key {
+        crate::audit::reset_key()?;
+        println!(
+            "Audit key reset: the value previously stored in the OS keyring has been \
+             discarded. A fresh MAC key will be generated below. Every entry (and \
+             anchor) written under the old key is now permanently unverifiable — run \
+             with --reset-anchor too (now or on a later run) to re-baseline the \
+             tamper-evidence anchors to the new key."
+        );
+    }
+
     let mut logger = AuditLogger::open(paths.audit_log.clone())?;
 
     if reset_anchor {
@@ -577,8 +607,22 @@ fn vault_save_after_chat(paths: &Paths, session: VaultSession, transcript: &[Lin
     // deliberate: the orchestrator's own logger has appended `session.start` through
     // `session.end` to this same file in the meantime, so re-opening picks up the
     // real chain head instead of writing with a stale `prev` and breaking it.
-    if let Ok(mut audit) = AuditLogger::open(paths.audit_log.clone()) {
-        let _ = audit.log("vault.saved", &format!("lines={}", transcript.len()));
+    //
+    // Best-effort by design — the vault save above has already succeeded and must not
+    // be undone by an audit hiccup — but not *silent*: `AuditLogger::open` failing
+    // here includes the corrupt-keyring-key case (AUDIT-2026-07-31.md §3.5), which the
+    // user needs to see even though this function still returns `Ok`. Note this
+    // specific failure is unlikely to be reached in practice: `Orchestrator::new`
+    // already opened a logger with `?` earlier in this same process (see `chat`), so a
+    // corrupt key would already have aborted the session before the vault was ever
+    // saved. It would only show up here if the keyring entry was corrupted mid-session.
+    match AuditLogger::open(paths.audit_log.clone()) {
+        Ok(mut audit) => {
+            if let Err(e) = audit.log("vault.saved", &format!("lines={}", transcript.len())) {
+                eprintln!("[audit] failed to record vault.saved: {e}");
+            }
+        }
+        Err(e) => eprintln!("[audit] failed to open the audit log to record vault.saved: {e}"),
     }
     Ok(())
 }
@@ -673,8 +717,17 @@ fn vault_destroy(paths: &Paths, vault: &EncryptedVault) -> Result<()> {
 
     vault.destroy();
     println!("Vault destroyed.");
-    if let Ok(mut audit) = AuditLogger::open(paths.audit_log.clone()) {
-        let _ = audit.log("vault.destroyed", "destroyed via `simon vault destroy`");
+    // Best-effort, but surfaced rather than silently swallowed — same reasoning as
+    // the equivalent audit call in `vault_save_after_chat`: the destroy itself has
+    // already happened and must not be undone by an audit hiccup, but a corrupt-key
+    // failure here (§3.5) is exactly the kind of thing a user needs to be told about.
+    match AuditLogger::open(paths.audit_log.clone()) {
+        Ok(mut audit) => {
+            if let Err(e) = audit.log("vault.destroyed", "destroyed via `simon vault destroy`") {
+                eprintln!("[audit] failed to record vault.destroyed: {e}");
+            }
+        }
+        Err(e) => eprintln!("[audit] failed to open the audit log to record vault.destroyed: {e}"),
     }
     Ok(())
 }

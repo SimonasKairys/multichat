@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::providers::{ProgressSink, Provider, RateLimit, Reply};
+use crate::providers::{ProgressSink, Provider, ProviderFailure, RateLimit, Reply};
 
 /// Ceiling on captured output, so a runaway child cannot exhaust memory.
 const MAX_OUTPUT_BYTES: usize = 1 << 20;
@@ -215,6 +215,33 @@ fn summarize_stderr(stderr: &str) -> String {
     }
 }
 
+/// Reads one child output stream up to `cap` bytes, then drains whatever is left to a
+/// sink instead of returning as soon as the cap is hit.
+///
+/// The drain is not dead weight — deleting it reintroduces a regression already fixed
+/// once, in `94b5c1d`. Stopping at the cap and dropping the reader closes the pipe out
+/// from under a child that is still writing to it; the child then takes SIGPIPE and
+/// dies, and simon reports "exited with signal: 13 (SIGPIPE)" instead of whatever the
+/// child was actually about to exit with — measured exactly that way there, with a
+/// stub whose last statement (`exit 1`) never ran. Draining to `tokio::io::sink()`
+/// keeps the pipe open (and memory bounded, since nothing past `cap` is retained)
+/// until the child closes it on its own or the caller's own timeout kills the child.
+///
+/// Returns the bytes kept and whether the stream held more than `cap` of them.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(reader: R, cap: usize) -> (Vec<u8>, bool) {
+    let mut buf = Vec::new();
+    // `.take(cap)` makes the limited reader report EOF once `cap` bytes have been
+    // read, whether or not the underlying stream actually ended there — so
+    // `read_to_end` can never over-retain, but on its own can't say *why* it stopped.
+    let mut limited = reader.take(cap as u64);
+    let _ = limited.read_to_end(&mut buf).await;
+    let mut reader = limited.into_inner();
+    let drained = tokio::io::copy(&mut reader, &mut tokio::io::sink())
+        .await
+        .unwrap_or(0);
+    (buf, drained > 0)
+}
+
 impl LocalBinaryProvider {
     /// Does the actual work of `Provider::send`, parameterised on the timeout so a
     /// test can use a short one instead of waiting out `CLI_TIMEOUT` for real —
@@ -254,41 +281,97 @@ impl LocalBinaryProvider {
         }
         command.arg(effective_prompt);
         command.kill_on_drop(true);
+        // `command.output()` used to do this call in one shot: spawn, then buffer
+        // BOTH streams to completion, and only afterwards was `MAX_OUTPUT_BYTES`
+        // applied to what came back. A child that emits a gigabyte put a gigabyte in
+        // `simon`'s address space — physically pinned there by `mlockall` (see
+        // `main.rs`), unable even to page out — before a single byte was discarded.
+        // Piping explicitly lets `read_capped` below stop retaining bytes past the
+        // cap *as they arrive*, per stream.
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
 
         // `kill_on_drop(true)` only reaps the child when *something* drops the future
-        // that owns it. Without a timeout, nothing ever did — `command.output().await`
-        // would sit forever on a wedged CLI, permanently freezing the session. Wrapping
-        // it in `tokio::time::timeout` gives the future a reason to drop: on elapse,
-        // `timeout` drops the inner `output()` future, which drops the child handle,
-        // which is what actually kills the process.
-        let output = match tokio::time::timeout(timeout, command.output()).await {
-            Ok(result) => result.with_context(|| format!("failed to run {}", self.binary_path))?,
-            Err(_) => {
-                return Err(anyhow!(
-                    "{} timed out after {}s",
-                    self.binary_path,
-                    timeout.as_secs()
-                ));
-            }
+        // that owns it. Without a timeout, nothing ever did — sitting on a wedged CLI
+        // would permanently freeze the session. Wrapping the whole spawn/read/wait
+        // sequence in `tokio::time::timeout` gives it a reason to drop: on elapse,
+        // `timeout` drops `run`, which drops `child` inside it, which is what
+        // actually kills the process — the same mechanism as before `output()` was
+        // inlined here, just now wrapped around more work.
+        let run = async move {
+            let mut child = command.spawn()?;
+            // `.expect` is safe: both were just set to `Stdio::piped()` above, so
+            // tokio always populates these handles on a successful spawn.
+            let stdout = child.stdout.take().expect("stdout was piped");
+            let stderr = child.stderr.take().expect("stderr was piped");
+
+            // Read both streams concurrently, not one after the other: a child that
+            // fills its stderr pipe buffer while stdout is being drained first (or
+            // the reverse) blocks on its next write to the full pipe, and nothing
+            // here would ever get back around to draining it — a self-inflicted
+            // deadlock. `tokio::join!` polls both futures on this task instead.
+            let ((stdout_bytes, stdout_truncated), (stderr_bytes, stderr_truncated)) = tokio::join!(
+                read_capped(stdout, MAX_OUTPUT_BYTES),
+                read_capped(stderr, MAX_OUTPUT_BYTES),
+            );
+
+            let status = child.wait().await?;
+            Ok::<_, std::io::Error>((
+                status,
+                stdout_bytes,
+                stdout_truncated,
+                stderr_bytes,
+                stderr_truncated,
+            ))
         };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        // `stderr_truncated` is intentionally unused past this point: on failure,
+        // `summarize_stderr` below already caps and marks its own summary for
+        // display, independent of whether `read_capped`'s memory cap also cut the
+        // raw bytes it was given — a second truncation marker on top would be noise.
+        let (status, stdout_bytes, stdout_truncated, stderr_bytes, _stderr_truncated) =
+            match tokio::time::timeout(timeout, run).await {
+                Ok(result) => {
+                    result.with_context(|| format!("failed to run {}", self.binary_path))?
+                }
+                Err(_) => {
+                    return Err(
+                        anyhow::Error::new(ProviderFailure::Timeout).context(format!(
+                            "{} timed out after {}s",
+                            self.binary_path,
+                            timeout.as_secs()
+                        )),
+                    );
+                }
+            };
+
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             return Err(anyhow!(
                 "{} exited with {}: {}",
                 self.binary_path,
-                output.status,
+                status,
                 summarize_stderr(&stderr)
             ));
         }
 
-        let mut stdout = output.stdout;
-        stdout.truncate(MAX_OUTPUT_BYTES);
-        let text = String::from_utf8_lossy(&stdout).trim().to_string();
+        // `from_utf8_lossy` runs on bytes `read_capped` already cut to
+        // `MAX_OUTPUT_BYTES` — never a raw byte-index slice taken here — so a
+        // multi-byte codepoint straddling the cap becomes a replacement character
+        // instead of panicking (the failure mode fixed in `923b934`).
+        let text = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
 
         if text.is_empty() {
             return Err(anyhow!("{} produced no output", self.binary_path));
         }
+
+        // Report a cut reply rather than silently handing back a partial one as if
+        // it were complete — mirrors `send_streaming`'s truncation handling below.
+        let text = if stdout_truncated {
+            format!("{text}\n\n… output truncated at {MAX_OUTPUT_BYTES} bytes")
+        } else {
+            text
+        };
 
         Ok(Reply {
             text,
@@ -402,20 +485,22 @@ impl LocalBinaryProvider {
                     // property holds here, just triggered by `select!` dropping the
                     // losing branches instead of `tokio::time::timeout` doing it.
                     drop(child);
-                    return Err(anyhow!(
+                    return Err(anyhow::Error::new(ProviderFailure::Timeout).context(format!(
                         "{} timed out after {}s (total time limit for a streaming call)",
                         self.binary_path,
                         CLI_TOTAL_TIMEOUT.as_secs()
-                    ));
+                    )));
                 }
                 next = tokio::time::timeout(CLI_IDLE_TIMEOUT, lines.next_line()) => {
                     match next {
                         Err(_) => {
                             drop(child);
-                            return Err(anyhow!(
-                                "{} timed out after {}s of no output",
-                                self.binary_path,
-                                CLI_IDLE_TIMEOUT.as_secs()
+                            return Err(anyhow::Error::new(ProviderFailure::Timeout).context(
+                                format!(
+                                    "{} timed out after {}s of no output",
+                                    self.binary_path,
+                                    CLI_IDLE_TIMEOUT.as_secs()
+                                ),
                             ));
                         }
                         Ok(Err(e)) => {
@@ -491,16 +576,27 @@ impl LocalBinaryProvider {
         // exited cleanly but the CLI's own output never sent a `result`/`result`
         // event — treat partial progress as better than nothing).
         let mut text = result_text.unwrap_or(assistant_text);
+        let mut truncated = false;
         if text.len() > MAX_OUTPUT_BYTES {
             let mut bytes = text.into_bytes();
             bytes.truncate(MAX_OUTPUT_BYTES);
             text = String::from_utf8_lossy(&bytes).into_owned();
+            truncated = true;
         }
         let text = text.trim().to_string();
 
         if text.is_empty() {
             return Err(anyhow!("{} produced no output", self.binary_path));
         }
+
+        // Report a cut reply rather than silently handing back a partial one as if
+        // it were complete — see the identical marker on the non-streaming path in
+        // `send_with_timeout`, which this mirrors for consistency between the two.
+        let text = if truncated {
+            format!("{text}\n\n… output truncated at {MAX_OUTPUT_BYTES} bytes")
+        } else {
+            text
+        };
 
         Ok(Reply {
             text,
@@ -929,6 +1025,116 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Builds a provider that runs `script` under `/bin/sh`. Unix-only, like the
+    /// `/bin/echo` test above: `LocalBinaryProvider::new` rejects a nonexistent binary,
+    /// and there is no `/bin/sh` on Windows.
+    #[cfg(unix)]
+    fn shell_provider(script: &str) -> LocalBinaryProvider {
+        LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec!["-c".to_string(), script.to_string()],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
+        )
+        .unwrap()
+    }
+
+    /// ~3 MiB down the given fd — comfortably past `MAX_OUTPUT_BYTES` (1 MiB), so the
+    /// cap is genuinely exercised rather than just approached.
+    #[cfg(unix)]
+    const FLOOD: &str = "dd if=/dev/zero bs=1024 count=3072 2>/dev/null | tr '\\0' 'x'";
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_chatty_child_is_capped_without_being_killed_by_sigpipe() {
+        // The regression, fixed once in 94b5c1d: capping a stream by dropping the reader
+        // closes the pipe under a child still writing to it, the child dies of SIGPIPE,
+        // and simon reports "signal: 13" instead of the child's real exit.
+        //
+        // The flood must come from the shell's own builtin `printf`, not from a
+        // `dd | tr` pipeline. In a pipeline it is the *subprocess* that takes SIGPIPE
+        // while the shell survives to run `exit`, so the test would pass whether or not
+        // the drain existed — which is exactly what an earlier version of this test did.
+        let chunk = "y".repeat(4096);
+        let p = shell_provider(&format!(
+            "i=0; while [ $i -lt 1024 ]; do printf '%s' '{chunk}' >&2; i=$((i+1)); done; exit 7"
+        ));
+        let err = p
+            .send_with_timeout(None, "ignored", Duration::from_secs(60))
+            .await
+            .expect_err("a child exiting non-zero must surface as an error");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("signal"),
+            "the child was killed by a signal instead of exiting on its own: {msg}"
+        );
+        assert!(
+            msg.contains('7'),
+            "the child's own exit status 7 did not survive: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_enormous_stdout_is_capped_rather_than_retained_whole() {
+        let p = shell_provider(FLOOD);
+        let reply = p
+            .send_with_timeout(None, "ignored", Duration::from_secs(60))
+            .await
+            .unwrap();
+        // Fixture guard: if the flood produced nothing, a "is bounded" assertion below
+        // would pass for entirely the wrong reason.
+        assert!(
+            !reply.text.is_empty(),
+            "fixture produced no output at all, so the cap was never exercised"
+        );
+        assert!(
+            reply.text.len() <= MAX_OUTPUT_BYTES + 1024,
+            "kept {} bytes, which is not bounded by MAX_OUTPUT_BYTES ({MAX_OUTPUT_BYTES})",
+            reply.text.len()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_child_flooding_both_streams_at_once_does_not_deadlock() {
+        // Reading the streams one after the other deadlocks here: the child blocks
+        // writing to whichever pipe buffer fills first, and a sequential reader never
+        // gets back to drain it. The outer `tokio::time::timeout` is the assertion —
+        // it turns a hang into a failure instead of a CI job that never ends.
+        let p = shell_provider(&format!("{FLOOD} & {FLOOD} >&2; wait"));
+        let result = tokio::time::timeout(
+            Duration::from_secs(90),
+            p.send_with_timeout(None, "ignored", Duration::from_secs(60)),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "reading both streams deadlocked instead of completing"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn output_cut_at_the_cap_mid_codepoint_does_not_panic() {
+        // Every character here is multi-byte, so a 1 MiB cut is overwhelmingly likely
+        // to land inside one. Byte-index slicing panicked on exactly this shape before
+        // (923b934).
+        let p =
+            shell_provider("i=0; while [ $i -lt 40000 ]; do printf 'ąčęėįšųūž'; i=$((i+1)); done");
+        let reply = p
+            .send_with_timeout(None, "ignored", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(!reply.text.is_empty(), "fixture produced no output");
+    }
+
     #[tokio::test]
     async fn a_child_that_finishes_within_the_timeout_still_succeeds() {
         // Unix-only: depends on `/bin/echo`, a Unix path that `LocalBinaryProvider::new`

@@ -152,6 +152,26 @@ pub trait Provider: Send + Sync {
 /// bad model name) without pasting a whole response into the transcript.
 const MAX_ERROR_DETAIL_CHARS: usize = 300;
 
+/// A failure kind a provider can name, carried as the *cause* of an `anyhow` error
+/// while the human-readable sentence stays in the context on top of it.
+///
+/// This exists because the audit log records the *kind* of a failure and withholds its
+/// text (see `orchestrator::safe_error_detail`). Classification works by downcasting
+/// through the error chain, which found `std::io::Error` and `reqwest::Error` but not
+/// this crate's own failures — those were raised with `anyhow!("…")`, so a CLI timeout,
+/// the single most common real failure here, was recorded as `kind=unspecified`. An
+/// audit entry that cannot distinguish a timeout from a refusal is not worth the line
+/// it occupies. Attaching a typed cause fixes that without changing what the user
+/// reads: `Display` still shows the context sentence, and `is_retryable_delegation_error`
+/// still matches on its text.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProviderFailure {
+    #[error("the provider did not answer within its time limit")]
+    Timeout,
+    #[error("the provider answered with HTTP {0}")]
+    HttpStatus(u16),
+}
+
 /// Bounds provider-controlled text (error bodies, response JSON) before embedding it
 /// in an error message. Truncates on a char boundary, not a byte index — the text may
 /// contain multi-byte UTF-8, and slicing mid-character panics. Mirrors

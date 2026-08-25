@@ -11,7 +11,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
 use crate::config::{Api, CloudEndpoint};
-use crate::providers::{Provider, RateLimit, Reply, truncate_error_detail};
+use crate::providers::{Provider, ProviderFailure, RateLimit, Reply, truncate_error_detail};
 
 /// Anthropic requires this header on every request; it is an API-version pin, not a
 /// model version.
@@ -161,12 +161,14 @@ impl Provider for CloudProvider {
             // Include the provider's message — a bare status code makes auth failures
             // indistinguishable from bad model names.
             let detail = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "{} returned {}: {}",
-                self.provider,
-                status,
-                truncate_error_detail(detail.trim())
-            ));
+            return Err(
+                anyhow::Error::new(ProviderFailure::HttpStatus(status.as_u16())).context(format!(
+                    "{} returned {}: {}",
+                    self.provider,
+                    status,
+                    truncate_error_detail(detail.trim())
+                )),
+            );
         }
 
         let parsed: Value = response

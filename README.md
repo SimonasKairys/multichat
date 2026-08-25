@@ -388,6 +388,20 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   orchestrator writes many entries per turn. Deleting a log on purpose is legitimate,
   so `simon audit --reset-anchor` re-baselines the evidence, says plainly that it is
   discarding it, and records the reset in the new chain.
+- **Failures are logged by kind, never by text.** The log's invariant is sizes, counts,
+  and paths only — but every error path used to format the error's own message into it,
+  and an error can carry a fragment of a provider's response or a path a model chose. A
+  failure now records `kind=timeout`, `kind=permission_denied`, `kind=http_status` and
+  the like, with `detail=withheld` in place of the text. The kind is read from the
+  error's typed cause rather than by scanning its words, so the two failures that
+  dominate in practice — a model CLI that never answered, a provider returning non-2xx —
+  are named rather than lumped into "unspecified".
+- **A damaged MAC key stops the program instead of replacing itself.** The key is the
+  only thing that makes the log verifiable, so silently generating a new one invalidates
+  every entry ever written — and anyone able to write a short value into the keyring
+  could have triggered exactly that, making a forged history look like ordinary
+  corruption. A keyring entry that is present but unusable is now a hard error naming
+  the service and what to do about it. An absent entry is still a normal first run.
 - **`--classified`** — refuses any provider whose traffic leaves the machine, and
   requires process-wide memory locking to succeed rather than warning.
 - **Process-wide memory locking on Linux** — `mlockall` at startup (`main.rs`), pinning
@@ -512,6 +526,12 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   the task list, and is recorded in the audit log with the before and after sizes.
 - A local CLI tool is treated as remote for `--classified` purposes, because we cannot
   see whether it calls a cloud API internally.
+- Output from a local CLI is bounded as it is read, not after. The cap used to apply to
+  what was *kept*, while the whole of a child's output was buffered first — and since
+  `mlockall` pins the process into RAM, that buffer could not even be paged out. Both
+  streams are now read concurrently, each capped, with the remainder drained rather than
+  dropped: closing the pipe early kills a chatty child with SIGPIPE and misreports it as
+  a crash, which is a bug this project already shipped once.
 
 ## Development
 

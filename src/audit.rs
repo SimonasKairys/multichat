@@ -702,25 +702,100 @@ fn keyring_anchor_service(log_path: &Path) -> String {
     format!("audit-anchor-hmac-{}", hex(&hasher.finalize()))
 }
 
-/// Fetches the per-install MAC key from the keyring, generating one on first use.
+/// What to do with whatever `Credentials::get(KEYRING_SERVICE)` returned. Split out
+/// from `load_or_create_key` as a pure function of `Option<&str>` — no keyring I/O —
+/// so the "generate on first run" vs. "reject a corrupt existing value" decision is
+/// testable without a working keyring daemon; CI runs on Windows and macOS images with
+/// no Secret Service.
+#[derive(Debug)]
+enum KeyDecision {
+    UseExisting(Vec<u8>),
+    GenerateNew,
+}
+
+/// `None` (no entry yet) always means "generate a fresh key" — a legitimate first run.
+/// `Some` runs the existing value through [`validate_key`]; a value that fails
+/// validation is an `Err`, never treated as absent.
+fn decide_key(existing: Option<&str>) -> Result<KeyDecision> {
+    match existing {
+        None => Ok(KeyDecision::GenerateNew),
+        Some(s) => validate_key(s).map(KeyDecision::UseExisting),
+    }
+}
+
+/// Validates a keyring-stored value as a usable 32-byte MAC key.
+///
+/// The previous implementation only rejected non-hex values (via `?`); a value that
+/// was valid hex but the wrong length fell through and silently minted + stored a
+/// brand-new key. The MAC key is the only thing that makes the audit log verifiable,
+/// so that silently destroyed the ability to verify every entry ever written — and did
+/// so with no message, at startup. An attacker able to write a short value into the
+/// keyring (without being able to read the real key) could use that to invalidate the
+/// whole audit history and make it look like ordinary corruption. A tamper-evidence
+/// system must never rotate its own key without being told to — see the module docs'
+/// "resetting an anchor is a deliberate, logged action" section for the same principle
+/// applied to the anchor.
+fn validate_key(existing: &str) -> Result<Vec<u8>> {
+    let decoded = unhex(existing).context("audit key in keyring is not valid hex")?;
+    if decoded.len() != 32 {
+        // Report the length only — never `existing` or `decoded`. The length alone is
+        // enough to diagnose the problem; the bytes are key material (or close enough
+        // to it) and have no business in an error string that might end up in a
+        // terminal scrollback or a bug report.
+        return Err(anyhow!(
+            "the audit MAC key stored in the OS keyring (service {KEYRING_SERVICE:?}) \
+             is {} bytes long, not the required 32 — this is not a key `simon` wrote. \
+             Refusing to silently generate and store a replacement: that would make \
+             every existing audit entry permanently unverifiable, with no warning. If \
+             you intend to accept that loss (e.g. restoring a keyring from a different \
+             install, or recovering from manual tampering with the keyring entry), run \
+             `simon audit --reset-key` to discard the bad value and start a fresh \
+             chain from here.",
+            decoded.len()
+        ));
+    }
+    Ok(decoded)
+}
+
+/// Discards whatever is currently stored under [`KEYRING_SERVICE`] — valid, corrupt,
+/// or absent — so the next [`load_or_create_key`] call takes the `GenerateNew` branch
+/// instead of failing [`validate_key`]'s length check.
+///
+/// A **separate** escape hatch from [`AuditLogger::reset_anchor`], not a variant of
+/// it: `reset_anchor` is a method on an already-open `AuditLogger`, but a corrupt key
+/// means `AuditLogger::open` never succeeds in the first place — there is no logger to
+/// call it on. Wired to `simon audit --reset-key`, which — like `--reset-anchor` —
+/// requires the caller to ask for this by name and is never triggered automatically.
+///
+/// Replacing the key makes every entry (and anchor) written under the old key
+/// permanently unverifiable, the same trade `reset_anchor` makes for the anchor alone.
+/// Follow this with `simon audit --reset-anchor` to re-baseline the anchors to the new
+/// key — otherwise `simon audit` will keep reporting the old entries as modified,
+/// which is correct: their MACs genuinely cannot be reproduced without the key that
+/// was just discarded.
+pub fn reset_key() -> Result<()> {
+    Credentials::delete(KEYRING_SERVICE)
+        .context("failed to delete the corrupt audit MAC key from the OS keyring")
+}
+
+/// Fetches the per-install MAC key from the keyring, generating one on first use. See
+/// `decide_key`/`validate_key` for the logic; this is just the I/O shell around it.
 fn load_or_create_key() -> Result<Vec<u8>> {
     use aes_gcm::aead::OsRng;
     use aes_gcm::aead::rand_core::RngCore;
     use secrecy::ExposeSecret;
 
-    if let Some(existing) = Credentials::get(KEYRING_SERVICE)? {
-        let decoded =
-            unhex(existing.expose_secret()).context("audit key in keyring is not valid hex")?;
-        if decoded.len() == 32 {
-            return Ok(decoded);
+    let existing = Credentials::get(KEYRING_SERVICE)?;
+    match decide_key(existing.as_ref().map(|s| s.expose_secret().as_str()))? {
+        KeyDecision::UseExisting(key) => Ok(key),
+        KeyDecision::GenerateNew => {
+            let mut key = vec![0u8; 32];
+            OsRng.fill_bytes(&mut key);
+            Credentials::set(KEYRING_SERVICE, &hex(&key))
+                .context("failed to store the audit MAC key in the OS keyring")?;
+            Ok(key)
         }
     }
-
-    let mut key = vec![0u8; 32];
-    OsRng.fill_bytes(&mut key);
-    Credentials::set(KEYRING_SERVICE, &hex(&key))
-        .context("failed to store the audit MAC key in the OS keyring")?;
-    Ok(key)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1152,5 +1227,74 @@ mod tests {
         let report = log.verify().unwrap();
         assert_eq!(report.anchor, AnchorStatus::Current);
         assert_eq!(report.entries, 1);
+    }
+
+    // --- §3.5: a corrupt keyring value must not be silently rotated --------------
+    //
+    // `decide_key`/`validate_key` are pure functions of `Option<&str>` — no keyring
+    // I/O — precisely so these can run without a working keyring daemon. CI runs on
+    // Windows and macOS images with no Secret Service; nothing below touches one.
+
+    #[test]
+    fn a_valid_32_byte_hex_key_is_accepted() {
+        let key = vec![0xABu8; 32];
+        match decide_key(Some(&hex(&key))).unwrap() {
+            KeyDecision::UseExisting(decoded) => assert_eq!(decoded, key),
+            KeyDecision::GenerateNew => panic!("a valid existing key must not be discarded"),
+        }
+    }
+
+    #[test]
+    fn a_valid_hex_value_of_the_wrong_length_is_rejected() {
+        // The actual defect: 16 bytes of perfectly valid hex, just not 32 of them.
+        // The old code fell through this case and silently minted a replacement key,
+        // destroying the ability to verify every prior audit entry with no warning.
+        let short = hex(&[0x11u8; 16]);
+        let err = decide_key(Some(&short)).unwrap_err().to_string();
+        assert!(
+            err.contains("16") && err.contains("32"),
+            "error should name both the actual and required length: {err}"
+        );
+        assert!(
+            err.contains(KEYRING_SERVICE),
+            "error should name the keyring service so the user knows what to fix: {err}"
+        );
+        assert!(
+            err.contains("--reset-key"),
+            "error should describe the deliberate recovery action: {err}"
+        );
+        assert!(
+            !err.contains(&short),
+            "error must not leak the offending key material: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_hex_value_is_still_rejected() {
+        // Guards the pre-existing behaviour: this case already propagated correctly
+        // via `?` before this fix; must not regress while restructuring around it.
+        let err = decide_key(Some("not-hex-at-all")).unwrap_err().to_string();
+        assert!(err.contains("hex"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn an_absent_value_still_generates_a_new_key() {
+        // The first-run path must not regress: no entry yet is a legitimate reason to
+        // generate a key, distinct from a present-but-unusable one.
+        match decide_key(None).unwrap() {
+            KeyDecision::GenerateNew => {}
+            KeyDecision::UseExisting(_) => panic!("nothing existed to use"),
+        }
+    }
+
+    #[test]
+    fn wrong_length_key_error_never_contains_the_decoded_bytes_either() {
+        // Belt-and-suspenders on top of the hex-string check above: assert the
+        // *decoded* bytes (as a second, differently-shaped hex string) don't leak
+        // through some other formatting path either.
+        let short = vec![0x42u8; 4];
+        let short_hex = hex(&short);
+        let err = decide_key(Some(&short_hex)).unwrap_err().to_string();
+        assert!(!err.contains("42424242"), "unexpected error: {err}");
     }
 }

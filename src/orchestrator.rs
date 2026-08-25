@@ -445,6 +445,122 @@ fn sanitize_progress_detail(raw: &str) -> String {
     truncate_chars(cleaned.trim(), MAX_PROGRESS_DETAIL_CHARS)
 }
 
+/// The *kind* of a failure — safe to write to the audit log even though the error's
+/// own message is not (see `safe_error_detail`). A closed, small set: every variant
+/// exists because a reader auditing the log later needs to tell one failure mode from
+/// another (a stuck connection is not the same incident as a missing file), not
+/// because it captures everything the error could mean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorKind {
+    NotFound,
+    PermissionDenied,
+    Timeout,
+    ConnectionRefused,
+    ConnectionFailed,
+    InvalidResponse,
+    /// The provider answered, with a status that was not a success.
+    HttpStatus,
+    /// Nothing in the error's cause chain matched a known kind above. Still reachable —
+    /// plenty of failures here are `anyhow!("...")` with no typed source — but no longer
+    /// the common case: the two that dominate in practice, a model CLI that never
+    /// answered and a provider returning a non-2xx status, now carry a
+    /// `providers::ProviderFailure` cause precisely so they do not land here.
+    Unspecified,
+}
+
+impl ErrorKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::NotFound => "not_found",
+            ErrorKind::PermissionDenied => "permission_denied",
+            ErrorKind::Timeout => "timeout",
+            ErrorKind::ConnectionRefused => "connection_refused",
+            ErrorKind::ConnectionFailed => "connection_failed",
+            ErrorKind::InvalidResponse => "invalid_response",
+            ErrorKind::HttpStatus => "http_status",
+            ErrorKind::Unspecified => "unspecified",
+        }
+    }
+}
+
+/// Classifies `err` by walking its `anyhow` cause chain for a concrete type whose
+/// *kind* — never its `Display` — is safe to name.
+///
+/// This is the chosen alternative to two weaker options. Bounding-only (what
+/// `providers::truncate_error_detail` already does) caps *length*, not *content*: a
+/// short string can still be a fragment of a response body. Grepping the message for
+/// suspicious substrings is worse still — it is trying to blocklist an open-ended
+/// space of attacker- and model-controlled text, and a blocklist over free text is
+/// always incomplete. Classifying by type is closed instead of open: `std::io::Error`
+/// and `reqwest::Error` expose their kind through a fixed, developer-defined
+/// vocabulary (`ErrorKind::NotFound`, `is_timeout()`, …) that a remote server or a
+/// model's own output has no way to steer, unlike the prose next to it.
+///
+/// `serde_json::Error` gets one bucket (`InvalidResponse`) because a malformed-JSON
+/// body is the same *kind* of failure however it is malformed — nothing downstream
+/// acts differently on "unexpected EOF" versus "expected `,`".
+///
+/// A plain `anyhow!("...")` with no wrapped source — the common case, per
+/// `ErrorKind::Unspecified`'s doc comment — matches nothing here and falls through.
+fn classify_error(err: &anyhow::Error) -> ErrorKind {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            match io_err.kind() {
+                std::io::ErrorKind::NotFound => return ErrorKind::NotFound,
+                std::io::ErrorKind::PermissionDenied => return ErrorKind::PermissionDenied,
+                std::io::ErrorKind::TimedOut => return ErrorKind::Timeout,
+                std::io::ErrorKind::ConnectionRefused => return ErrorKind::ConnectionRefused,
+                _ => {}
+            }
+        }
+        if let Some(req_err) = cause.downcast_ref::<reqwest::Error>() {
+            if req_err.is_timeout() {
+                return ErrorKind::Timeout;
+            }
+            if req_err.is_connect() {
+                return ErrorKind::ConnectionFailed;
+            }
+            if req_err.is_decode() || req_err.is_body() {
+                return ErrorKind::InvalidResponse;
+            }
+        }
+        if cause.downcast_ref::<serde_json::Error>().is_some() {
+            return ErrorKind::InvalidResponse;
+        }
+        // This crate's own failures. Without these the dominant real-world cases —
+        // a model CLI that never answered, a provider that returned 429 — fell through
+        // to `Unspecified`, which is exactly the information the audit entry exists to
+        // carry. See `providers::ProviderFailure`.
+        if let Some(failure) = cause.downcast_ref::<crate::providers::ProviderFailure>() {
+            return match failure {
+                crate::providers::ProviderFailure::Timeout => ErrorKind::Timeout,
+                crate::providers::ProviderFailure::HttpStatus(_) => ErrorKind::HttpStatus,
+            };
+        }
+    }
+    ErrorKind::Unspecified
+}
+
+/// Turns an error into the only representation the audit log's hard invariant
+/// allows — sizes, counts, and paths only, never content (see the `Sizes and counts
+/// only, never content` comment on `run_file_reads`'s audit call, and
+/// `docs/AUDIT-2026-07-30.md` §3.5). Every call site that used to write
+/// `format!("... error={e}")` embedded the error's own `Display` straight into the
+/// log, which is exactly what the invariant forbids: a provider error can carry a
+/// fragment of the response body, an `anyhow` chain concatenates its whole context,
+/// and none of that is simon's to disclose in a file designed to be handed to someone
+/// else as evidence.
+///
+/// This never touches `Display`. It records the *kind* alone (`classify_error`), which
+/// is safe by construction, plus an explicit `detail=withheld` marker — so a reader
+/// can tell "this event has no error text" (a log line with no detail field) apart
+/// from "there was error text, and it was deliberately not recorded" (this). Bounded
+/// regardless of input for the strongest possible reason: the input's length never
+/// factors into the output at all.
+fn safe_error_detail(err: &anyhow::Error) -> String {
+    format!("kind={} detail=withheld", classify_error(err).as_str())
+}
+
 /// Whether a candidate connection can actually be constructed right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Availability {
@@ -1431,7 +1547,7 @@ impl Orchestrator {
                 .await;
             }
             Err(e) => {
-                let _ = self.audit.log("connections.failed", &format!("error={e}"));
+                let _ = self.audit.log("connections.failed", &safe_error_detail(&e));
                 self.emit(Event::Error(format!(
                     "failed to apply new connections: {e}"
                 )))
@@ -1518,9 +1634,10 @@ impl Orchestrator {
         {
             Ok(reply) => reply,
             Err(e) => {
-                let _ = self
-                    .audit
-                    .log("prompt.failed", &format!("model={primary_label} error={e}"));
+                let _ = self.audit.log(
+                    "prompt.failed",
+                    &format!("model={primary_label} {}", safe_error_detail(&e)),
+                );
                 self.emit(Event::Error(format!("{primary_label}: {e}")))
                     .await;
                 return;
@@ -1703,9 +1820,10 @@ impl Orchestrator {
                 }
                 Err(e) => {
                     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let _ = self
-                        .audit
-                        .log("task.failed", &format!("task={task_id} error={e}"));
+                    let _ = self.audit.log(
+                        "task.failed",
+                        &format!("task={task_id} {}", safe_error_detail(&e)),
+                    );
                     // Record the error as the task's result and mark it Failed, not
                     // just logged-and-dropped: without this a failed delegation sat at
                     // [IN_PROGRESS] forever, indistinguishable from one still running,
@@ -1783,9 +1901,10 @@ impl Orchestrator {
                     .await;
                 }
                 Err(e) => {
-                    let _ = self
-                        .audit
-                        .log("skill.read_failed", &format!("name={name} error={e}"));
+                    let _ = self.audit.log(
+                        "skill.read_failed",
+                        &format!("name={name} {}", safe_error_detail(&e)),
+                    );
                     self.emit(Event::Error(format!("skill `{name}`: {e}")))
                         .await;
                 }
@@ -1863,7 +1982,7 @@ impl Orchestrator {
                 let outcome = format!("failed: {e}");
                 let _ = self.audit.log(
                     "file.write_failed",
-                    &format!("path={} error={e}", write.path),
+                    &format!("path={} {}", write.path, safe_error_detail(&e)),
                 );
                 self.ledger.record_file_write(&write.path, &outcome);
                 self.emit(Event::Error(format!("write `{}`: {e}", write.path)))
@@ -1904,7 +2023,7 @@ impl Orchestrator {
                 Err(e) => {
                     let _ = self.audit.log(
                         "file.write_failed",
-                        &format!("path={} error={e}", write.path),
+                        &format!("path={} {}", write.path, safe_error_detail(&e)),
                     );
                     self.ledger.record_file_write(&write.path, &e.to_string());
                     self.emit(Event::Error(format!("write `{}`: {e}", write.path)))
@@ -1956,9 +2075,10 @@ impl Orchestrator {
                     .await;
                 }
                 Err(e) => {
-                    let _ = self
-                        .audit
-                        .log("project.read_failed", &format!("path={path} error={e}"));
+                    let _ = self.audit.log(
+                        "project.read_failed",
+                        &format!("path={path} {}", safe_error_detail(&e)),
+                    );
                     self.emit(Event::Error(format!("read `{path}`: {e}"))).await;
                 }
             }
@@ -1994,9 +2114,10 @@ impl Orchestrator {
                     .await;
                 }
                 Err(e) => {
-                    let _ = self
-                        .audit
-                        .log("project.list_failed", &format!("path={path} error={e}"));
+                    let _ = self.audit.log(
+                        "project.list_failed",
+                        &format!("path={path} {}", safe_error_detail(&e)),
+                    );
                     self.emit(Event::Error(format!("list `{path}`: {e}"))).await;
                 }
             }
@@ -2006,6 +2127,78 @@ impl Orchestrator {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_audit_detail_names_the_failure_kind_but_never_its_text() {
+        // The invariant this guards is the whole point of `safe_error_detail`: a reader
+        // of the audit log must learn *what kind* of failure happened without any of the
+        // error's free text, which can carry a provider's response body or a model's own
+        // output.
+        let body = "SECRET-RESPONSE-BODY-marker-9f3a";
+        let err = anyhow::Error::new(crate::providers::ProviderFailure::HttpStatus(429))
+            .context(format!("anthropic returned 429: {body}"));
+
+        // Fixture guard: the text really is in the error, so the "not contained"
+        // assertion below cannot pass merely because the fixture was empty.
+        assert!(
+            err.to_string().contains(body),
+            "fixture did not put the secret text into the error"
+        );
+
+        let detail = safe_error_detail(&err);
+        assert!(
+            !detail.contains(body),
+            "audit detail leaked the error text: {detail}"
+        );
+        assert!(detail.contains("http_status"), "kind was lost: {detail}");
+    }
+
+    #[test]
+    fn a_cli_timeout_is_recorded_as_a_timeout_not_as_unspecified() {
+        // The regression: timeouts were raised with a bare `anyhow!("… timed out after
+        // …")`, so classification found nothing typed and logged `kind=unspecified` —
+        // losing the single most common real failure in this project. The
+        // human-readable sentence must survive too, because
+        // `is_retryable_delegation_error` matches on it.
+        let err = anyhow::Error::new(crate::providers::ProviderFailure::Timeout)
+            .context("/home/x/claude timed out after 300s".to_string());
+        assert!(
+            err.to_string().contains("timed out after"),
+            "the retry classifier's substring must stay in Display"
+        );
+        assert_eq!(safe_error_detail(&err), "kind=timeout detail=withheld");
+    }
+
+    #[test]
+    fn io_error_kinds_survive_into_the_audit_detail() {
+        for (kind, expected) in [
+            (std::io::ErrorKind::NotFound, "not_found"),
+            (std::io::ErrorKind::PermissionDenied, "permission_denied"),
+        ] {
+            let err = anyhow::Error::new(std::io::Error::from(kind));
+            let detail = safe_error_detail(&err);
+            assert!(detail.contains(expected), "{kind:?} became {detail}");
+        }
+    }
+
+    #[test]
+    fn the_audit_detail_is_bounded_and_utf8_safe_for_an_enormous_error() {
+        // Byte-index truncation panicked on multi-byte input before (fixed in 923b934);
+        // this message is Lithuanian, so every possible cut point is mid-codepoint.
+        let huge = "ąčęėįšųūž".repeat(100_000);
+        assert!(
+            huge.len() > 1_000_000,
+            "fixture is not large enough to matter"
+        );
+        let err = anyhow::anyhow!("{huge}");
+        let detail = safe_error_detail(&err);
+        assert!(
+            detail.len() < 200,
+            "detail was not bounded: {} bytes",
+            detail.len()
+        );
+        assert!(!detail.contains('ą'), "detail echoed the error text");
+    }
     use super::*;
     use crate::providers::{RateLimit, Reply};
     use async_trait::async_trait;

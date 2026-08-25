@@ -1024,7 +1024,6 @@ mod tests {
         assert!(err.contains("timed out"), "unexpected error: {err}");
     }
 
-    #[cfg(unix)]
     /// Builds a provider that runs `script` under `/bin/sh`. Unix-only, like the
     /// `/bin/echo` test above: `LocalBinaryProvider::new` rejects a nonexistent binary,
     /// and there is no `/bin/sh` on Windows.
@@ -1135,6 +1134,7 @@ mod tests {
         assert!(!reply.text.is_empty(), "fixture produced no output");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_child_that_finishes_within_the_timeout_still_succeeds() {
         // Unix-only: depends on `/bin/echo`, a Unix path that `LocalBinaryProvider::new`

@@ -142,6 +142,14 @@ const SPINNER_FRAMES: [&str; 4] = ["●···", "·●··", "··●·", "··�
 
 pub struct App {
     pub input: String,
+    /// Byte offset of the caret within `input`, always on a `char` boundary.
+    ///
+    /// Kept as a byte index rather than a character count because every operation on it
+    /// is a `String` insert/remove, which want bytes. The boundary invariant is
+    /// maintained by only ever moving it by `char::len_utf8` of an adjacent character —
+    /// this crate has shipped byte-index panics before (923b934), and a caret is
+    /// exactly the kind of place they hide until someone types a non-ASCII character.
+    pub cursor: usize,
     pub transcript: Vec<Line>,
     /// Lines scrolled off the top of the history pane.
     pub scroll: u16,
@@ -217,6 +225,7 @@ impl App {
         }
         Self {
             input: String::new(),
+            cursor: 0,
             transcript,
             scroll: 0,
             busy: false,
@@ -237,11 +246,49 @@ impl App {
     }
 
     pub fn push_char(&mut self, c: char) {
-        self.input.push(c);
+        self.input.insert(self.cursor, c);
+        self.cursor += c.len_utf8();
     }
 
     pub fn backspace(&mut self) {
-        self.input.pop();
+        let Some(prev) = self.input[..self.cursor].chars().next_back() else {
+            return;
+        };
+        self.cursor -= prev.len_utf8();
+        self.input.remove(self.cursor);
+    }
+
+    /// Delete the character *at* the caret, leaving the caret where it is.
+    pub fn delete_forward(&mut self) {
+        if self.input[self.cursor..].chars().next().is_some() {
+            self.input.remove(self.cursor);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        if let Some(c) = self.input[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+        }
+    }
+
+    pub fn cursor_right(&mut self) {
+        if let Some(c) = self.input[self.cursor..].chars().next() {
+            self.cursor += c.len_utf8();
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.input.len();
+    }
+
+    /// How many characters sit left of the caret — what the renderer needs to place the
+    /// terminal cursor. Characters, not bytes: the caret's column is a display position.
+    pub fn cursor_column(&self) -> usize {
+        self.input[..self.cursor].chars().count()
     }
 
     /// Takes the pending input if there is any, recording it in the transcript.
@@ -251,6 +298,7 @@ impl App {
             return None;
         }
         self.input.clear();
+        self.cursor = 0;
         self.transcript.push(Line {
             speaker: Speaker::You,
             text: text.clone(),
@@ -821,6 +869,83 @@ mod tests {
             "whitespace-only input must be ignored"
         );
         assert!(!app.busy);
+    }
+
+    #[test]
+    fn typing_inserts_at_the_caret_rather_than_always_at_the_end() {
+        let mut app = app();
+        for c in "helo".chars() {
+            app.push_char(c);
+        }
+        app.cursor_left();
+        app.push_char('l');
+        assert_eq!(app.input, "hello");
+        assert_eq!(
+            app.cursor_column(),
+            4,
+            "caret should sit after the inserted char"
+        );
+    }
+
+    #[test]
+    fn the_caret_moves_by_whole_characters_through_multibyte_text() {
+        // Every character here is two bytes, so a caret that moved by one byte would
+        // land mid-codepoint and panic on the next insert or slice — the failure class
+        // fixed in 923b934.
+        let mut app = app();
+        for c in "ąčęėį".chars() {
+            app.push_char(c);
+        }
+        assert_eq!(app.input.len(), 10, "fixture is not multi-byte as assumed");
+        assert_eq!(app.cursor, 10);
+
+        for expected in [4usize, 3, 2, 1, 0] {
+            app.cursor_left();
+            assert_eq!(app.cursor_column(), expected);
+            assert!(
+                app.input.is_char_boundary(app.cursor),
+                "caret left a char boundary"
+            );
+        }
+        app.cursor_left();
+        assert_eq!(app.cursor, 0, "moving left at the start must be a no-op");
+
+        app.push_char('x');
+        assert_eq!(app.input, "xąčęėį");
+    }
+
+    #[test]
+    fn backspace_and_delete_act_on_opposite_sides_of_the_caret() {
+        let mut app = app();
+        for c in "ąbč".chars() {
+            app.push_char(c);
+        }
+        app.cursor_left(); // between 'b' and 'č'
+        app.backspace(); // removes 'b'
+        assert_eq!(app.input, "ąč");
+        app.delete_forward(); // removes 'č'
+        assert_eq!(app.input, "ą");
+        app.delete_forward(); // nothing to the right
+        assert_eq!(app.input, "ą");
+    }
+
+    #[test]
+    fn home_and_end_jump_to_the_edges_and_submitting_resets_the_caret() {
+        let mut app = app();
+        for c in "ąčę".chars() {
+            app.push_char(c);
+        }
+        app.cursor_home();
+        assert_eq!(app.cursor, 0);
+        app.cursor_end();
+        assert_eq!(app.cursor, app.input.len());
+
+        assert_eq!(app.submit().as_deref(), Some("ąčę"));
+        assert_eq!(app.input, "");
+        assert_eq!(
+            app.cursor, 0,
+            "a stale caret past a cleared input would panic"
+        );
     }
 
     #[test]

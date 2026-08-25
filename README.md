@@ -58,7 +58,11 @@ once a commander has been chosen; until then it just flashes a reminder to press
 non-interactively instead.
 
 In the TUI: type and press **Enter** to send, **PageUp/PageDown** to scroll, **Esc** or
-**Ctrl-C** to quit. Type `/commander` on its own to list every connected model with
+**Ctrl-C** to quit. The prompt line edits like a normal one — **left/right** move the
+caret, **Home/End** jump to either edge, **Backspace/Delete** cut on either side of it,
+and modified chords are not typed as text (a stray **Ctrl-A** used to insert a bare
+`a`). `/forget` clears the ledger's accumulated content when a long session has piled
+up more than the commander needs. Type `/commander` on its own to list every connected model with
 the current commander marked, or `/commander <name>` (a full label, a bare model
 name, or a provider name) to switch commanders live, without leaving the
 conversation — the choice persists across restarts, same as the picker's. Neither

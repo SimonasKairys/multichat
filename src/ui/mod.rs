@@ -419,9 +419,20 @@ async fn handle_key(
             }
         }
         KeyCode::Backspace => app.backspace(),
+        KeyCode::Delete => app.delete_forward(),
+        KeyCode::Left => app.cursor_left(),
+        KeyCode::Right => app.cursor_right(),
+        KeyCode::Home => app.cursor_home(),
+        KeyCode::End => app.cursor_end(),
         KeyCode::PageUp => app.scroll_up(),
         KeyCode::PageDown => app.scroll_down(),
-        KeyCode::Char(c) => app.push_char(c),
+        // Ctrl-modified characters are shortcuts, not text. This arm is the catch-all
+        // for typing, and it used to take `c` whatever the modifiers were — so every
+        // chord this function does not explicitly handle (Ctrl+A, Ctrl+W, Ctrl+U…)
+        // silently typed its bare letter into the prompt. Alt is left alone: it is not
+        // bound to anything here, and some keyboard layouts produce ordinary characters
+        // with AltGr, which crossterm reports as Alt.
+        KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => app.push_char(c),
         _ => {}
     }
 }
@@ -451,6 +462,21 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
                 .borders(Borders::ALL),
         );
     frame.render_widget(input, chunks[1]);
+
+    // Place the terminal's own caret. Without this the arrow keys move an invisible
+    // position and editing mid-line is guesswork. Skipped while busy, where the input is
+    // greyed out and not accepting text — a caret there would invite typing that goes
+    // nowhere. The offset is the border (1) plus the `"> "` prompt (2); the column is
+    // counted in characters, which is right for this project's Latin and Lithuanian
+    // text but would drift on double-width CJK, since measuring that needs a
+    // grapheme-width table this crate deliberately does not carry.
+    if !app.busy {
+        let x = chunks[1].x + 3 + app.cursor_column() as u16;
+        let y = chunks[1].y + 1;
+        if x < chunks[1].x + chunks[1].width.saturating_sub(1) {
+            frame.set_cursor_position((x, y));
+        }
+    }
 }
 
 /// Renders the picker: a body pane listing every candidate grouped by provider, and

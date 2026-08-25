@@ -10,7 +10,22 @@ name = "simon"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
+# Narrowed from `features = ["full"]`, which pulls in the whole runtime — net, signal,
+# fs, io-std and the rest — when this crate uses a specific handful. Each entry below
+# is here because something in `src/` needs it: `rt-multi-thread` and `macros` for
+# `#[tokio::main]`/`#[tokio::test]` and `select!`/`join!`, `sync` for the mpsc channels
+# the orchestrator and UI talk over, `time` for every timeout and the spinner interval,
+# `process` for spawning model CLIs, and `io-util` for the bounded readers in
+# `providers::local_binary`. `reqwest` enables whatever transport features it needs on
+# its own, so they do not belong here.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "process",
+    "io-util",
+] }
 ratatui = "0.30"
 crossterm = { version = "0.28", features = ["event-stream"] }
 clap = { version = "4.5", features = ["derive"] }
@@ -36,10 +51,11 @@ futures = "0.3"
 rpassword = "7"
 zeroize = "1"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-
-[target.'cfg(target_os = "macos")'.dependencies]
+# One `cfg(unix)` block rather than a per-OS block each. `security.rs` guards the
+# platform-specific calls internally (`mlockall` is Linux-only, per-allocation `mlock`
+# is every unix), so listing Linux and macOS separately only meant that adding a third
+# unix would need a third identical stanza.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]

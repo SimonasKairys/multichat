@@ -195,6 +195,68 @@ fn model_hint(label: &str) -> Option<&'static str> {
     }
 }
 
+/// Hard ceiling on the *whole* rendered system prompt, in characters, enforced across
+/// every section together — the piece the per-item caps above were missing.
+///
+/// `docs/AUDIT-2026-07-30.md` §3.2 measured a ledger stuffed to every per-item cap at
+/// 54,818 chars (~13,700 tokens at this project's chars/4 approximation), sent on
+/// *every* provider call for the rest of the session — including each of up to 3
+/// delegations in a turn, so one user message could cost ~55,000 tokens of system
+/// prompt four times over before anyone's actual words. Every individual cap
+/// (`MAX_RESULT_CHARS`, `MAX_SKILL_CONTENT_CHARS`, ...) is sensibly chosen; nobody had
+/// multiplied them together.
+///
+/// 16,000 chars (~4,000 tokens) is chosen because it:
+/// - is a >3x cut from that measured worst case per call, so a long session's cost no
+///   longer scales with ledger history the way the audit describes;
+/// - still comfortably fits the load-bearing sections (roster, budgets, and the four
+///   protocol blocks — typically 3,500-4,500 chars depending on roster size) plus
+///   several full task results or a loaded skill/file, so the degrade path in
+///   `system_prompt` fires on long-running sessions, not on ordinary turns;
+/// - keeps cost proportional to what actually accumulated: a fresh session's prompt is
+///   a few hundred chars regardless of this ceiling, and only a session that has
+///   loaded enough content to approach 16,000 chars pays for the ceiling at all.
+///
+/// Not derived from any provider's context window — this bounds cost and latency,
+/// which matter long before any window is close to full.
+const MAX_SYSTEM_PROMPT_CHARS: usize = 16_000;
+
+/// Reserved out of the whole-prompt budget for the *structural* text the degrade path
+/// in `system_prompt` writes — content-section headers, "no X yet" fallback lines, and
+/// the notes that announce an elision or omission. Kept separate from the budget spent
+/// on section *content* (task results, skill bodies, ...) so that an elision note is
+/// never itself the thing squeezed out by the content it is reporting on — see
+/// `push_structural` vs `fits`. Sized generously above the worst case (six sections,
+/// each with at most one short header and one short note) with room to spare.
+const BUDGET_NOTE_RESERVE_CHARS: usize = 1000;
+
+/// Checks whether `text` fits in the remaining content budget, consuming it if so.
+/// Leaves `*budget` untouched when it doesn't fit — the caller can still try smaller
+/// items after a big one fails, which is exactly what the per-section renderers below
+/// do (walk most-recent-first, skip whatever doesn't currently fit, keep going).
+fn fits(budget: &mut usize, text: &str) -> bool {
+    let len = text.chars().count();
+    if len <= *budget {
+        *budget -= len;
+        true
+    } else {
+        false
+    }
+}
+
+/// Writes `text` to `out` if it fits in the remaining *structural* budget
+/// (`note_budget`), silently doing nothing otherwise. `BUDGET_NOTE_RESERVE_CHARS` is
+/// sized so this should never actually fail in practice; if it somehow does, dropping
+/// one header or note is a far smaller problem than the whole-prompt budget being
+/// overrun to write it anyway.
+fn push_structural(out: &mut String, note_budget: &mut usize, text: &str) {
+    let len = text.chars().count();
+    if len <= *note_budget {
+        *note_budget -= len;
+        out.push_str(text);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SwarmLedger {
     /// What the commander said last turn, so a plan survives long enough to be acted
@@ -423,6 +485,44 @@ impl SwarmLedger {
         });
     }
 
+    /// Clears every *accumulated content* section — the escape hatch half of
+    /// `docs/AUDIT-2026-07-30.md` §3.2, alongside the whole-prompt budget in
+    /// `system_prompt`. The budget bounds any single turn; this is for a session that
+    /// has run long enough that even the budgeted prompt is mostly stale content, with
+    /// no other way to get back to a small prompt short of restarting.
+    ///
+    /// What's dropped and why: `loaded_skills`, `written_files`, `loaded_reads`, and
+    /// `file_listings` are pure accumulation — nothing else in the app reads them
+    /// except `system_prompt`, so there is no cost to emptying them outright.
+    /// `last_commander_reply` exists only to carry a plan across one turn boundary
+    /// (see its field doc comment); once explicitly cleared there is no plan left to
+    /// carry, and leaving a stale one in place would misrepresent what the commander
+    /// most recently said. Task *results* are cleared for the same reason they
+    /// dominate the audit's worst-case math (`MAX_RENDERED_TASKS` × `MAX_RESULT_CHARS`
+    /// = 40,000 chars, the single largest compounding section) — the reply text is
+    /// exactly the accumulated content this method exists to drop.
+    ///
+    /// What survives and why: `roster` and `budgets` are not accumulated history —
+    /// they describe what's reachable *right now* and are refreshed independently by
+    /// `set_roster`/`update_budget`, so clearing them would just make the very next
+    /// prompt claim "no other models are reachable" until the next reconfigure, which
+    /// is not what "forget stale content" means. The tasks themselves (`id`,
+    /// `description`, `assigned_to`, `status`) survive too: a task list is the user's
+    /// to-do list for the session, cheap on its own (bounded by `MAX_RENDERED_TASKS` in
+    /// the prompt regardless of how many were ever added), and useful to keep looking
+    /// at across a clear — what needed clearing was the heavy replies riding along
+    /// with it, not the fact that the work happened.
+    pub fn clear_content(&mut self) {
+        for task in &mut self.tasks {
+            task.result = None;
+        }
+        self.loaded_skills.clear();
+        self.written_files.clear();
+        self.loaded_reads.clear();
+        self.file_listings.clear();
+        self.last_commander_reply = None;
+    }
+
     pub fn assign_task(&mut self, id: usize, model_label: &str) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
             task.assigned_to = Some(model_label.to_string());
@@ -436,11 +536,60 @@ impl SwarmLedger {
     }
 
     /// Renders the ledger as the Markdown system-prompt block injected into every
-    /// model's context.
+    /// model's context, within `MAX_SYSTEM_PROMPT_CHARS` total.
+    ///
+    /// Two tiers, rendered in this order:
+    ///
+    /// 1. **Load-bearing**: the header, the roster ("Available models"), resource
+    ///    budgets, and the four protocol sections (delegation, skills, file write,
+    ///    file read). These always render in full, unconditionally. Eliding any of
+    ///    them doesn't shrink the prompt gracefully — it makes the model stop
+    ///    following the protocol altogether, or hands work to a model it has no
+    ///    cost/context information for. Their combined size is computed first and
+    ///    subtracted from the total budget; whatever's left is the *content budget*
+    ///    for tier 2.
+    /// 2. **Content**: tasks (with results), the commander's previous turn, loaded
+    ///    skills, loaded project-file reads, file listings, and written-file records —
+    ///    in that priority order, which is also the order they're rendered in. Each
+    ///    is capped per-item already (`MAX_RESULT_CHARS` and friends), but the audit
+    ///    this closes found that the caps compound: 20 tasks × 2000 chars alone is
+    ///    40,000. So each section here spends from a shared, shrinking content budget
+    ///    (`fits`/`push_structural`, most-recent-first) and announces what it dropped
+    ///    rather than silently vanishing — see each `render_*_section` below.
+    ///
+    /// Tasks lead the content tier because they carry the actual work product
+    /// (delegation results) the commander needs to synthesise from; the previous turn
+    /// follows because losing it silently reproduces the exact bug `last_commander_reply`
+    /// exists to fix (see its field doc comment). Loaded skills/reads follow because
+    /// they're content a model explicitly asked to see. File listings and written-file
+    /// records are last: they're metadata about what happened, not content a model is
+    /// working from, and `docs/AUDIT-2026-07-30.md` §3.2 specifically flagged listings
+    /// as the section with no per-item content cap at all — most likely to blow the
+    /// budget on its own, least valuable per character when it does.
     pub fn system_prompt(&self) -> String {
         let mut out = String::from("## SWARM LEDGER (shared blackboard)\n\n");
+        out.push_str(&self.render_roster());
+        out.push_str(&self.render_resource_budgets());
+        let protocols = Self::render_protocols();
 
-        out.push_str("### Available models\n");
+        let reserved = out.chars().count() + protocols.chars().count();
+        let available = MAX_SYSTEM_PROMPT_CHARS.saturating_sub(reserved);
+        let mut note_budget = available.min(BUDGET_NOTE_RESERVE_CHARS);
+        let mut budget = available - note_budget;
+
+        out.push_str(&self.render_tasks_section(&mut budget, &mut note_budget));
+        out.push_str(&self.render_previous_turn_section(&mut budget, &mut note_budget));
+        out.push_str(&self.render_loaded_skills_section(&mut budget, &mut note_budget));
+        out.push_str(&self.render_loaded_reads_section(&mut budget, &mut note_budget));
+        out.push_str(&self.render_file_listings_section(&mut budget, &mut note_budget));
+        out.push_str(&self.render_written_files_section(&mut budget, &mut note_budget));
+
+        out.push_str(&protocols);
+        out
+    }
+
+    fn render_roster(&self) -> String {
+        let mut out = String::from("### Available models\n");
         if self.roster.is_empty() {
             out.push_str("No other models are reachable.\n");
         } else {
@@ -451,8 +600,11 @@ impl SwarmLedger {
                 }
             }
         }
+        out
+    }
 
-        out.push_str("\n### Resource budgets\n");
+    fn render_resource_budgets(&self) -> String {
+        let mut out = String::from("\n### Resource budgets\n");
         if self.budgets.is_empty() {
             out.push_str("No budget information has been observed yet.\n");
         } else {
@@ -460,68 +612,232 @@ impl SwarmLedger {
                 out.push_str(&format!("- {model}: {budget}\n"));
             }
         }
+        out
+    }
 
-        out.push_str("\n### Tasks\n");
+    /// Renders the tasks section within the shared content budget. The ledger keeps
+    /// every task for the whole session; `MAX_RENDERED_TASKS` already limits the
+    /// window to the most recent ones (unchanged from before this budget existed), and
+    /// this adds a second, independent cut on top: even within that window, entries
+    /// are kept most-recent-first only as far as the remaining budget allows, since a
+    /// full window of 20 results can alone be 40,000 chars. Both cuts are announced
+    /// separately — they have different causes and a reader troubleshooting a missing
+    /// task benefits from knowing which one ate it.
+    fn render_tasks_section(&self, budget: &mut usize, note_budget: &mut usize) -> String {
+        let mut out = String::new();
+        push_structural(&mut out, note_budget, "\n### Tasks\n");
         if self.tasks.is_empty() {
-            out.push_str("No active tasks.\n");
-        } else {
-            // The ledger keeps every task for the whole session and is re-injected into
-            // every prompt, so rendering all of them would make each turn's system
-            // prompt grow without bound. Show only the most recent `MAX_RENDERED_TASKS`
-            // and say so, rather than silently dropping the older ones (they still
-            // exist in `self.tasks` for anything that inspects the ledger directly).
-            let total = self.tasks.len();
-            let start = total.saturating_sub(MAX_RENDERED_TASKS);
-            if start > 0 {
-                out.push_str(&format!(
-                    "(...{start} earlier task(s) elided; showing the {MAX_RENDERED_TASKS} most recent...)\n"
-                ));
-            }
-            for task in &self.tasks[start..] {
+            push_structural(&mut out, note_budget, "No active tasks.\n");
+            return out;
+        }
+
+        let total = self.tasks.len();
+        let start = total.saturating_sub(MAX_RENDERED_TASKS);
+        let window = &self.tasks[start..];
+
+        let entries: Vec<String> = window
+            .iter()
+            .map(|task| {
                 let assignee = task.assigned_to.as_deref().unwrap_or("unassigned");
-                out.push_str(&format!(
+                let mut entry = format!(
                     "- {} Task #{}: {} (assigned: {})\n",
                     task.status.tag(),
                     task.id,
                     task.description,
                     assignee
-                ));
+                );
                 if let Some(result) = &task.result {
-                    // Indent continuation lines so a multi-line result nests under its
-                    // task instead of producing bare lines that read as separate ledger
-                    // entries.
+                    // Indent continuation lines so a multi-line result nests under
+                    // its task instead of producing bare lines that read as separate
+                    // ledger entries.
                     let indented = result.replace('\n', "\n    ");
-                    out.push_str(&format!("    result: {indented}\n"));
+                    entry.push_str(&format!("    result: {indented}\n"));
                 }
+                entry
+            })
+            .collect();
+
+        // Walk most-recent-first so a tight budget drops the oldest of the window,
+        // not the newest — the newest task is the one most likely to be what the
+        // commander is waiting on.
+        let mut keep = vec![false; entries.len()];
+        for i in (0..entries.len()).rev() {
+            keep[i] = fits(budget, &entries[i]);
+        }
+        let budget_dropped = keep.iter().filter(|k| !**k).count();
+
+        if start > 0 {
+            push_structural(
+                &mut out,
+                note_budget,
+                &format!(
+                    "(...{start} earlier task(s) elided; showing the {MAX_RENDERED_TASKS} most recent...)\n"
+                ),
+            );
+        }
+        if budget_dropped > 0 {
+            push_structural(
+                &mut out,
+                note_budget,
+                &format!(
+                    "(...{budget_dropped} more recent task(s) omitted from this prompt — system-prompt character budget exhausted...)\n"
+                ),
+            );
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            if keep[i] {
+                out.push_str(entry);
             }
         }
+        out
+    }
 
-        out.push_str("\n### Loaded skills\n");
+    /// Renders the commander's previous turn within the shared content budget. Unlike
+    /// the list-shaped sections below, this is one blob of prose, not a set of
+    /// discrete records, so a partial version is still useful and it is truncated
+    /// rather than dropped whole when it doesn't fit.
+    fn render_previous_turn_section(&self, budget: &mut usize, note_budget: &mut usize) -> String {
+        let mut out = String::new();
+        let Some(previous) = &self.last_commander_reply else {
+            return out;
+        };
+
+        // Named for the commander rather than addressed to "you": every model reads
+        // this same ledger, and a sub-agent must not mistake the commander's plan for
+        // something it said itself.
+        push_structural(
+            &mut out,
+            note_budget,
+            "\n### The commander's previous turn\n",
+        );
+
+        if fits(budget, &format!("{previous}\n")) {
+            out.push_str(previous);
+            out.push('\n');
+            return out;
+        }
+
+        // Doesn't fit whole. Cut on a char boundary, not a byte index — `previous` is
+        // arbitrary model-authored prose and may contain multi-byte UTF-8, and
+        // slicing mid-character panics (the class of bug fixed in 923b934). Mirrors
+        // `record_commander_reply`'s own truncation, just against the remaining
+        // whole-prompt budget instead of `MAX_PREVIOUS_TURN_CHARS`.
+        let keep = *budget;
+        *budget = 0;
+        let cut = previous
+            .char_indices()
+            .nth(keep)
+            .map(|(i, _)| i)
+            .unwrap_or(previous.len());
+        out.push_str(&previous[..cut]);
+        push_structural(
+            &mut out,
+            note_budget,
+            "…\n(truncated — system-prompt character budget exhausted)\n",
+        );
+        out
+    }
+
+    /// Renders loaded skills within the shared content budget. Same most-recent-first,
+    /// whole-item-or-nothing treatment as `render_tasks_section`, but skills are never
+    /// sliced mid-item on a budget miss (unlike the previous turn above): a skill's
+    /// content is a coherent document a model asked to load, and half of one reads as
+    /// corrupted rather than merely shorter.
+    fn render_loaded_skills_section(&self, budget: &mut usize, note_budget: &mut usize) -> String {
+        let mut out = String::new();
+        push_structural(&mut out, note_budget, "\n### Loaded skills\n");
         if self.loaded_skills.is_empty() {
-            out.push_str("No skills have been loaded into context yet.\n");
-        } else {
-            for skill in &self.loaded_skills {
-                out.push_str(&format!("#### {}\n{}\n", skill.name, skill.content));
-            }
+            push_structural(
+                &mut out,
+                note_budget,
+                "No skills have been loaded into context yet.\n",
+            );
+            return out;
         }
 
-        if !self.written_files.is_empty() {
-            out.push_str("\n### Files you have written\n");
-            for written in &self.written_files {
-                out.push_str(&format!("- {}: {}\n", written.path, written.outcome));
+        let entries: Vec<String> = self
+            .loaded_skills
+            .iter()
+            .map(|skill| format!("#### {}\n{}\n", skill.name, skill.content))
+            .collect();
+        let mut keep = vec![false; entries.len()];
+        for i in (0..entries.len()).rev() {
+            keep[i] = fits(budget, &entries[i]);
+        }
+        let dropped = keep.iter().filter(|k| !**k).count();
+        if dropped > 0 {
+            push_structural(
+                &mut out,
+                note_budget,
+                &format!(
+                    "(...{dropped} loaded skill(s) omitted from this prompt — system-prompt character budget exhausted...)\n"
+                ),
+            );
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            if keep[i] {
+                out.push_str(entry);
             }
         }
+        out
+    }
 
-        if !self.loaded_reads.is_empty() {
-            out.push_str("\n### Loaded project files\n");
-            for read in &self.loaded_reads {
-                out.push_str(&format!("#### {}\n{}\n", read.path, read.content));
+    /// Renders loaded project-file reads within the shared content budget. Same
+    /// whole-item treatment as `render_loaded_skills_section`, and the header only
+    /// appears when there's at least one loaded read, unchanged from before this
+    /// budget existed.
+    fn render_loaded_reads_section(&self, budget: &mut usize, note_budget: &mut usize) -> String {
+        let mut out = String::new();
+        if self.loaded_reads.is_empty() {
+            return out;
+        }
+        push_structural(&mut out, note_budget, "\n### Loaded project files\n");
+
+        let entries: Vec<String> = self
+            .loaded_reads
+            .iter()
+            .map(|read| format!("#### {}\n{}\n", read.path, read.content))
+            .collect();
+        let mut keep = vec![false; entries.len()];
+        for i in (0..entries.len()).rev() {
+            keep[i] = fits(budget, &entries[i]);
+        }
+        let dropped = keep.iter().filter(|k| !**k).count();
+        if dropped > 0 {
+            push_structural(
+                &mut out,
+                note_budget,
+                &format!(
+                    "(...{dropped} loaded project file(s) omitted from this prompt — system-prompt character budget exhausted...)\n"
+                ),
+            );
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            if keep[i] {
+                out.push_str(entry);
             }
         }
+        out
+    }
 
-        if !self.file_listings.is_empty() {
-            out.push_str("\n### Project file listings\n");
-            for listing in &self.file_listings {
+    /// Renders directory listings within the shared content budget. Same whole-item
+    /// treatment as the sections above. This is the section `docs/AUDIT-2026-07-30.md`
+    /// §3.2 specifically flagged as having no per-item content cap at all (a listing's
+    /// `outcome` can hold up to `workspace::MAX_LIST_ENTRIES` entries) — the
+    /// whole-item skip here is what keeps one outsized listing from consuming the
+    /// entire content budget on its own the way an uncapped truncation would still
+    /// have to guard against.
+    fn render_file_listings_section(&self, budget: &mut usize, note_budget: &mut usize) -> String {
+        let mut out = String::new();
+        if self.file_listings.is_empty() {
+            return out;
+        }
+        push_structural(&mut out, note_budget, "\n### Project file listings\n");
+
+        let entries: Vec<String> = self
+            .file_listings
+            .iter()
+            .map(|listing| {
                 // An empty path means the project root — render it as `.` rather
                 // than a blank label, mirroring `Workspace::list`'s own treatment of
                 // an empty request as the root.
@@ -534,18 +850,72 @@ impl SwarmLedger {
                 // path instead of producing bare lines that read as separate ledger
                 // entries — same treatment as a multi-line task result above.
                 let indented = listing.outcome.replace('\n', "\n    ");
-                out.push_str(&format!("- {label}: {indented}\n"));
+                format!("- {label}: {indented}\n")
+            })
+            .collect();
+        let mut keep = vec![false; entries.len()];
+        for i in (0..entries.len()).rev() {
+            keep[i] = fits(budget, &entries[i]);
+        }
+        let dropped = keep.iter().filter(|k| !**k).count();
+        if dropped > 0 {
+            push_structural(
+                &mut out,
+                note_budget,
+                &format!(
+                    "(...{dropped} file listing(s) omitted from this prompt — system-prompt character budget exhausted...)\n"
+                ),
+            );
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            if keep[i] {
+                out.push_str(entry);
             }
         }
+        out
+    }
 
-        if let Some(previous) = &self.last_commander_reply {
-            // Named for the commander rather than addressed to "you": every model
-            // reads this same ledger, and a sub-agent must not mistake the
-            // commander's plan for something it said itself.
-            out.push_str("\n### The commander's previous turn\n");
-            out.push_str(previous);
-            out.push('\n');
+    /// Renders write-outcome records within the shared content budget. Same whole-item
+    /// treatment as the sections above; in practice these almost always fit whole,
+    /// since `WrittenFile` deliberately holds no file content — see its doc comment.
+    fn render_written_files_section(&self, budget: &mut usize, note_budget: &mut usize) -> String {
+        let mut out = String::new();
+        if self.written_files.is_empty() {
+            return out;
         }
+        push_structural(&mut out, note_budget, "\n### Files you have written\n");
+
+        let entries: Vec<String> = self
+            .written_files
+            .iter()
+            .map(|written| format!("- {}: {}\n", written.path, written.outcome))
+            .collect();
+        let mut keep = vec![false; entries.len()];
+        for i in (0..entries.len()).rev() {
+            keep[i] = fits(budget, &entries[i]);
+        }
+        let dropped = keep.iter().filter(|k| !**k).count();
+        if dropped > 0 {
+            push_structural(
+                &mut out,
+                note_budget,
+                &format!(
+                    "(...{dropped} written-file record(s) omitted from this prompt — system-prompt character budget exhausted...)\n"
+                ),
+            );
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            if keep[i] {
+                out.push_str(entry);
+            }
+        }
+        out
+    }
+
+    /// The four protocol sections, verbatim and unconditional — see `system_prompt`'s
+    /// doc comment for why these never shrink.
+    fn render_protocols() -> String {
+        let mut out = String::new();
 
         out.push_str(
             "\n### Delegation protocol\n\
@@ -1432,5 +1802,201 @@ mod tests {
         ledger.record_file_write("notes.md", "ok (20 bytes)");
         assert_eq!(ledger.written_files().len(), 1);
         assert_eq!(ledger.written_files()[0].outcome, "ok (20 bytes)");
+    }
+
+    // --- Whole-prompt budget (docs/AUDIT-2026-07-30.md §3.2) -----------------------
+
+    /// A ledger stuffed to every per-section cap: `MAX_RENDERED_TASKS` tasks each with
+    /// a full `MAX_RESULT_CHARS` result, `MAX_LOADED_SKILLS` skills each with full
+    /// `MAX_SKILL_CONTENT_CHARS` content, `MAX_LOADED_READS` reads each with full
+    /// `MAX_READ_CONTENT_CHARS` content, `MAX_RECORDED_LISTS` oversized listings (the
+    /// section the audit flagged as having no per-item content cap at all),
+    /// `MAX_RECORDED_WRITES` write records, and a full `MAX_PREVIOUS_TURN_CHARS`
+    /// previous turn. Mirrors the probe `docs/AUDIT-2026-07-30.md` §3.2 used, extended
+    /// with the three sections (`written_files`, `loaded_reads`, `file_listings`)
+    /// added after that audit was written.
+    fn maximally_stuffed_ledger() -> SwarmLedger {
+        let mut ledger = SwarmLedger::new();
+        ledger.set_roster(vec![
+            "ollama:llama3".to_string(),
+            "anthropic:claude-opus-5".to_string(),
+        ]);
+        ledger.update_budget("anthropic:claude-opus-5", "42 requests left");
+
+        for i in 0..MAX_RENDERED_TASKS {
+            let id = ledger.add_task(&format!(
+                "task {i}: summarise a reasonably long delegated unit of work"
+            ));
+            ledger.assign_task(id, "ollama:llama3");
+            ledger.record_result(id, &"x".repeat(MAX_RESULT_CHARS));
+        }
+        for i in 0..MAX_LOADED_SKILLS {
+            ledger.record_skill(
+                &format!("skill-{i}.md"),
+                &"y".repeat(MAX_SKILL_CONTENT_CHARS),
+            );
+        }
+        for i in 0..MAX_LOADED_READS {
+            ledger.record_file_read(
+                &format!("file-{i}.txt"),
+                &"z".repeat(MAX_READ_CONTENT_CHARS),
+            );
+        }
+        for i in 0..MAX_RECORDED_LISTS {
+            // A 500-entry listing, the shape `docs/AUDIT-2026-07-30.md` §3.2 warned
+            // about: `workspace::MAX_LIST_ENTRIES` allows this, and nothing in
+            // `ListedFiles` caps it further.
+            let outcome = (0..500)
+                .map(|n| format!("entry_{n}.rs"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            ledger.record_file_list(&format!("dir-{i}"), &outcome);
+        }
+        for i in 0..MAX_RECORDED_WRITES {
+            ledger.record_file_write(&format!("written-{i}.md"), "ok (1234 bytes)");
+        }
+        ledger.record_commander_reply(&"v".repeat(MAX_PREVIOUS_TURN_CHARS));
+        ledger
+    }
+
+    #[test]
+    fn a_maximally_stuffed_ledger_renders_within_the_total_budget() {
+        let text = maximally_stuffed_ledger().system_prompt();
+        let chars = text.chars().count();
+        assert!(
+            chars <= MAX_SYSTEM_PROMPT_CHARS,
+            "rendered {chars} chars, budget is {MAX_SYSTEM_PROMPT_CHARS}"
+        );
+    }
+
+    #[test]
+    fn measured_before_and_after_sizes_for_a_maximally_stuffed_ledger() {
+        // "Measured, not estimated" — same standard `docs/AUDIT-2026-07-30.md` §3.2
+        // held itself to. "Before" is reconstructed by rendering every content section
+        // with an effectively unlimited budget (the same code path `system_prompt`
+        // uses, just without the ceiling), which is what the whole-prompt budget in
+        // `system_prompt` replaced — not a re-estimate from the caps on paper.
+        let ledger = maximally_stuffed_ledger();
+
+        let mut budget = usize::MAX;
+        let mut note_budget = usize::MAX;
+        let mut unbounded = String::new();
+        unbounded.push_str(&ledger.render_roster());
+        unbounded.push_str(&ledger.render_resource_budgets());
+        unbounded.push_str(&ledger.render_tasks_section(&mut budget, &mut note_budget));
+        unbounded.push_str(&ledger.render_previous_turn_section(&mut budget, &mut note_budget));
+        unbounded.push_str(&ledger.render_loaded_skills_section(&mut budget, &mut note_budget));
+        unbounded.push_str(&ledger.render_loaded_reads_section(&mut budget, &mut note_budget));
+        unbounded.push_str(&ledger.render_file_listings_section(&mut budget, &mut note_budget));
+        unbounded.push_str(&ledger.render_written_files_section(&mut budget, &mut note_budget));
+        unbounded.push_str(&SwarmLedger::render_protocols());
+
+        let before_chars = unbounded.chars().count();
+        let after_chars = ledger.system_prompt().chars().count();
+        // Run with `cargo test -- --nocapture` to see these; kept in the test rather
+        // than removed after one manual run (unlike the audit's own probe) because
+        // this is a regression guard, not a one-off measurement.
+        println!("PROBE before (unbudgeted) system_prompt chars = {before_chars}");
+        println!("PROBE after  (budgeted)   system_prompt chars = {after_chars}");
+
+        assert!(
+            before_chars > MAX_SYSTEM_PROMPT_CHARS * 2,
+            "expected the unbudgeted render to dwarf the new ceiling; got {before_chars}"
+        );
+        assert!(after_chars <= MAX_SYSTEM_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn load_bearing_sections_survive_a_maximally_stuffed_prompt() {
+        let text = maximally_stuffed_ledger().system_prompt();
+        assert!(text.contains("### Available models"));
+        assert!(text.contains("### Resource budgets"));
+        assert!(text.contains("### Delegation protocol"));
+        assert!(text.contains("### Skills protocol"));
+        assert!(text.contains("### File write protocol"));
+        assert!(text.contains("### File read protocol"));
+        assert!(text.contains("ACTION: delegate_task"));
+        assert!(text.contains("ACTION: read_skill"));
+        assert!(text.contains("ACTION: write_file"));
+        assert!(text.contains("ACTION: read_file"));
+        assert!(text.contains("ACTION: list_files"));
+    }
+
+    #[test]
+    fn elision_from_the_whole_prompt_budget_is_announced_not_silent() {
+        let text = maximally_stuffed_ledger().system_prompt();
+        assert!(
+            text.contains("system-prompt character budget exhausted"),
+            "a maximally-stuffed ledger must announce what it dropped, not just drop it:\n{text}"
+        );
+    }
+
+    #[test]
+    fn multi_byte_utf8_content_over_budget_never_panics_and_stays_valid() {
+        // Lithuanian and CJK text, well past every per-item cap, exercising both the
+        // existing char-boundary truncation in `record_*` and the new budget-driven
+        // truncation in `render_previous_turn_section`. `system_prompt` returning a
+        // `String` at all is itself proof no cut landed mid-character — a byte-index
+        // slice on a non-boundary panics at runtime rather than producing invalid
+        // UTF-8, so this test failing to panic already demonstrates the property; the
+        // assertions below just confirm the budget was still respected.
+        let mut ledger = SwarmLedger::new();
+        let long_lt = "ąčęėįšųūž".repeat(2000);
+        let long_cjk = "文字化けせずに切り詰められることを確認する".repeat(2000);
+
+        for i in 0..(MAX_RENDERED_TASKS + 3) {
+            let id = ledger.add_task(&format!("task {i}"));
+            ledger.record_result(id, &long_lt);
+        }
+        ledger.record_skill("skill.md", &long_cjk);
+        ledger.record_file_read("read.md", &long_lt);
+        ledger.record_file_list("dir", &long_cjk);
+        ledger.record_commander_reply(&long_lt);
+
+        let text = ledger.system_prompt();
+        assert!(text.chars().count() <= MAX_SYSTEM_PROMPT_CHARS);
+        assert!(text.contains("### Delegation protocol"));
+    }
+
+    #[test]
+    fn clear_content_drops_accumulated_sections_but_keeps_the_roster_and_task_list() {
+        let mut ledger = SwarmLedger::new();
+        ledger.set_roster(vec!["ollama:llama3".to_string()]);
+        ledger.update_budget("ollama:llama3", "no quota needed");
+        let id = ledger.add_task("summarise the diff");
+        ledger.assign_task(id, "ollama:llama3");
+        ledger.record_result(id, "the diff adds a timeout");
+        ledger.record_skill("notes.md", "be terse and cite sources");
+        ledger.record_file_write("out.md", "ok (10 bytes)");
+        ledger.record_file_read("in.md", "some file content");
+        ledger.record_file_list("src", "ok (1 entries)\nmain.rs");
+        ledger.record_commander_reply("Plan: ship it.");
+
+        ledger.clear_content();
+
+        // Content sections: gone.
+        assert!(ledger.loaded_skills().is_empty());
+        assert!(ledger.written_files().is_empty());
+        assert!(ledger.loaded_reads().is_empty());
+        assert!(ledger.file_listings().is_empty());
+        assert!(ledger.last_commander_reply().is_none());
+        assert!(ledger.tasks()[0].result.is_none());
+
+        // What survives: the roster, the resource budgets, and the task itself (just
+        // not its result) — see `clear_content`'s doc comment for why.
+        assert_eq!(ledger.roster(), ["ollama:llama3".to_string()]);
+        assert_eq!(ledger.tasks().len(), 1);
+        assert_eq!(ledger.tasks()[0].description, "summarise the diff");
+        assert_eq!(
+            ledger.tasks()[0].assigned_to.as_deref(),
+            Some("ollama:llama3")
+        );
+
+        let text = ledger.system_prompt();
+        assert!(text.contains("- ollama:llama3"));
+        assert!(text.contains("no quota needed"));
+        assert!(text.contains("Task #1: summarise the diff"));
+        assert!(!text.contains("the diff adds a timeout"));
+        assert!(!text.contains("be terse and cite sources"));
     }
 }

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use crate::app::{App, Line};
-use crate::audit::AuditLogger;
+use crate::audit::{AnchorStatus, AuditLogger};
 use crate::config::{Credentials, Paths, Settings};
 use crate::orchestrator::{Orchestrator, Registry};
 use crate::security::Hardening;
@@ -84,7 +84,16 @@ enum Commands {
     /// List every model this machine can currently reach.
     Models,
     /// Verify the audit log's hash chain.
-    Audit,
+    Audit {
+        /// Discard the tamper-evidence anchors for the current log and re-baseline
+        /// them to whatever is on disk right now. For after a deliberate admin action
+        /// (deleting or trimming the log on purpose) that would otherwise leave every
+        /// future `simon audit` reporting truncation with no way to clear it. Never
+        /// happens implicitly — this flag is the only way to trigger it, and if the
+        /// log still has entries the reset itself is recorded into the chain first.
+        #[arg(long)]
+        reset_anchor: bool,
+    },
     /// Inspect or destroy the encrypted transcript vault.
     Vault {
         #[command(subcommand)]
@@ -125,7 +134,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Auth { service, delete }) => auth(&service, delete, &settings),
         Some(Commands::Models) => list_models(&settings, cli.classified).await,
-        Some(Commands::Audit) => verify_audit(&paths),
+        Some(Commands::Audit { reset_anchor }) => verify_audit(&paths, reset_anchor),
         Some(Commands::Vault { action }) => vault_command(&paths, action),
         Some(Commands::Chat {
             model,
@@ -273,10 +282,34 @@ async fn list_models(settings: &Settings, classified: bool) -> Result<()> {
     Ok(())
 }
 
-fn verify_audit(paths: &Paths) -> Result<()> {
-    let logger = AuditLogger::open(paths.audit_log.clone())?;
-    let count = logger.verify()?;
-    println!("Audit chain verified: {count} entries intact.");
+fn verify_audit(paths: &Paths, reset_anchor: bool) -> Result<()> {
+    let mut logger = AuditLogger::open(paths.audit_log.clone())?;
+
+    if reset_anchor {
+        logger.reset_anchor("reset via `simon audit --reset-anchor`")?;
+        println!(
+            "Anchor reset: tamper-evidence for this log's previous history has been \
+             discarded and re-baselined to what's on disk now."
+        );
+    }
+
+    let report = logger.verify()?;
+    match report.anchor {
+        AnchorStatus::Current => {
+            println!("Audit chain verified: {} entries intact.", report.entries);
+        }
+        // Not a hard failure — see `AnchorStatus::Missing`'s doc comment for why. The
+        // chain itself (printed above) is still fully verified; what's unconfirmed is
+        // only whether the tail could have been silently truncated.
+        AnchorStatus::Missing => {
+            println!(
+                "Audit chain verified: {} entries intact, but no anchor was found to \
+                 confirm the tail hasn't been truncated (an old log from before this \
+                 check existed, or the anchor file was removed).",
+                report.entries
+            );
+        }
+    }
     Ok(())
 }
 

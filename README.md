@@ -32,6 +32,7 @@ simon chat --project ~/code/myapp  # confine models to this folder instead of cw
 simon vault status           # vault path, failed attempts, idle window
 simon vault destroy          # permanently delete the vault (typed "yes" to confirm)
 simon audit                  # verify the audit log's hash chain
+simon audit --reset-anchor   # re-baseline tamper-evidence after deleting the log
 ```
 
 `-m` accepts a full label (`ollama:llama3`), a bare model name (`llama3`), or a provider
@@ -376,6 +377,17 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   `Blake2s256` MAC over the previous entry. The key lives in the OS keyring, so writing
   the log file is not enough to forge it. Recovers the chain head across restarts.
   `simon audit` verifies the whole file.
+- **The chain is anchored outside itself, so a cut tail is visible.** A forward walk
+  alone cannot see truncation: delete the last N lines and what remains is a shorter,
+  perfectly valid chain. Every append therefore also rewrites `<log>.anchor`, a small
+  record of the entry count and the tail's MAC, authenticated with the same keyring
+  key — so an attacker who can write files but cannot read the keyring can cut the log
+  but cannot make the anchor agree. A second anchor in the keyring, synced only when a
+  logger opens or closes, additionally survives deletion of both files. The keyring is
+  deliberately off the per-entry path: a round trip costs ~30 ms here, and the
+  orchestrator writes many entries per turn. Deleting a log on purpose is legitimate,
+  so `simon audit --reset-anchor` re-baselines the evidence, says plainly that it is
+  discarding it, and records the reset in the new chain.
 - **`--classified`** — refuses any provider whose traffic leaves the machine, and
   requires process-wide memory locking to succeed rather than warning.
 - **Process-wide memory locking on Linux** — `mlockall` at startup (`main.rs`), pinning
@@ -488,6 +500,16 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   secure enclave.
 - The audit log uses a MAC, not a signature. Anyone who can read the keyring key can
   forge entries, so it proves integrity against local tampering, not non-repudiation.
+  That is the threat model the anchor above is built for too: it stops someone who can
+  edit files, not someone who already holds the key.
+- The ledger is re-sent in full on every call, so a long session used to grow the
+  system prompt without bound — a maximally-loaded ledger measured 241,945 characters.
+  It is now capped at 16,000. The roster and the protocol sections are always rendered
+  in full and their cost is reserved first; only accumulated content (task results,
+  loaded skills, loaded files, listings, the previous turn) is dropped, newest kept,
+  and every drop is announced in the prompt so the model is not misled into thinking it
+  is seeing everything. `/forget` clears that content on demand, keeping the roster and
+  the task list, and is recorded in the audit log with the before and after sizes.
 - A local CLI tool is treated as remote for `--classified` purposes, because we cannot
   see whether it calls a cloud API internally.
 
@@ -520,9 +542,10 @@ the first one skimmed or never reached: `picker.rs`, `ui/`, `app.rs`, `config.rs
 
 Both describe a July tree. The code has moved since and later fixes live in the git
 history, not in these documents, so read their findings as claims to re-check rather
-than as current status. Most are still open — the audit log still accepts a truncated
-tail, the ledger still has no whole-prompt budget, `Settings::save` is still not
-atomic.
+than as current status. §3.2 and §3.3 of the 07-30 audit — the unbounded system prompt
+and the silently truncatable tail — are closed, and the sections above describe what
+replaced them. Others are still open, among them the non-atomic `Settings::save`
+(07-31 §3.4).
 
 The two earlier audits (of the initial Rust commit and of `2cca5da`) described trees
 that no longer exist and were removed as superseded; both are recoverable at commit

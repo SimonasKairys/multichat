@@ -118,6 +118,12 @@ pub enum Command {
     /// `name` resolves to against the current registry (exact label, bare model
     /// name, or provider name — the same rule `Registry::get` uses).
     SetCommander(String),
+    /// `/forget` typed in chat: clear the ledger's accumulated content. This is
+    /// `docs/AUDIT-2026-07-30.md` §3.2's other half — the whole-prompt budget in
+    /// `SwarmLedger::system_prompt` bounds any single turn, but a session that has run
+    /// long enough has no way back to a small prompt short of restarting. See
+    /// `SwarmLedger::clear_content` for exactly what survives and why.
+    ClearLedger,
 }
 
 impl std::fmt::Debug for Command {
@@ -131,6 +137,7 @@ impl std::fmt::Debug for Command {
             // User-typed but not secret (it is a model name/label the user chose),
             // unlike `Settings` above — fine to print verbatim.
             Command::SetCommander(name) => f.debug_tuple("SetCommander").field(name).finish(),
+            Command::ClearLedger => write!(f, "ClearLedger"),
         }
     }
 }
@@ -236,6 +243,14 @@ pub enum Event {
     CommanderChanged {
         label: String,
         connection_id: Option<String>,
+    },
+    /// `/forget` (`Command::ClearLedger`) ran. `chars_before`/`chars_after` are the
+    /// rendered system prompt's size immediately before and after the clear, so the
+    /// user gets concrete evidence the command did something rather than a bare
+    /// "cleared" they have to take on faith.
+    LedgerCleared {
+        chars_before: usize,
+        chars_after: usize,
     },
 }
 
@@ -1381,6 +1396,12 @@ impl Orchestrator {
                     // always follows regardless of whether the reply was an error.
                     self.emit(Event::TurnComplete).await;
                 }
+                Command::ClearLedger => {
+                    self.clear_ledger().await;
+                    // Same reasoning as `SetCommander` above: this never fails, but
+                    // `submit()` still assumed a model turn when the user typed it.
+                    self.emit(Event::TurnComplete).await;
+                }
             }
         }
 
@@ -1443,6 +1464,24 @@ impl Orchestrator {
                 .await;
             }
         }
+    }
+
+    /// Handles `/forget` typed in chat. Measures the rendered prompt before and after
+    /// so `Event::LedgerCleared` can show the user real numbers, not just a claim that
+    /// something happened; see that variant's doc comment.
+    async fn clear_ledger(&mut self) {
+        let chars_before = self.ledger.system_prompt().chars().count();
+        self.ledger.clear_content();
+        let chars_after = self.ledger.system_prompt().chars().count();
+        let _ = self.audit.log(
+            "ledger.cleared",
+            &format!("chars_before={chars_before} chars_after={chars_after}"),
+        );
+        self.emit(Event::LedgerCleared {
+            chars_before,
+            chars_after,
+        })
+        .await;
     }
 
     async fn handle_prompt(&mut self, prompt: &str) {
@@ -3084,6 +3123,58 @@ mod tests {
 
         assert_eq!(orch.registry.primary(), "ollama:llama3");
         assert!(matches!(event_rx.try_recv(), Ok(Event::Error(_))));
+    }
+
+    #[tokio::test]
+    async fn clear_ledger_drops_content_reports_sizes_and_audits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        // Load the ledger with content that `clear_content` is documented to drop.
+        let task_id = orch.ledger.add_task("summarise the diff");
+        orch.ledger
+            .record_result(task_id, "the diff adds a timeout");
+        orch.ledger.record_skill("notes.md", "be terse");
+        orch.ledger.record_commander_reply("Plan: ship it.");
+
+        orch.clear_ledger().await;
+
+        match event_rx.try_recv() {
+            Ok(Event::LedgerCleared {
+                chars_before,
+                chars_after,
+            }) => {
+                assert!(chars_before > chars_after);
+            }
+            other => panic!("expected LedgerCleared, got {other:?}"),
+        }
+
+        // The content is gone...
+        assert!(orch.ledger.loaded_skills().is_empty());
+        assert!(orch.ledger.last_commander_reply().is_none());
+        assert!(orch.ledger.tasks()[0].result.is_none());
+        // ...but the task itself, the escape hatch's whole point, survives.
+        assert_eq!(orch.ledger.tasks().len(), 1);
+        assert_eq!(orch.ledger.tasks()[0].description, "summarise the diff");
+
+        let audit_text = std::fs::read_to_string(&paths.audit_log).unwrap();
+        assert!(audit_text.contains("ledger.cleared"));
     }
 
     #[tokio::test]

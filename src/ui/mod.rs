@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
 
-use crate::app::{App, CommanderCommand, parse_commander_command};
+use crate::app::{App, CommanderCommand, parse_commander_command, parse_forget_command};
 use crate::config::{Credentials, Settings};
 use crate::orchestrator::{Command, Event, WriteDecision, discover_candidates};
 use crate::picker::PickerState;
@@ -390,13 +390,19 @@ async fn handle_key(
         KeyCode::Enter => {
             if let Some(prompt) = app.submit() {
                 // `submit()` already recorded the typed text as the user's line and
-                // set `busy = true`, assuming a model turn — both correct even for a
-                // `/commander` command; only how the text is dispatched differs
-                // below, and the bare-listing branch has to undo the `busy` guess.
+                // set `busy = true`, assuming a model turn — correct even for
+                // `/commander` and `/forget`; only how the text is dispatched differs
+                // below, and the locally-handled branch has to undo the `busy` guess.
                 match parse_commander_command(&prompt) {
                     Some(CommanderCommand::List) => app.list_commander(),
                     Some(CommanderCommand::SwitchTo(name)) => {
                         if commands.send(Command::SetCommander(name)).await.is_err() {
+                            app.apply(Event::Error("orchestrator is not running".into()));
+                            app.busy = false;
+                        }
+                    }
+                    None if parse_forget_command(&prompt) => {
+                        if commands.send(Command::ClearLedger).await.is_err() {
                             app.apply(Event::Error("orchestrator is not running".into()));
                             app.busy = false;
                         }

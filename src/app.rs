@@ -38,9 +38,10 @@ impl Line {
 }
 
 /// What a `/commander` line typed in the chat input means, resolved before it ever
-/// reaches the orchestrator. This is the only slash command the TUI understands
-/// today — anything else starting with `/` is ordinary prompt text, so this stays a
-/// single recognizer rather than a general command framework.
+/// reaches the orchestrator. Along with `/forget` (see `parse_forget_command`), this is
+/// one of the two slash commands the TUI understands today — anything else starting
+/// with `/` is ordinary prompt text, so these stay small dedicated recognizers rather
+/// than a general command framework.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommanderCommand {
     /// Bare `/commander`: list the roster instead of sending anything to a model.
@@ -67,6 +68,17 @@ pub fn parse_commander_command(text: &str) -> Option<CommanderCommand> {
     } else {
         CommanderCommand::SwitchTo(rest.to_string())
     })
+}
+
+/// Recognises `/forget` — the escape hatch for `docs/AUDIT-2026-07-30.md` §3.2's other
+/// half, clearing the ledger's accumulated content (see
+/// `SwarmLedger::clear_content`). Unlike `/commander`, it takes no argument — there is
+/// nothing to name, the ledger is a singleton for the session — so this is a plain
+/// exact match rather than a two-variant enum like `CommanderCommand`. Same
+/// never-a-prefix rule as `parse_commander_command`: `/forgetful` or `/forget now`
+/// fall through to the model unchanged rather than partially matching.
+pub fn parse_forget_command(text: &str) -> bool {
+    text.trim() == "/forget"
 }
 
 /// What the session is currently waiting on — distinguishes *why* it's busy from the
@@ -395,6 +407,21 @@ impl App {
                     text: format!("commander: {label}"),
                 });
             }
+            Event::LedgerCleared {
+                chars_before,
+                chars_after,
+            } => {
+                // The concrete before/after sizes are the evidence: "cleared" alone
+                // is a claim the user has no way to check.
+                self.transcript.push(Line {
+                    speaker: Speaker::System,
+                    text: format!(
+                        "ledger cleared: {chars_before} -> {chars_after} chars of system prompt \
+                         (task results, loaded skills, loaded files, listings, and the previous \
+                         turn dropped; the roster and task list remain)"
+                    ),
+                });
+            }
         }
     }
 
@@ -495,7 +522,7 @@ impl App {
             // this is the pre-existing busy line, unchanged.
             None if self.busy => format!("{} · working… (Esc to quit)", self.primary),
             None => format!(
-                "{} · Enter send · /commander · Ctrl+O connections · Esc quit",
+                "{} · Enter send · /commander · /forget · Ctrl+O connections · Esc quit",
                 self.primary
             ),
         }
@@ -530,11 +557,14 @@ mod tests {
     #[test]
     fn the_idle_status_line_is_unchanged() {
         // Pinned byte-for-byte: existing tests and muscle memory depend on this exact
-        // string when nothing is in flight.
+        // string when nothing is in flight. `/forget` is listed here because a way to
+        // clear the ledger that nobody can find only half-closes
+        // `docs/AUDIT-2026-07-30.md` §3.2 — a practical run of the TUI showed the
+        // command working while the hint bar still advertised only `/commander`.
         let app = app();
         assert_eq!(
             app.status_line(),
-            "ollama:llama3 · Enter send · /commander · Ctrl+O connections · Esc quit"
+            "ollama:llama3 · Enter send · /commander · /forget · Ctrl+O connections · Esc quit"
         );
     }
 
@@ -986,6 +1016,21 @@ mod tests {
     fn commander_command_matching_is_exact_not_a_prefix() {
         assert_eq!(parse_commander_command("/commanders foo"), None);
         assert_eq!(parse_commander_command("/commander-old"), None);
+    }
+
+    #[test]
+    fn a_bare_forget_command_is_recognised() {
+        assert!(parse_forget_command("/forget"));
+        // Leading/trailing whitespace around the whole line must not matter, same as
+        // `/commander`.
+        assert!(parse_forget_command("  /forget  "));
+    }
+
+    #[test]
+    fn forget_command_matching_is_exact_not_a_prefix_and_takes_no_argument() {
+        assert!(!parse_forget_command("/forgetful"));
+        assert!(!parse_forget_command("/forget now"));
+        assert!(!parse_forget_command("just a message"));
     }
 
     #[test]

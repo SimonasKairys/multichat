@@ -522,11 +522,15 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   edit files, not someone who already holds the key.
 - The ledger is re-sent in full on every call, so a long session used to grow the
   system prompt without bound — a maximally-loaded ledger measured 241,945 characters.
-  It is now capped at 16,000. The roster and the protocol sections are always rendered
-  in full and their cost is reserved first; only accumulated content (task results,
-  loaded skills, loaded files, listings, the previous turn) is dropped, newest kept,
-  and every drop is announced in the prompt so the model is not misled into thinking it
-  is seeing everything. `/forget` clears that content on demand, keeping the roster and
+  It is now capped at 16,000. The protocol sections are rendered in full and their cost
+  reserved first, since a model that loses the protocol stops following it. The roster
+  and budget lists are load-bearing too — a model cannot delegate to one it cannot see —
+  but they are capped rather than unlimited: rendering them before computing the budget,
+  with no ceiling of their own, was how a 600-model roster produced 63,819 characters
+  and made the cap meaningless. Accumulated content (task results, loaded skills, loaded
+  files, listings, the previous turn) is what gets dropped, newest kept, and every drop
+  is announced in the prompt so the model is not misled into thinking it sees
+  everything. `/forget` clears that content on demand, keeping the roster and
   the task list, and is recorded in the audit log with the before and after sizes.
 - A local CLI tool is treated as remote for `--classified` purposes, because we cannot
   see whether it calls a cloud API internally.

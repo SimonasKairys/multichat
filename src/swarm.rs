@@ -230,6 +230,17 @@ const MAX_SYSTEM_PROMPT_CHARS: usize = 16_000;
 /// each with at most one short header and one short note) with room to spare.
 const BUDGET_NOTE_RESERVE_CHARS: usize = 1000;
 
+/// Ceilings on the two sections that are rendered before the content budget is worked
+/// out. Without them `MAX_SYSTEM_PROMPT_CHARS` was not a ceiling at all: the roster and
+/// the budget list went into the buffer unbounded, `saturating_sub` quietly floored the
+/// remaining allowance at zero, and the content sections were starved while the prompt
+/// itself sailed past the limit — an audit measured ~600 roster entries producing 63,819
+/// characters, four times the documented cap, on every call for a whole session. They
+/// cannot simply be dropped instead: a model cannot delegate to a model it cannot see,
+/// which is why they are capped and announced rather than budgeted like content.
+const ROSTER_MAX_CHARS: usize = 2000;
+const RESOURCE_BUDGETS_MAX_CHARS: usize = 1000;
+
 /// Checks whether `text` fits in the remaining content budget, consuming it if so.
 /// Leaves `*budget` untouched when it doesn't fit — the caller can still try smaller
 /// items after a big one fails, which is exactly what the per-section renderers below
@@ -283,6 +294,31 @@ pub struct SwarmLedger {
     /// Outcomes of `ACTION: list_files(...)` requests, oldest first. Capped at
     /// `MAX_RECORDED_LISTS`; see `record_file_list`.
     file_listings: Vec<ListedFiles>,
+}
+
+/// Trims a rendered section to `cap` characters on a whole-line boundary, appending a
+/// note naming what was dropped. Whole lines because half a roster entry is a model
+/// label that does not exist; announced because a silently shortened list reads to the
+/// model as the complete one.
+fn cap_section(section: String, cap: usize, what: &str) -> String {
+    if section.chars().count() <= cap {
+        return section;
+    }
+    let mut kept = String::new();
+    let mut dropped = 0usize;
+    for line in section.lines() {
+        let candidate = line.chars().count() + 1;
+        if kept.chars().count() + candidate <= cap {
+            kept.push_str(line);
+            kept.push('\n');
+        } else {
+            dropped += 1;
+        }
+    }
+    kept.push_str(&format!(
+        "(... {dropped} more {what} omitted: this section is capped)\n"
+    ));
+    kept
 }
 
 impl SwarmLedger {
@@ -568,8 +604,16 @@ impl SwarmLedger {
     /// budget on its own, least valuable per character when it does.
     pub fn system_prompt(&self) -> String {
         let mut out = String::from("## SWARM LEDGER (shared blackboard)\n\n");
-        out.push_str(&self.render_roster());
-        out.push_str(&self.render_resource_budgets());
+        out.push_str(&cap_section(
+            self.render_roster(),
+            ROSTER_MAX_CHARS,
+            "model(s)",
+        ));
+        out.push_str(&cap_section(
+            self.render_resource_budgets(),
+            RESOURCE_BUDGETS_MAX_CHARS,
+            "budget line(s)",
+        ));
         let protocols = Self::render_protocols();
 
         let reserved = out.chars().count() + protocols.chars().count();
@@ -1008,26 +1052,70 @@ impl SwarmLedger {
     /// Splits on the *first* comma (so the target cannot contain one) and matches to the
     /// *last* closing parenthesis on the line, so prompts may contain commas and nested
     /// parentheses.
+    /// Extracts the argument text of `ACTION: name(...)` when `line` **is** that action.
+    ///
+    /// Two rules, both learned from a defect rather than chosen up front.
+    ///
+    /// `strip_prefix`, not `find`. A model that was just told to use this protocol
+    /// explains it constantly — "you would write ACTION: delegate_task(model, task) in
+    /// your reply" — and matching mid-line executed that sentence: a real sub-agent
+    /// call, one of the three delegation slots for the turn, and a task written into
+    /// the shared ledger that every model afterwards reads as fact. A comment beside
+    /// `parse_file_writes` used to justify the permissive siblings on the grounds that
+    /// a stray match there "costs one ignored request"; it does not, and this is what
+    /// it actually cost. `parse_file_writes` has required a whole-line match for a
+    /// while, and both preambles instruct models to emit a line of exactly this form,
+    /// so the parsers now match the contract that was always documented.
+    ///
+    /// Balanced parentheses, not the first `)` or the last. The first ends the
+    /// argument early whenever a prompt contains a parenthesis; the last swallows
+    /// anything trailing on the line, including a second action, so
+    /// `delegate_task(a, x) and ACTION: delegate_task(b, y)` became one delegation
+    /// whose prompt absorbed the second and the second model never ran. Counting depth
+    /// stops at the parenthesis that actually closes the call and ignores the rest of
+    /// the line, which also settles the one-action-per-line question the same way
+    /// `strip_prefix` already settles it.
+    fn action_argument<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+        let trimmed = line
+            .trim()
+            .trim_start_matches('`')
+            .trim_end_matches('`')
+            .trim();
+        let rest = trimmed.strip_prefix(marker)?;
+        let mut depth = 1usize;
+        for (i, c) in rest.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&rest[..i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     pub fn parse_delegations(reply: &str) -> Vec<Delegation> {
         const MARKER: &str = "ACTION: delegate_task(";
         let mut found = Vec::new();
 
         for line in reply.lines() {
-            let line = line.trim().trim_start_matches('`').trim_end_matches('`');
-            let Some(start) = line.find(MARKER) else {
+            let Some(inner) = Self::action_argument(line, MARKER) else {
                 continue;
             };
-            let rest = &line[start + MARKER.len()..];
-            let Some(close) = rest.rfind(')') else {
-                continue;
-            };
-            let inner = &rest[..close];
             let Some((target, prompt)) = inner.split_once(',') else {
                 continue;
             };
 
-            let target = target.trim().trim_matches(['"', '\'']).to_string();
-            let prompt = prompt.trim().trim_matches(['"', '\'']).to_string();
+            // Backticks are stripped from each argument, not just from the ends of the
+            // line: a model writing ACTION: delegate_task(`ollama:llama3`, …) produced a
+            // target with the backticks still attached, which matched no model in the
+            // roster and failed the dispatch for a purely cosmetic reason.
+            let target = target.trim().trim_matches(['"', '\'', '`']).to_string();
+            let prompt = prompt.trim().trim_matches(['"', '\'', '`']).to_string();
             if target.is_empty() || prompt.is_empty() {
                 continue;
             }
@@ -1047,15 +1135,10 @@ impl SwarmLedger {
         let mut found = Vec::new();
 
         for line in reply.lines() {
-            let line = line.trim().trim_start_matches('`').trim_end_matches('`');
-            let Some(start) = line.find(MARKER) else {
+            let Some(inner) = Self::action_argument(line, MARKER) else {
                 continue;
             };
-            let rest = &line[start + MARKER.len()..];
-            let Some(close) = rest.find(')') else {
-                continue;
-            };
-            let name = rest[..close].trim().trim_matches(['"', '\'']).to_string();
+            let name = inner.trim().trim_matches(['"', '\'', '`']).to_string();
             if name.is_empty() {
                 continue;
             }
@@ -1084,15 +1167,10 @@ impl SwarmLedger {
         let mut found = Vec::new();
 
         for line in reply.lines() {
-            let line = line.trim().trim_start_matches('`').trim_end_matches('`');
-            let Some(start) = line.find(MARKER) else {
+            let Some(inner) = Self::action_argument(line, MARKER) else {
                 continue;
             };
-            let rest = &line[start + MARKER.len()..];
-            let Some(close) = rest.find(')') else {
-                continue;
-            };
-            let path = rest[..close].trim().trim_matches(['"', '\'']).to_string();
+            let path = inner.trim().trim_matches(['"', '\'', '`']).to_string();
             if path.is_empty() {
                 continue;
             }
@@ -1117,16 +1195,10 @@ impl SwarmLedger {
         let mut found = Vec::new();
 
         for line in reply.lines() {
-            let line = line.trim().trim_start_matches('`').trim_end_matches('`');
-            let Some(start) = line.find(MARKER) else {
+            let Some(inner) = Self::action_argument(line, MARKER) else {
                 continue;
             };
-            let rest = &line[start + MARKER.len()..];
-            let Some(close) = rest.find(')') else {
-                continue;
-            };
-            let path = rest[..close].trim().trim_matches(['"', '\'']).to_string();
-            found.push(path);
+            found.push(inner.trim().trim_matches(['"', '\'', '`']).to_string());
         }
 
         found
@@ -1203,8 +1275,9 @@ impl SwarmLedger {
             // `ACTION: write_file(<path>)` block") is extremely common in replies from
             // a model that was just instructed to use it, and matching mid-line would
             // open a block there — swallowing the rest of the reply into a file named
-            // `<path>`. The sibling per-line parsers stay permissive because a stray
-            // match there costs one ignored request, not the remainder of the reply.
+            // `<path>`. The sibling parsers now hold the same line: this comment used
+            // to excuse their permissiveness as costing "one ignored request", which
+            // was wrong — see `action_argument` for what a mid-line match really did.
             let Some(rest) = trimmed.strip_prefix(OPEN_MARKER) else {
                 stripped_lines.push(line);
                 continue;
@@ -1228,6 +1301,122 @@ impl SwarmLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prose_that_merely_mentions_an_action_does_not_execute_it() {
+        // The worst of this set. A model told to use the protocol explains it, and the
+        // explanation used to run: a real sub-agent call, one of the three delegation
+        // slots for the turn, and a task written into the ledger every model then reads
+        // as fact. The same held for the other three actions.
+        let prose = "To delegate work, you would write ACTION: delegate_task(ollama:llama3, \
+                     summarize this) in your reply.";
+        assert!(
+            prose.contains("ACTION: delegate_task("),
+            "fixture must actually contain the marker, or this proves nothing"
+        );
+        assert!(SwarmLedger::parse_delegations(prose).is_empty());
+
+        assert!(
+            SwarmLedger::parse_read_skill("Mention ACTION: read_skill(rust) mid-sentence.")
+                .is_empty()
+        );
+        assert!(
+            SwarmLedger::parse_read_files("Mention ACTION: read_file(src/main.rs) mid-sentence.")
+                .is_empty()
+        );
+        assert!(
+            SwarmLedger::parse_list_files("Mention ACTION: list_files(src) mid-sentence.")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_line_carries_at_most_one_action_and_trailing_text_is_ignored() {
+        // `rfind(')')` took the last parenthesis on the line, so a second action was
+        // absorbed into the first one's prompt and its model never ran. Depth counting
+        // stops at the parenthesis that closes the call.
+        let line = "ACTION: delegate_task(agy, do the first) and ACTION: delegate_task(claude, do the second)";
+        let found = SwarmLedger::parse_delegations(line);
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].target, "agy");
+        assert_eq!(
+            found[0].prompt, "do the first",
+            "the prompt absorbed the rest of the line"
+        );
+    }
+
+    #[test]
+    fn a_prompt_may_contain_parentheses_of_its_own() {
+        let found = SwarmLedger::parse_delegations("ACTION: delegate_task(agy, fix run(x) please)");
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].prompt, "fix run(x) please");
+    }
+
+    #[test]
+    fn backticked_arguments_are_unwrapped_so_dispatch_still_matches() {
+        // A backticked target kept its backticks and matched no model in the roster, so
+        // the delegation failed for a purely cosmetic reason.
+        let found = SwarmLedger::parse_delegations("ACTION: delegate_task(`agy`, `do it`)");
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].target, "agy");
+        assert_eq!(found[0].prompt, "do it");
+
+        assert_eq!(
+            SwarmLedger::parse_read_files("ACTION: read_file(`src/main.rs`)"),
+            vec!["src/main.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_huge_roster_cannot_push_the_prompt_past_its_documented_ceiling() {
+        // The cap was declared closed on a measurement that stuffed only the *content*
+        // sections. The roster and budget lists were rendered before the budget was
+        // computed and had no limit of their own, so this shape sailed straight past it.
+        let mut ledger = SwarmLedger::new();
+        ledger.set_roster(
+            (0..600)
+                .map(|i| format!("provider-{i}:model-{i}"))
+                .collect(),
+        );
+        for i in 0..600 {
+            ledger.update_budget(&format!("provider-{i}"), "120000 tokens remaining");
+        }
+        for i in 0..MAX_RENDERED_TASKS {
+            let id = ledger.add_task(&format!("task {i}"));
+            ledger.record_result(id, &"x".repeat(MAX_RESULT_CHARS * 2));
+        }
+        for i in 0..MAX_LOADED_SKILLS {
+            ledger.record_skill(
+                &format!("skill{i}"),
+                &"y".repeat(MAX_SKILL_CONTENT_CHARS * 2),
+            );
+        }
+
+        let prompt = ledger.system_prompt();
+        let n = prompt.chars().count();
+        // Fixture guard: an unbounded render of this ledger is far over the cap, so a
+        // pass below means the cap worked rather than the fixture being small.
+        assert!(
+            ledger.roster().len() == 600,
+            "fixture roster did not survive, so this proves nothing"
+        );
+        assert!(
+            n <= MAX_SYSTEM_PROMPT_CHARS,
+            "rendered {n} chars, over the {MAX_SYSTEM_PROMPT_CHARS} ceiling"
+        );
+        // The roster is load-bearing: it must still be there, just shortened, and the
+        // shortening must be visible rather than silent.
+        assert!(
+            prompt.contains("provider-0:model-0"),
+            "the roster was dropped entirely"
+        );
+        assert!(prompt.contains("omitted"), "the elision was not announced");
+        // The protocol sections are what make the model follow the protocol at all.
+        assert!(
+            prompt.contains("Delegation protocol"),
+            "protocols were squeezed out"
+        );
+    }
 
     #[test]
     fn renders_an_empty_ledger_without_panicking() {
@@ -1998,53 +2187,5 @@ mod tests {
         assert!(text.contains("Task #1: summarise the diff"));
         assert!(!text.contains("the diff adds a timeout"));
         assert!(!text.contains("be terse and cite sources"));
-    }
-
-    #[test]
-    fn bug_parse_delegations_swallows_subsequent_delegations_on_same_line() {
-        // When multiple delegations appear on the same line, `parse_delegations`'s use of
-        // `rfind(')')` matches the closing parenthesis of the LAST delegation.
-        // As a result, the first delegation's prompt absorbs the second delegation action,
-        // and the second delegation is completely missed!
-        let reply = "I will delegate: `ACTION: delegate_task(worker1, task one)` and `ACTION: delegate_task(worker2, task two)`";
-        let found = SwarmLedger::parse_delegations(reply);
-
-        // PROOF OF BUG: Expected 2 delegations, but only 1 is returned because the second was swallowed into prompt 1
-        assert_eq!(
-            found.len(),
-            1,
-            "Expected only 1 corrupted delegation parsed instead of 2"
-        );
-        assert_eq!(found[0].target, "worker1");
-        assert!(
-            found[0].prompt.contains("ACTION: delegate_task(worker2"),
-            "First prompt swallowed second delegation: {}",
-            found[0].prompt
-        );
-    }
-
-    #[test]
-    fn bug_parse_delegations_absorbs_trailing_parentheses_into_prompt() {
-        // When prose with parentheses follows a delegation on the same line,
-        // `rfind(')')` matches the closing parenthesis of the prose instead of the delegation!
-        let reply = "ACTION: delegate_task(worker, run tests) (ensure clean exit)";
-        let found = SwarmLedger::parse_delegations(reply);
-
-        assert_eq!(found.len(), 1);
-        // PROOF OF BUG: The prompt contains the closing parenthesis of delegate_task AND trailing commentary
-        assert_eq!(found[0].prompt, "run tests) (ensure clean exit");
-    }
-
-    #[test]
-    fn bug_parse_delegations_backticked_arguments_retain_backticks_breaking_dispatch() {
-        // When a model wraps arguments in inline markdown backticks, `target` retains the backticks,
-        // which fails registry lookup in `orchestrator.rs`.
-        let reply = "ACTION: delegate_task(`ollama:llama3`, `do task`)";
-        let found = SwarmLedger::parse_delegations(reply);
-
-        assert_eq!(found.len(), 1);
-        // PROOF OF BUG: target is `ollama:llama3` with literal backticks, not ollama:llama3
-        assert_eq!(found[0].target, "`ollama:llama3`");
-        assert_eq!(found[0].prompt, "`do task`");
     }
 }

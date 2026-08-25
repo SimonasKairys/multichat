@@ -311,6 +311,19 @@ impl Workspace {
                 "project path `{requested}` resolves outside the project folder"
             ));
         }
+        // The check above only asks "did the walk stay inside the project folder",
+        // and a symlink into `.git` trivially passes it: `.git` legitimately lives
+        // *inside* `self.root` too, so `git_link -> .git` resolves to
+        // `self.root/.git`, which `starts_with(&self.root)` accepts without
+        // complaint. The lexical `reject_git_writes` a few lines up cannot see this
+        // either — it only inspects the literal path components of `requested`
+        // (`git_link/sub/file.sh`), none of which spell `.git`, so it has nothing to
+        // object to. Only the *resolved* anchor reveals that the walk actually
+        // landed inside `.git`, and this is the last point before `create_dir_all`
+        // runs — the resolved-path `reject_git_writes` call after `create_dir_all`
+        // below catches the same thing, but only after that call has already
+        // created a real directory inside the repository's `.git` tree.
+        Self::reject_git_writes(requested, &resolved_anchor)?;
 
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -522,5 +535,38 @@ mod tests {
         let (_guard, w) = workspace();
         let path = w.write("mygit/notes.txt", "not the real .git").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "not the real .git");
+    }
+
+    // Unix-only: same reasoning as the other symlink tests above.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_dot_git_is_refused_before_any_directory_is_created() {
+        // The regression this guards: the ancestor walk added ahead of
+        // `create_dir_all` (see `a_write_through_a_symlinked_directory_creates_
+        // nothing_outside_the_root` above) only checked that the walk's resolved
+        // anchor stayed *inside the project root* — and `git_link -> .git` resolves
+        // to `root/.git`, which trivially satisfies that check since `.git`
+        // legitimately lives inside the root too. The lexical `reject_git_writes`
+        // earlier in `write` cannot catch it either, since `requested`
+        // (`git_link/sub/file.sh`) never spells `.git` out. That let
+        // `create_dir_all` run against the symlinked (uncanonicalized) parent path
+        // and create a real directory inside the repository's actual `.git` tree,
+        // before the resolved-path `.git` check later in `write` ever got a chance
+        // to refuse.
+        let (_guard, w) = workspace();
+        let real_git = w.root().join(".git");
+        fs::create_dir_all(&real_git).unwrap();
+        std::os::unix::fs::symlink(&real_git, w.root().join("git_link")).unwrap();
+
+        let err = w
+            .write("git_link/sub/file.sh", "malicious")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".git"), "unexpected error: {err}");
+
+        // The whole point: nothing was created inside the real `.git` tree, and the
+        // file itself was never written.
+        assert!(!real_git.join("sub").exists());
+        assert!(!real_git.join("sub").join("file.sh").exists());
     }
 }

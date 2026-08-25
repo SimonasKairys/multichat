@@ -338,9 +338,33 @@ impl EncryptedVault {
 
     /// Overwrites the file with zeros before unlinking, so the ciphertext is not left
     /// recoverable in freed blocks on simple filesystems.
+    ///
+    /// This function's entire purpose is destroying the one file at `self.path` — not
+    /// whatever that path might be redirected to. `fs::metadata` and `fs::write` both
+    /// follow symlinks, so if `vault.enc` were ever a symlink (planted by an attacker,
+    /// or left behind by some other mistake), the old `fs::metadata` + `fs::write`
+    /// pair zeroed the *link's target* — an unrelated file that merely happens to
+    /// share a directory entry with the vault — while reporting the vault destroyed.
+    /// `fs::symlink_metadata` inspects the link itself rather than following it, so a
+    /// symlink here is detected and the zero-fill is skipped entirely: there is
+    /// nothing belonging to the vault to shred.
+    ///
+    /// The unconditional `fs::remove_file` below is safe either way without any
+    /// special-casing: `remove_file` unlinks the directory entry named `self.path`
+    /// (via `unlink(2)` on Unix) without ever dereferencing a symlink to do so, so it
+    /// only ever removes the link — never the target — regardless of which branch ran
+    /// above. That alone already satisfies "the vault path no longer resolves to
+    /// anything", which is what both callers (the `MAX_ATTEMPTS` wipe and `simon
+    /// vault destroy`) actually want.
     pub fn destroy(&self) {
-        if let Ok(meta) = fs::metadata(&self.path) {
-            let _ = fs::write(&self.path, vec![0u8; meta.len() as usize]);
+        match fs::symlink_metadata(&self.path) {
+            Ok(meta) if !meta.file_type().is_symlink() => {
+                let _ = fs::write(&self.path, vec![0u8; meta.len() as usize]);
+            }
+            _ => {
+                // Either a symlink (refuse to zero through it — see above) or the
+                // path is already gone; either way there is nothing safe to zero.
+            }
         }
         let _ = fs::remove_file(&self.path);
     }
@@ -432,6 +456,27 @@ fn random_salt() -> Vec<u8> {
 /// holds the destination open without `FILE_SHARE_DELETE`, but `simon` never has two
 /// processes writing the same config or vault concurrently.)
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    // `preserve_permissions` below carries `path`'s current mode forward onto the
+    // replacement file. If `path` is a symlink, the naive way to read "its current
+    // mode" (`fs::metadata`, which follows links) actually reads the *target's*
+    // mode — so a `vault.enc`/`config.json` that had been replaced by a symlink to
+    // some loosely-permissioned file would silently launder that file's mode onto
+    // the freshly written replacement (644 instead of the documented owner-only
+    // 600), while the rename itself replaces the symlink with a real file rather
+    // than writing through it. Neither half of that is a sane outcome for a helper
+    // whose only two callers write access-controlled secrets, so refuse outright
+    // rather than pick between "honor the link" and "replace it" on the caller's
+    // behalf. Checked with `symlink_metadata`, which — unlike `metadata` — inspects
+    // the link itself instead of following it.
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(anyhow!(
+            "refusing to write {} through a symlink",
+            path.display()
+        ));
+    }
+
     let tmp = tmp_path_for(path);
     // A failed write leaves only the temp file behind, never a touched `path`, so
     // nothing to clean up on this branch.
@@ -487,7 +532,17 @@ fn tmp_path_for(target: &Path) -> PathBuf {
 #[cfg(unix)]
 fn preserve_permissions(target: &Path, tmp: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = fs::metadata(target)
+    // `symlink_metadata`, not `metadata`: `write_atomically`'s caller-facing guard
+    // above already refuses the whole operation when `target` itself is a symlink,
+    // but this stays consistent with that decision on its own rather than silently
+    // reading through a link if that guard is ever changed. A symlink's own mode
+    // bits are not a meaningful "current permissions of the vault/config file" in
+    // any case — on Linux they are cosmetic and normally read back as 0o777 — so a
+    // symlink is treated the same as "nothing there yet" and falls through to the
+    // owner-only default below, exactly like a brand-new file would.
+    let mode = fs::symlink_metadata(target)
+        .ok()
+        .filter(|m| !m.file_type().is_symlink())
         .map(|m| m.permissions().mode())
         .unwrap_or(0o600);
     fs::set_permissions(tmp, fs::Permissions::from_mode(mode))
@@ -986,6 +1041,87 @@ mod tests {
             vault.load(&pw).unwrap(),
             b"secret",
             "the vault must still open"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn destroy_refuses_to_zero_a_symlinks_target() {
+        // `destroy()` used `fs::metadata` + `fs::write`, both of which follow
+        // symlinks. If `vault.enc` were ever a symlink, the self-destruct (on
+        // `MAX_ATTEMPTS`, or `simon vault destroy`) zeroed the LINK'S TARGET — some
+        // unrelated file that merely shares a directory entry with the vault — and
+        // then unlinked only the link itself, leaving the caller believing the
+        // vault (and only the vault) was destroyed.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"payload", &pw).unwrap();
+
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, b"do not touch").unwrap();
+        fs::remove_file(vault.path()).unwrap();
+        std::os::unix::fs::symlink(&victim, vault.path()).unwrap();
+
+        vault.destroy();
+
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"do not touch",
+            "destroy() zeroed the symlink's target instead of refusing to"
+        );
+        assert!(
+            !vault.path().exists(),
+            "the symlink itself should still be gone — unlinking it never touches \
+             its target, so this is safe even though the target survives"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_atomically_refuses_a_symlinked_target_rather_than_borrow_its_permissions() {
+        // `preserve_permissions` used `fs::metadata(target)`, which follows a
+        // symlink and reads the mode of whatever it points at. A `vault.enc` or
+        // `config.json` replaced by a symlink to a loosely-permissioned file would
+        // silently launder that file's mode onto the freshly written replacement —
+        // 644 instead of the documented owner-only 600 — even though the rename
+        // itself never touches the symlink's target's contents. Refusing the whole
+        // write, rather than merely fixing the mode calculation, is the answer to
+        // "should this be allowed at all": there is no legitimate reason `vault.enc`
+        // or `config.json` would ever be a symlink.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Deliberately looser than the 0o600 default, so a borrowed mode would be
+        // observably different from the correct one.
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, b"unrelated data").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let link = dir.path().join("vault.enc");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = write_atomically(&link, b"new contents")
+            .expect_err("must refuse to write through a symlinked target");
+        assert!(
+            err.to_string().contains("symlink"),
+            "unexpected error: {err}"
+        );
+
+        // Nothing should have replaced the symlink, and the file it points at —
+        // content or permissions — must be untouched.
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must survive a refused write"
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"unrelated data");
+        let victim_mode = fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            victim_mode, 0o644,
+            "the symlink target's own permissions must be untouched"
         );
     }
 }

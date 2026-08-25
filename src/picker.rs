@@ -329,17 +329,53 @@ impl PickerState {
 
     /// Cycles which transport the highlighted candidate would use, without changing
     /// whether it is enabled. A no-op on a single-transport candidate (Ollama).
+    ///
+    /// This used to cycle blindly through every transport index, which meant Tab
+    /// could land — and, once `enabled`, silently submit — on a transport `toggle`
+    /// and `set_commander` would both have refused: a cloud API with no stored key,
+    /// or (worse) any remote transport under `--classified`, the one flag this
+    /// program promises never lets traffic off the machine. Skipping unavailable
+    /// transports here, the same signal every other selection path already checks,
+    /// is the fix: it keeps one source of truth (`Availability`) instead of adding
+    /// a second "is this okay for Tab" check that could drift from the first.
+    ///
+    /// When every other transport is unavailable there is nothing to cycle to, so
+    /// this flashes why instead of silently doing nothing — consistent with how
+    /// `toggle`/`set_commander` explain a refusal rather than swallowing the
+    /// keypress.
     pub fn cycle_transport(&mut self) {
         let Some(row) = self.current_row() else {
             return;
         };
-        let n = self.candidates[row.candidate].transports.len();
+        let candidate = row.candidate;
+        let n = self.candidates[candidate].transports.len();
         if n < 2 {
             return;
         }
-        self.flash = None;
-        let sel = &mut self.selections[row.candidate];
-        sel.chosen = (sel.chosen + 1) % n;
+
+        let start = self.selections[candidate].chosen;
+        let mut probe = start;
+        for _ in 0..n - 1 {
+            probe = (probe + 1) % n;
+            if self.candidates[candidate].transports[probe]
+                .availability
+                .is_available()
+            {
+                self.flash = None;
+                self.selections[candidate].chosen = probe;
+                return;
+            }
+        }
+
+        // Nothing else to switch to. Flash the reason attached to the very next
+        // transport in the cycle — the one a single Tab press would most plausibly
+        // have expected to land on — rather than a generic message.
+        let next = (start + 1) % n;
+        if let Availability::Unavailable(reason) =
+            &self.candidates[candidate].transports[next].availability
+        {
+            self.flash = Some(reason.clone());
+        }
     }
 
     /// Marks the highlighted candidate as commander. Refuses (with a flash) on a
@@ -382,6 +418,31 @@ impl PickerState {
             self.flash = Some("press `c` to choose a commander before connecting".into());
             return None;
         };
+
+        // Belt and braces. `toggle`, `set_commander` and `cycle_transport` all gate
+        // on `Availability` before letting a row become enabled/chosen/commander,
+        // so in the ordinary run of the UI nothing unavailable ever reaches here.
+        // But availability can also shift out from under an *already* enabled
+        // selection with no picker interaction at all — a saved connection whose
+        // API key was deleted from the keyring between runs is restored straight
+        // into `Selection { enabled: true, .. }` by `initial_selection`, never
+        // touching any of the gated paths. Re-checking here is the one place that
+        // catches that case, and it is also the last line of defence for
+        // `--classified`: if any selection path upstream ever regresses (as
+        // `cycle_transport` once did), this still refuses to hand back a
+        // connection the availability rules forbid.
+        for (i, candidate) in self.candidates.iter().enumerate() {
+            let sel = &self.selections[i];
+            if !sel.enabled {
+                continue;
+            }
+            if let Availability::Unavailable(reason) =
+                &candidate.transports[sel.chosen].availability
+            {
+                self.flash = Some(format!("{}: {reason}", candidate.id));
+                return None;
+            }
+        }
 
         let mut connections = BTreeMap::new();
         for (i, candidate) in self.candidates.iter().enumerate() {
@@ -465,6 +526,42 @@ mod tests {
         }
     }
 
+    /// Like `candidate_dual`, but with both transport rows available — for
+    /// exercising ordinary cycling where the landing row is actually selectable,
+    /// as opposed to the refusal path `candidate_dual`'s API row is built for.
+    fn candidate_dual_both_available(id: &str) -> Candidate {
+        Candidate {
+            id: id.into(),
+            group: id.to_uppercase(),
+            model: id.into(),
+            transports: vec![
+                crate::orchestrator::TransportOption {
+                    transport: Some(Transport::Cli),
+                    label: "via CLI".into(),
+                    detail: "/usr/bin/x".into(),
+                    availability: Availability::Available,
+                    cli: Some(CliSpec {
+                        binary_name: id.into(),
+                        path: "/usr/bin/x".into(),
+                        args: vec![],
+                        system_arg: None,
+                        dialect: None,
+                        workspace_arg: None,
+                    }),
+                    needs_key: false,
+                },
+                crate::orchestrator::TransportOption {
+                    transport: Some(Transport::Api),
+                    label: "via API".into(),
+                    detail: "(key stored)".into(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                },
+            ],
+        }
+    }
+
     /// A single-row candidate unavailable for a reason the picker cannot fix by
     /// prompting (e.g. a classified-mode refusal) — `needs_key` is false, unlike
     /// `candidate_dual`'s API row.
@@ -497,7 +594,10 @@ mod tests {
 
     #[test]
     fn tab_cycles_transport_without_changing_enabled() {
-        let candidates = vec![candidate_dual("anthropic", true)];
+        // Both rows available here: `candidate_dual`'s API row would make this a
+        // refusal case, which is covered separately by
+        // `cycle_transport_cannot_land_on_a_cloud_transport_with_no_stored_key`.
+        let candidates = vec![candidate_dual_both_available("anthropic")];
         let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
         picker.toggle(); // ticks the CLI row (row 0, transport index 0)
         assert!(picker.is_checked(0, 0));
@@ -869,50 +969,95 @@ mod tests {
         assert!(!picker.is_commander(0, 1));
     }
 
+    /// A vendor with a local CLI (always available) and a remote API refused under
+    /// `--classified` — the exact shape `discover_vendors` builds when `--classified`
+    /// is set (see `src/orchestrator.rs`'s `build_vendor_candidate`). `needs_key`
+    /// stays false: unlike a missing key, a classified refusal is not something
+    /// the picker can fix by prompting.
+    fn candidate_local_and_classified_remote(id: &str) -> Candidate {
+        Candidate {
+            id: id.into(),
+            group: id.to_uppercase(),
+            model: id.into(),
+            transports: vec![
+                crate::orchestrator::TransportOption {
+                    transport: Some(Transport::Cli),
+                    label: "via CLI".into(),
+                    detail: "/usr/bin/x".into(),
+                    availability: Availability::Available,
+                    cli: Some(CliSpec {
+                        binary_name: id.into(),
+                        path: "/usr/bin/x".into(),
+                        args: vec![],
+                        system_arg: None,
+                        dialect: None,
+                        workspace_arg: None,
+                    }),
+                    needs_key: false,
+                },
+                crate::orchestrator::TransportOption {
+                    transport: Some(Transport::Api),
+                    label: "via API".into(),
+                    detail: String::new(),
+                    availability: Availability::Unavailable(
+                        "cloud APIs are refused under --classified".into(),
+                    ),
+                    cli: None,
+                    needs_key: false,
+                },
+            ],
+        }
+    }
+
     #[test]
-    fn bug_cycle_transport_selects_unavailable_transport_and_submits_it() {
-        // 1. Setup candidate with CLI available and API unavailable
+    fn cycle_transport_cannot_land_on_a_cloud_transport_with_no_stored_key() {
+        // Inverted from the external audit's `bug_cycle_transport_selects_
+        // unavailable_transport_and_submits_it`, which asserted the *broken*
+        // behaviour — Tab landing on, and submit() persisting, an API row with no
+        // stored key — and passed before this fix. Same setup, opposite assertions.
         let candidate = candidate_dual("anthropic", true);
         let mut picker = PickerState::new(vec![candidate], &BTreeMap::new(), None, false);
 
-        // 2. Select CLI (index 0) and set as commander
-        picker.toggle();
+        picker.toggle(); // ticks the CLI row (available)
         picker.set_commander();
         assert!(picker.is_commander(0, 0));
         assert!(picker.is_checked(0, 0));
-
-        // 3. User presses Tab (cycle_transport)
-        picker.cycle_transport();
-
-        // BUG: The transport was cycled to index 1 (API), which is UNAVAILABLE ("no key stored").
-        // PickerState marks it as checked and marks it as commander despite being unavailable!
-        assert!(
-            picker.is_checked(0, 1),
-            "Unavailable transport 1 is now marked checked"
-        );
-        assert!(
-            picker.is_commander(0, 1),
-            "Unavailable transport 1 is now marked as commander"
-        );
+        // Fixture guard: the only other transport really is unavailable, so a
+        // no-op here would be meaningless.
         assert!(
             !picker.candidates()[0].transports[1]
                 .availability
                 .is_available()
         );
 
-        // BUG: submit() allows submitting this unavailable transport as enabled and commander!
-        let (connections, commander) = picker
-            .submit()
-            .expect("submit succeeded with unavailable transport");
+        picker.cycle_transport(); // the only other transport (API) needs a key
+
+        // Tab must not move onto the unavailable row...
+        assert!(!picker.is_checked(0, 1));
+        assert!(!picker.is_commander(0, 1));
+        // ...and must leave the still-valid CLI selection exactly as it was,
+        // rather than e.g. clearing commander status as a side effect of refusing.
+        assert!(picker.is_checked(0, 0));
+        assert!(picker.is_commander(0, 0));
+        assert_eq!(picker.flash.as_deref(), Some("no key stored"));
+
+        let (connections, commander) = picker.submit().expect("the CLI selection is still valid");
         assert_eq!(commander.as_deref(), Some("anthropic"));
         let conn = &connections["anthropic"];
         assert!(conn.enabled);
-        assert_eq!(conn.transport, Some(Transport::Api));
+        assert_eq!(conn.transport, Some(Transport::Cli));
     }
 
     #[test]
-    fn bug_submit_permits_submitting_unavailable_saved_connection_and_commander() {
-        // Setup candidate that is unavailable (e.g. cloud API refused under --classified)
+    fn submit_refuses_a_saved_connection_that_has_become_unavailable() {
+        // Inverted from the external audit's `bug_submit_permits_submitting_
+        // unavailable_saved_connection_and_commander`, which asserted submit()
+        // handed back an unavailable commander and passed before this fix.
+        //
+        // This is also the "previously saved connection that has since become
+        // unavailable" case: nothing in the picker's own interaction paths ever ran
+        // — `initial_selection` restored `enabled: true` straight from config — so
+        // only submit()'s own belt-and-braces check can catch it.
         let candidate = candidate_refused("anthropic", "cloud APIs are refused under --classified");
         let mut connections = BTreeMap::new();
         connections.insert(
@@ -925,21 +1070,85 @@ mod tests {
             },
         );
 
-        // Load saved connection state
         let mut picker = PickerState::new(vec![candidate], &connections, Some("anthropic"), false);
         assert!(picker.is_checked(0, 0));
         assert!(picker.is_commander(0, 0));
+        // Fixture guard: the restored row really is unavailable.
         assert!(
             !picker.candidates()[0].transports[0]
                 .availability
                 .is_available()
         );
 
-        // BUG: submit() does not validate availability, returning an unavailable connection and commander
-        let (conns, commander) = picker
-            .submit()
-            .expect("submit succeeded despite unavailable commander");
-        assert!(conns["anthropic"].enabled);
-        assert_eq!(commander.as_deref(), Some("anthropic"));
+        let result = picker.submit();
+        assert!(
+            result.is_none(),
+            "submit must refuse an unavailable commander"
+        );
+        assert_eq!(
+            picker.flash.as_deref(),
+            Some("anthropic: cloud APIs are refused under --classified")
+        );
+        // Refusing does not silently rewrite state out from under the user: the
+        // row is left exactly as ticked/commandered as it was, so they can see it
+        // and fix it (e.g. by un-ticking it) rather than wondering what happened.
+        assert!(picker.is_checked(0, 0));
+        assert!(picker.is_commander(0, 0));
+    }
+
+    #[test]
+    fn classified_blocks_tab_and_submit_on_a_remote_transport() {
+        // Belt and braces for the strongest promise this program makes: under
+        // `--classified`, no remote transport may ever be selected, however it got
+        // there.
+        let candidate = candidate_local_and_classified_remote("anthropic");
+        let mut picker = PickerState::new(vec![candidate], &BTreeMap::new(), None, false);
+        picker.toggle(); // ticks the local CLI row
+        picker.set_commander();
+        assert!(picker.is_checked(0, 0));
+        // Fixture guard.
+        assert!(
+            !picker.candidates()[0].transports[1]
+                .availability
+                .is_available()
+        );
+
+        // Belt: Tab must skip straight past the classified-forbidden remote row.
+        picker.cycle_transport();
+        assert!(!picker.is_checked(0, 1));
+        assert!(picker.is_checked(0, 0));
+        assert_eq!(
+            picker.flash.as_deref(),
+            Some("cloud APIs are refused under --classified")
+        );
+
+        // Braces: even if a remote transport ends up selected some other way —
+        // config hand-edited, or restored from a run made before --classified was
+        // set — submit() must still refuse it rather than trust the stored state.
+        let smuggled_candidate = candidate_local_and_classified_remote("anthropic");
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "anthropic".into(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Api),
+                path: None,
+                model: None,
+            },
+        );
+        let mut smuggled = PickerState::new(
+            vec![smuggled_candidate],
+            &connections,
+            Some("anthropic"),
+            false,
+        );
+        assert!(smuggled.is_checked(0, 1));
+        assert!(smuggled.is_commander(0, 1));
+
+        assert!(smuggled.submit().is_none());
+        assert_eq!(
+            smuggled.flash.as_deref(),
+            Some("anthropic: cloud APIs are refused under --classified")
+        );
     }
 }

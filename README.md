@@ -57,6 +57,9 @@ once a commander has been chosen; until then it just flashes a reminder to press
 **c**. `simon chat -m <label>` skips the picker and picks the commander
 non-interactively instead.
 
+`chat` is the default subcommand, and its flags work without naming it: `simon --vault`
+and `simon chat --vault` are the same thing.
+
 In the TUI: type and press **Enter** to send, **PageUp/PageDown** to scroll, **Esc** or
 **Ctrl-C** to quit. The prompt line edits like a normal one — **left/right** move the
 caret, **Home/End** jump to either edge, **Backspace/Delete** cut on either side of it,
@@ -406,6 +409,13 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   could have triggered exactly that, making a forged history look like ordinary
   corruption. A keyring entry that is present but unusable is now a hard error naming
   the service and what to do about it. An absent entry is still a normal first run.
+- **Symlinks are never followed where a file's identity is the point.** The vault's
+  self-destruct used `fs::write`, which follows a link: pointing `vault.enc` at another
+  file made the wipe zero *that* file and unlink only the link. The atomic writer took
+  its permission bits through a link the same way, so `vault.enc` and `config.json`
+  could land at 644 instead of owner-only. And a symlink named after anything, pointing
+  at `.git`, let `create_dir_all` build directories inside the real repository before
+  the write was refused. All three now use `symlink_metadata` and refuse.
 - **`--classified`** — refuses any provider whose traffic leaves the machine, and
   requires process-wide memory locking to succeed rather than warning.
 - **Process-wide memory locking on Linux** — `mlockall` at startup (`main.rs`), pinning

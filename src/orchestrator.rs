@@ -412,7 +412,13 @@ fn is_retryable_delegation_error(error: &str) -> bool {
         "timed out after",
         "does not exist",
         "has an empty path",
-        "classified",
+        // Not bare "classified": every real refusal is worded "refused under
+        // --classified" (see `discover_ollama`/`build_vendor_candidate`), and bare
+        // "classified" also matches "unclassified", "declassified" and
+        // "reclassified" appearing in any unrelated transient error, abandoning a
+        // retryable failure after one attempt — the exact bug `"timed out after"`
+        // was narrowed for above.
+        "--classified",
     ];
     let lowered = error.to_ascii_lowercase();
     !PERMANENT.iter().any(|marker| lowered.contains(marker))
@@ -1259,9 +1265,32 @@ impl Registry {
                     providers.keys().cloned().collect::<Vec<_>>().join(", ")
                 )
             })?,
-            None => Self::resolve_commander(settings, &candidates, &providers)
-                .or_else(|| providers.keys().next().cloned())
-                .expect("registry is non-empty"),
+            // A saved commander (`settings.commander`) is a prior, explicit user
+            // choice — unlike the "connect everything, pick anything" default a
+            // fresh install starts from, silently replacing it is never acceptable
+            // (Fix 4). So the two cases are handled differently: no saved choice at
+            // all falls back to whatever is available, same as always; a saved
+            // choice that fails to resolve fails loudly instead of falling back,
+            // the same way an explicit `want` above does.
+            None => match &settings.commander {
+                Some(saved) => Self::resolve_commander(settings, &candidates, &providers)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            // The advice has to be reachable from where the user is
+                            // standing: this fires before the TUI exists, so `/commander`
+                            // — a command typed inside it — would be useless here.
+                            "saved commander `{saved}` is not reachable right now. \
+                             Available: {}. Choose one in the connection picker, or \
+                             start with `-m <name>`.",
+                            providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                        )
+                    })?,
+                None => providers
+                    .keys()
+                    .next()
+                    .cloned()
+                    .expect("registry is non-empty"),
+            },
         };
 
         if classified
@@ -1292,6 +1321,17 @@ impl Registry {
     /// Recomputing the label with `candidate_label` — using the same transport the
     /// connection was actually built with — is what makes the saved commander round-
     /// trip for every transport, not just Ollama and pure-API vendors.
+    ///
+    /// Every transport the candidate offers is tried, starting with whichever one
+    /// `settings.connections` recorded, before giving up (Fix 4). `/commander`
+    /// persists only `settings.commander` — nothing updates it when the RECORDED
+    /// transport alone goes stale later (an API key pulled from the keyring, a CLI
+    /// uninstalled) while a different transport for the very same vendor still
+    /// works. Trying only the recorded transport turned that ordinary drift into a
+    /// silent switch to an unrelated model: this function would return `None`, and
+    /// the caller used to fall back to `providers.keys().next()` — alphabetically
+    /// first — with no warning. The caller no longer does that for a saved
+    /// commander; see its doc comment.
     fn resolve_commander(
         settings: &Settings,
         candidates: &[Candidate],
@@ -1299,17 +1339,18 @@ impl Registry {
     ) -> Option<String> {
         let id = settings.commander.as_deref()?;
         let candidate = candidates.iter().find(|c| c.id == id)?;
-        let transport = settings
-            .connections
-            .get(id)
-            .and_then(|c| c.transport)
-            .or_else(|| candidate.transports.first().and_then(|t| t.transport));
-        let option = candidate
-            .transports
-            .iter()
-            .find(|t| t.transport == transport)?;
-        let label = candidate_label(candidate, option, settings);
-        Self::match_label(providers, &label)
+        let saved_transport = settings.connections.get(id).and_then(|c| c.transport);
+
+        // Stable sort, so ties (including "no saved transport at all") keep the
+        // candidate's own declared order — only the recorded transport, if any, is
+        // pulled to the front.
+        let mut transports: Vec<&TransportOption> = candidate.transports.iter().collect();
+        transports.sort_by_key(|t| t.transport != saved_transport);
+
+        transports
+            .into_iter()
+            .map(|option| candidate_label(candidate, option, settings))
+            .find_map(|label| Self::match_label(providers, &label))
     }
 
     /// Accepts an exact label, a bare model name, or a provider name.
@@ -1604,7 +1645,7 @@ impl Orchestrator {
         let primary_label = self.registry.primary().to_string();
         let _ = self.audit.log(
             "prompt.sent",
-            &format!("model={primary_label} chars={}", prompt.len()),
+            &format!("model={primary_label} chars={}", prompt.chars().count()),
         );
 
         let Some(provider) = self.registry.get(&primary_label) else {
@@ -1653,7 +1694,7 @@ impl Orchestrator {
         }
         let _ = self.audit.log(
             "reply.received",
-            &format!("model={primary_label} chars={}", reply.text.len()),
+            &format!("model={primary_label} chars={}", reply.text.chars().count()),
         );
 
         // The TUI sees the RAW reply, unmodified — the user must see exactly what the
@@ -1751,7 +1792,10 @@ impl Orchestrator {
 
                 let _ = self.audit.log(
                     "task.retrying",
-                    &format!("task={task_id} attempt={attempts} error={reason}"),
+                    &format!(
+                        "task={task_id} attempt={attempts} {}",
+                        safe_error_detail(&error)
+                    ),
                 );
                 self.emit(Event::DelegationRetry {
                     to: target_label.clone(),
@@ -1892,7 +1936,7 @@ impl Orchestrator {
                     self.ledger.record_skill(&name, &content);
                     let _ = self.audit.log(
                         "skill.read",
-                        &format!("name={name} chars={}", content.len()),
+                        &format!("name={name} chars={}", content.chars().count()),
                     );
                     self.emit(Event::SkillLoaded {
                         name: name.clone(),
@@ -2011,7 +2055,11 @@ impl Orchestrator {
                     let outcome = format!("ok ({} bytes)", write.content.len());
                     let _ = self.audit.log(
                         "file.written",
-                        &format!("path={} chars={}", write.path, write.content.len()),
+                        &format!(
+                            "path={} chars={}",
+                            write.path,
+                            write.content.chars().count()
+                        ),
                     );
                     self.ledger.record_file_write(&write.path, &outcome);
                     self.emit(Event::FileWritten {
@@ -2066,7 +2114,7 @@ impl Orchestrator {
                     // audit log (see `docs/AUDIT-2026-07-30.md` §3.5).
                     let _ = self.audit.log(
                         "project.read",
-                        &format!("path={path} chars={}", content.len()),
+                        &format!("path={path} chars={}", content.chars().count()),
                     );
                     self.emit(Event::FileRead {
                         path: path.clone(),
@@ -2595,6 +2643,134 @@ mod tests {
             .await
             .expect("the agy CLI connection must construct");
         assert_eq!(registry.primary(), "agy:gemini-3-pro");
+    }
+
+    #[test]
+    fn a_saved_commander_falls_through_to_another_available_transport_of_the_same_candidate() {
+        // Regression for Fix 4 (transport-fallback half): `/commander` persists only
+        // `settings.commander`; nothing updates it when the RECORDED transport alone
+        // goes stale later (here: an API key pulled from the keyring) while a
+        // different transport for the very same vendor still works. Before the fix,
+        // `resolve_commander` tried only the recorded transport, returned `None`,
+        // and the caller fell back to `providers.keys().next()` — an unrelated
+        // model, chosen alphabetically, with no warning. It must now find the
+        // vendor's OTHER transport instead.
+        let candidate = Candidate {
+            id: "anthropic".to_string(),
+            group: "ANTHROPIC".to_string(),
+            model: "claude".to_string(),
+            transports: vec![
+                TransportOption {
+                    transport: Some(Transport::Api),
+                    label: "via API".to_string(),
+                    detail: "no key stored".to_string(),
+                    availability: Availability::Unavailable("no key stored".to_string()),
+                    cli: None,
+                    needs_key: true,
+                },
+                TransportOption {
+                    transport: Some(Transport::Cli),
+                    label: "via CLI".to_string(),
+                    detail: "/bin/claude".to_string(),
+                    availability: Availability::Available,
+                    cli: Some(CliSpec {
+                        binary_name: "claude".to_string(),
+                        path: "/bin/claude".to_string(),
+                        args: vec![],
+                        system_arg: None,
+                        dialect: None,
+                        workspace_arg: None,
+                    }),
+                    needs_key: false,
+                },
+            ],
+        };
+
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "anthropic".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Api), // the now-stale saved choice
+                path: None,
+                model: None,
+            },
+        );
+        let settings = Settings {
+            connections,
+            commander: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+
+        // Only the CLI transport actually got built — `candidate_label` collapses
+        // `binary:model` to just `claude` when no model is configured, mirroring
+        // `LocalBinaryProvider::label` (see that function's doc comment).
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "claude".to_string(),
+            Arc::new(StubProvider {
+                provider: "claude".to_string(),
+                model: "claude".to_string(),
+                remote: false,
+            }),
+        );
+
+        let resolved =
+            Registry::resolve_commander(&settings, std::slice::from_ref(&candidate), &providers);
+        assert_eq!(
+            resolved,
+            Some("claude".to_string()),
+            "must fall through to the candidate's other transport, not give up"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_saved_commander_that_resolves_nowhere_fails_loudly_instead_of_substituting() {
+        // Regression for Fix 4 (fail-loudly half): when NO transport of the saved
+        // candidate resolves (here: the candidate itself is no longer discoverable
+        // at all — e.g. removed from config), `Registry::build` must not silently
+        // hand the session to whatever provider sorts first. Another provider
+        // (`agy`) is available here specifically to prove the failure is not just
+        // the "no models reachable" case — resolution fails even though a perfectly
+        // good model is sitting right there.
+        let mut local_binaries = BTreeMap::new();
+        local_binaries.insert(
+            "agy".to_string(),
+            crate::config::LocalBinarySpec {
+                path: "/bin/echo".into(),
+                args: vec![],
+                system_arg: None,
+                stream_format: None,
+            },
+        );
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "agy".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Cli),
+                path: Some("/bin/echo".into()),
+                model: None,
+            },
+        );
+        let settings = Settings {
+            ollama_host: "http://127.0.0.1:1".into(),
+            local_binaries,
+            connections,
+            // No candidate will ever discover under this id.
+            commander: Some("ghost-vendor-that-does-not-exist".to_string()),
+            ..Default::default()
+        };
+
+        let result = Registry::build(&settings, None, false, Path::new(".")).await;
+        let Err(err) = result else {
+            panic!("an unresolvable saved commander must fail loudly, not substitute agy");
+        };
+        assert!(
+            err.to_string().contains("ghost-vendor-that-does-not-exist"),
+            "the error should name the saved commander that could not be honoured: {err}"
+        );
     }
 
     #[tokio::test]
@@ -3897,6 +4073,36 @@ mod tests {
     }
 
     #[test]
+    fn an_unclassified_word_in_a_transient_error_is_still_retried() {
+        // Regression for Fix 2: the PERMANENT list used to check bare "classified",
+        // which also matches "unclassified"/"declassified"/"reclassified" showing
+        // up in an unrelated transient error — abandoning it after one attempt
+        // instead of retrying. None of these are a `--classified` policy refusal.
+        assert!(is_retryable_delegation_error(
+            "agy failed: field 'level' must be classified, unclassified, or secret"
+        ));
+        assert!(is_retryable_delegation_error(
+            "agy failed: document was declassified before this request"
+        ));
+        assert!(is_retryable_delegation_error(
+            "agy failed: request reclassified as low priority, retry shortly"
+        ));
+    }
+
+    #[test]
+    fn a_classified_refusal_is_not_retried() {
+        // The actual policy refusal (`discover_ollama`, `build_vendor_candidate`)
+        // is always worded with the flag, not the bare word — this is the case
+        // narrowing to "--classified" must still catch.
+        assert!(!is_retryable_delegation_error(
+            "remote Ollama hosts are refused under --classified"
+        ));
+        assert!(!is_retryable_delegation_error(
+            "cloud APIs are refused under --classified"
+        ));
+    }
+
+    #[test]
     fn there_is_a_backoff_for_every_retry() {
         // A mismatch here would panic on the last retry via an out-of-bounds index.
         assert_eq!(DELEGATION_RETRY_BACKOFF.len(), MAX_DELEGATION_ATTEMPTS - 1);
@@ -4161,6 +4367,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_audit_log_chars_field_counts_characters_not_bytes() {
+        // Regression for Fix 3: `project.read`'s `chars=` field used to be
+        // `content.len()` — a byte count — so a nine-character Lithuanian fixture
+        // (each letter two bytes in UTF-8) was logged as 18, not 9. Every other
+        // `chars=` field in this file had the same bug; this exercises the read
+        // path but the fix is identical everywhere `.chars().count()` now runs.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let fixture = "ąčęėįšųūž";
+        assert_eq!(fixture.chars().count(), 9);
+        assert_eq!(fixture.len(), 18, "fixture must actually be multi-byte");
+        std::fs::write(project_dir.path().join("notes.txt"), fixture).unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_file_reads("ollama:llama3", "ACTION: read_file(notes.txt)")
+            .await;
+
+        let log = std::fs::read_to_string(&paths.audit_log).unwrap();
+        assert!(
+            log.contains("chars=9"),
+            "audit log should record the character count, not the byte count: {log}"
+        );
+        assert!(
+            !log.contains("chars=18"),
+            "audit log recorded bytes instead of characters: {log}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_successful_read_emits_file_read_and_records_in_the_ledger() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
@@ -4354,7 +4604,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn bug_audit_log_leaks_raw_error_text_on_delegation_retry() {
+    async fn audit_log_never_leaks_raw_error_text_on_delegation_retry() {
+        // Formerly `bug_audit_log_leaks_raw_error_text_on_delegation_retry`: an
+        // external audit found `run_delegations`'s retry log built with
+        // `error.to_string()` instead of `safe_error_detail(&error)`, so a raw
+        // HTTP body or auth detail reached the audit file. Inverted here to assert
+        // the fixed, correct behaviour instead of the bug — see this file's other
+        // `.log(` call sites for the pattern this now matches.
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
         let project_dir = tempfile::tempdir().unwrap();
@@ -4412,12 +4668,16 @@ mod tests {
             .find(|line| line.contains("task.retrying"))
             .expect("expected task.retrying entry in audit log");
 
-        // PROOF OF VULNERABILITY / INVARIANT VIOLATION:
-        // The audit log contains the raw secret error string because line 1754 logs
-        // `error={reason}` using `error.to_string()` instead of using `safe_error_detail(&error)`.
+        // The audit log's invariant is kinds, sizes and paths — never content. The
+        // secret must never appear, and the line must carry `safe_error_detail`'s
+        // fixed marker instead (proof this isn't just an accidental empty field).
         assert!(
-            retry_line.contains(secret),
-            "Audit log leaked secret error text: {retry_line}"
+            !retry_line.contains(secret),
+            "audit log leaked secret error text: {retry_line}"
+        );
+        assert!(
+            retry_line.contains("detail=withheld"),
+            "expected the safe_error_detail marker in the retry line: {retry_line}"
         );
     }
 }

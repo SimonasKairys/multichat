@@ -292,13 +292,33 @@ impl App {
     }
 
     /// Takes the pending input if there is any, recording it in the transcript.
+    ///
+    /// Refuses to start anything while `self.busy` is already true. This is the one
+    /// choke point every Enter-triggered action goes through — a model prompt,
+    /// `/commander`, `/forget` — so it is where `busy`'s ownership has to be settled:
+    /// before this, `submit()` set `busy` unconditionally and `/commander`/`/forget`
+    /// cleared it themselves once done (`finish_local_command`), with nothing stopping
+    /// a local command from doing that while a real model turn was still running in
+    /// the background — the UI would then falsely report the turn finished. Gating
+    /// here instead of adding a "were we already busy" special case to each local
+    /// command means there is only one place that decides whether a new turn may
+    /// begin. The typed text is left in `self.input` rather than discarded, so it can
+    /// still be submitted once the in-flight turn actually completes.
     pub fn submit(&mut self) -> Option<String> {
+        if self.busy {
+            return None;
+        }
         let text = self.input.trim().to_string();
         if text.is_empty() {
             return None;
         }
         self.input.clear();
         self.cursor = 0;
+        // A user who scrolled up to reread earlier output must land back on the
+        // latest turn once they send a new message, or the reply they just triggered
+        // renders off-screen above their scroll position with nothing telling them
+        // it arrived.
+        self.scroll = 0;
         self.transcript.push(Line {
             speaker: Speaker::You,
             text: text.clone(),
@@ -435,6 +455,17 @@ impl App {
             }),
             Event::TurnComplete => self.busy = false,
             Event::Reconfigured { primary, roster } => {
+                // `Command::Reconfigure` is sent directly from `reopen_picker` in
+                // `ui/mod.rs`, never through `submit()`, so nothing else on this path
+                // ever sets `busy` — but nothing cleared it either if it happened to
+                // already be true (the picker can be reopened with Ctrl+O regardless
+                // of `busy`; see `is_reopen_picker`'s call site). The orchestrator
+                // processes one `Command` at a time, so a `Reconfigured` can only ever
+                // arrive once any earlier `Command::Prompt` has already finished and
+                // sent its own `TurnComplete` — meaning this can never be racing a
+                // real in-flight turn, and unconditionally clearing `busy` here is
+                // safe rather than a guess.
+                self.busy = false;
                 self.primary = primary.clone();
                 self.roster = roster.clone();
                 self.transcript.push(Line {
@@ -1211,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn bug_reconfigured_event_leaves_busy_flag_stuck_true() {
+    fn reconfigured_event_clears_a_stuck_busy_flag() {
         let mut app = app();
         app.busy = true;
 
@@ -1220,15 +1251,16 @@ mod tests {
             roster: vec!["anthropic:claude-opus-5".into()],
         });
 
-        // BUG: Event::Reconfigured does NOT reset app.busy to false.
-        // As a result, app.busy remains true indefinitely, status_line remains "working...",
-        // and input prompt remains disabled.
-        assert!(app.busy, "app.busy remains stuck at true");
-        assert!(app.status_line().contains("working…"));
+        // `busy` must not survive a `Reconfigured` event: nothing else on this path
+        // (see the comment on this arm in `apply`) will ever clear it, so leaving it
+        // set here would freeze the status line on "working…" and the input on its
+        // greyed-out, non-editing state forever.
+        assert!(!app.busy, "app.busy must not be left stuck at true");
+        assert!(!app.status_line().contains("working…"));
     }
 
     #[test]
-    fn bug_submit_does_not_reset_scroll_leaving_user_stranded() {
+    fn submit_resets_scroll_so_the_new_reply_is_visible() {
         let mut app = app();
         app.scroll = 20; // User scrolled up to inspect previous output
 
@@ -1238,8 +1270,33 @@ mod tests {
         let submitted = app.submit();
         assert_eq!(submitted.as_deref(), Some("new query"));
 
-        // BUG: submit() resets cursor and input, but fails to reset scroll.
-        // The user remains stranded at the old scroll offset and cannot view the newly submitted message.
-        assert_eq!(app.scroll, 20);
+        // The user must land back on the bottom of the transcript, or the reply their
+        // new message triggers renders off-screen above the stale scroll position.
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn submit_refuses_to_start_a_new_turn_while_one_is_already_in_flight() {
+        // The mechanism behind `handle_key_does_not_let_a_local_command_clear_busy_
+        // while_a_turn_is_in_flight` in `ui/mod.rs`: `submit()` is the single place
+        // that decides whether a new turn (model prompt or local command) may begin,
+        // so gating it here is what keeps every caller — not just `/commander` and
+        // `/forget` — from starting one while `busy` is already true.
+        let mut app = app();
+        app.busy = true;
+        for c in "/commander".chars() {
+            app.push_char(c);
+        }
+
+        assert_eq!(
+            app.submit(),
+            None,
+            "must refuse to start a new turn while one is in flight"
+        );
+        assert!(app.busy, "the in-flight turn's busy flag must be untouched");
+        assert_eq!(
+            app.input, "/commander",
+            "the typed text must be preserved, not silently dropped"
+        );
     }
 }

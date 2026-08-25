@@ -20,7 +20,7 @@ pub mod vault;
 pub mod workspace;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,11 +33,52 @@ use crate::orchestrator::{Orchestrator, Registry};
 use crate::security::Hardening;
 use crate::vault::{EncryptedVault, VaultError};
 
+/// Flags for the chat TUI. Split into its own type, rather than inlined into
+/// `Commands::Chat` the way every other subcommand's fields are, so the identical set
+/// can also be flattened onto `Cli` itself and accepted at the top level (`simon
+/// --vault`, not just `simon chat --vault`).
+///
+/// `Chat` is documented as the default subcommand — `command: None` behaves exactly
+/// like `simon chat` (see `main`'s `None` arm) — so a flag that only worked once
+/// `chat` was spelled out explicitly was a papercut with no safety purpose behind it.
+/// Flattening one struct in two places, instead of two independent arg lists, is what
+/// keeps the top-level and explicit-subcommand behaviour from drifting apart.
+#[derive(Args, Debug)]
+struct ChatArgs {
+    /// Commander model: a label (`ollama:llama3`), a bare model name, or a provider.
+    #[arg(short, long)]
+    model: Option<String>,
+    /// Persist the TUI transcript across sessions in an encrypted, password-
+    /// protected vault. Off by default, so behaviour is unchanged unless asked
+    /// for. This restores the user's own history — it does not give any model
+    /// conversation memory; every turn is still sent with no message history.
+    #[arg(long)]
+    vault: bool,
+    /// Write files without asking. By default every `write_file` a model proposes
+    /// is shown — path, size, whether it overwrites, and the content — and waits
+    /// for the user to allow it. This turns that gate off, which is what a
+    /// scripted or unattended session wants and what an interactive one almost
+    /// never does.
+    #[arg(long)]
+    auto_write: bool,
+}
+
 #[derive(Parser)]
 #[command(name = "simon", author, version, about, long_about = None)]
+// Lets `ChatArgs` be flattened onto `Cli` (below) at the same time `Commands` also
+// exists, without clap treating the two as ambiguous. Without this, clap's default
+// stance is that a `Command` with subcommands owns any leading positional/value
+// disambiguation itself; setting it explicitly is what makes `simon -m foo` resolve
+// to "no subcommand, `-m` belongs to the flattened chat args" rather than an error.
+#[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// The default subcommand's own flags, also accepted at the top level — see
+    /// `ChatArgs`'s doc comment for why this is flattened rather than inlined.
+    #[command(flatten)]
+    chat: ChatArgs,
 
     /// Air-gapped mode: refuse every provider whose traffic leaves this machine, and
     /// require memory locking to succeed.
@@ -55,22 +96,8 @@ struct Cli {
 enum Commands {
     /// Start the chat TUI (default).
     Chat {
-        /// Commander model: a label (`ollama:llama3`), a bare model name, or a provider.
-        #[arg(short, long)]
-        model: Option<String>,
-        /// Persist the TUI transcript across sessions in an encrypted, password-
-        /// protected vault. Off by default, so behaviour is unchanged unless asked
-        /// for. This restores the user's own history — it does not give any model
-        /// conversation memory; every turn is still sent with no message history.
-        #[arg(long)]
-        vault: bool,
-        /// Write files without asking. By default every `write_file` a model proposes
-        /// is shown — path, size, whether it overwrites, and the content — and waits
-        /// for the user to allow it. This turns that gate off, which is what a
-        /// scripted or unattended session wants and what an interactive one almost
-        /// never does.
-        #[arg(long)]
-        auto_write: bool,
+        #[command(flatten)]
+        args: ChatArgs,
     },
     /// Store an API key in the OS keyring. The key is read from the terminal or stdin,
     /// never from a command-line argument.
@@ -150,33 +177,35 @@ async fn main() -> Result<()> {
             reset_key,
         }) => verify_audit(&paths, reset_anchor, reset_key),
         Some(Commands::Vault { action }) => vault_command(&paths, action),
-        Some(Commands::Chat {
-            model,
-            vault,
-            auto_write,
-        }) => {
+        Some(Commands::Chat { args }) => {
             let project_root = resolve_project_root(cli.project)?;
             chat(
                 &paths,
                 &settings,
-                model.as_deref(),
+                args.model.as_deref(),
                 cli.classified,
-                vault,
+                args.vault,
                 &project_root,
-                auto_write,
+                args.auto_write,
             )
             .await
         }
+        // No subcommand named: `chat` is the default, and its flags were accepted
+        // directly on `cli` via the `ChatArgs` flattened onto `Cli` — see that
+        // struct's doc comment. Using `cli.chat` here (instead of the all-off
+        // defaults the old code hardcoded) is the actual fix: previously these
+        // fields didn't exist at the top level at all, so `simon -m foo` failed to
+        // parse before execution ever reached this arm.
         None => {
             let project_root = resolve_project_root(cli.project)?;
             chat(
                 &paths,
                 &settings,
-                None,
+                cli.chat.model.as_deref(),
                 cli.classified,
-                false,
+                cli.chat.vault,
                 &project_root,
-                false,
+                cli.chat.auto_write,
             )
             .await
         }
@@ -213,21 +242,41 @@ fn apply_hardening(classified: bool) -> Result<Hardening> {
     security::enforce_memory_protection(classified)
 }
 
-fn auth(service: &str, delete: bool, settings: &Settings) -> Result<()> {
-    // A custom endpoint literally named `gemini` or `claude` must keep that name —
-    // only fall back to the builtin alias mapping when no custom endpoint claims
-    // the raw name. Otherwise `builtin_endpoint`'s aliases (`claude` -> `anthropic`,
-    // `gemini` -> `google`) are canonicalised so the keyring entry lands under the
-    // id vendor discovery actually reads back (`discover_vendors` only ever asks
-    // for canonical ids), rather than under an alias no lookup ever queries.
-    let canonical = if settings.custom_endpoints.contains_key(service) {
-        service
+/// Resolves the keyring-entry name for `service` — the same name `discover_vendors`
+/// (`orchestrator.rs`) asks the keyring for when deciding whether a key is already
+/// stored. Split out of `auth` so this can be exercised by a test without touching
+/// the real OS keyring.
+///
+/// `config::canonical_provider` lowercases its input only to *decide* which arm of
+/// its match to take; its fallback arm (`_ => name`) then hands back the original
+/// `name`, case and all. `settings.endpoint` (via `builtin_endpoint`) also lowercases
+/// before comparing, so `simon auth ANTHROPIC` still found the endpoint and reported
+/// success — but `Credentials::set` below stored the key under the literal string
+/// `"ANTHROPIC"`, and `discover_vendors` only ever asks the keyring for the lowercase
+/// canonical ids (`"anthropic"`, `"openai"`, ...). The key landed somewhere no lookup
+/// ever reads from, so the picker kept reporting "(no key stored)" no matter how many
+/// times the key was re-entered. Lowercasing the pass-through result here — rather
+/// than inside `canonical_provider`, which this crate's file-ownership split for this
+/// change does not touch — fixes it without touching the alias arms, which already
+/// returned a correctly-cased id.
+fn resolve_canonical_service(service: &str, settings: &Settings) -> String {
+    if settings.custom_endpoints.contains_key(service) {
+        // A custom endpoint literally named `gemini` or `claude` must keep that
+        // exact name — only fall back to the builtin alias mapping (and the
+        // lowercasing below) when no custom endpoint claims the raw name, or a
+        // deliberately-named custom entry would be misfiled under an alias the
+        // user's own `config.json` never used.
+        service.to_string()
     } else {
-        crate::config::canonical_provider(service)
-    };
+        crate::config::canonical_provider(service).to_ascii_lowercase()
+    }
+}
+
+fn auth(service: &str, delete: bool, settings: &Settings) -> Result<()> {
+    let canonical = resolve_canonical_service(service, settings);
 
     if delete {
-        Credentials::delete(canonical)?;
+        Credentials::delete(&canonical)?;
         println!("Removed the stored key for {canonical}.");
         return Ok(());
     }
@@ -251,7 +300,7 @@ fn auth(service: &str, delete: bool, settings: &Settings) -> Result<()> {
         buf
     };
 
-    Credentials::set(canonical, key.trim())?;
+    Credentials::set(&canonical, key.trim())?;
     println!("Stored the {canonical} key in the OS keyring.");
     Ok(())
 }
@@ -757,7 +806,7 @@ mod tests {
         let cli = Cli::parse_from(["simon", "chat", "--classified", "--vault"]);
         assert!(cli.classified);
         match cli.command {
-            Some(Commands::Chat { vault, .. }) => assert!(vault),
+            Some(Commands::Chat { args }) => assert!(args.vault),
             _ => panic!("expected the Chat subcommand to have been parsed"),
         }
     }
@@ -766,7 +815,7 @@ mod tests {
     fn vault_defaults_to_off_so_existing_behaviour_is_unchanged() {
         let cli = Cli::parse_from(["simon", "chat"]);
         match cli.command {
-            Some(Commands::Chat { vault, .. }) => assert!(!vault),
+            Some(Commands::Chat { args }) => assert!(!args.vault),
             _ => panic!("expected the Chat subcommand to have been parsed"),
         }
     }
@@ -779,19 +828,70 @@ mod tests {
     }
 
     #[test]
-    fn bug_top_level_chat_flags_rejected_without_explicit_chat_subcommand() {
-        // Chat is advertised as the default subcommand (None => chat),
-        // but passing chat flags like -m or --vault at the top level is rejected.
-        let res_model = Cli::try_parse_from(["simon", "-m", "ollama:llama3"]);
+    fn top_level_chat_flags_are_accepted_without_the_chat_subcommand() {
+        // Was `bug_top_level_chat_flags_rejected_without_explicit_chat_subcommand`,
+        // which asserted the opposite (that these were rejected) as a known bug.
+        // `Chat` is documented as the default subcommand — `command: None` runs
+        // exactly like `simon chat` (see `main`'s `None` arm) — so a flag that only
+        // worked once `chat` was spelled out explicitly was a papercut with no
+        // safety property behind it worth preserving. Fixed by flattening
+        // `ChatArgs` onto `Cli` itself; this asserts the flags parse *and* land in
+        // the field `main`'s `None` arm actually reads, not just that parsing
+        // succeeds.
+        let cli = Cli::try_parse_from(["simon", "-m", "ollama:llama3"])
+            .expect("top-level -m must be accepted without an explicit `chat` subcommand");
         assert!(
-            res_model.is_err(),
-            "Top-level -m is rejected without explicit `chat` subcommand"
+            cli.command.is_none(),
+            "no subcommand was named, so none should have been selected"
         );
+        assert_eq!(cli.chat.model.as_deref(), Some("ollama:llama3"));
 
-        let res_vault = Cli::try_parse_from(["simon", "--vault"]);
-        assert!(
-            res_vault.is_err(),
-            "Top-level --vault is rejected without explicit `chat` subcommand"
+        let cli = Cli::try_parse_from(["simon", "--vault"])
+            .expect("top-level --vault must be accepted without an explicit `chat` subcommand");
+        assert!(cli.command.is_none());
+        assert!(cli.chat.vault);
+    }
+
+    #[test]
+    fn auth_normalises_a_builtin_provider_name_so_discovery_can_find_the_stored_key() {
+        // The bug: `canonical_provider`'s fallback arm returned its input
+        // un-lowercased, so `simon auth ANTHROPIC` stored the key under the literal
+        // string "ANTHROPIC" while `discover_vendors` (orchestrator.rs) only ever
+        // asks the keyring for the lowercase canonical id "anthropic" — the key was
+        // stored where lookup never looks, and the picker reported "(no key
+        // stored)" forever regardless of how many times it was re-entered.
+        let settings = Settings::default();
+        assert_eq!(
+            resolve_canonical_service("ANTHROPIC", &settings),
+            "anthropic"
+        );
+        assert_eq!(
+            resolve_canonical_service("OpenRouter", &settings),
+            "openrouter"
+        );
+        // The alias arms already returned a correctly-cased id before this fix;
+        // confirm they still do, whatever case the alias itself is typed in.
+        assert_eq!(resolve_canonical_service("Claude", &settings), "anthropic");
+        assert_eq!(resolve_canonical_service("GEMINI", &settings), "google");
+    }
+
+    #[test]
+    fn auth_preserves_a_custom_endpoints_exact_name_case_and_all() {
+        // The other half of the same function: a custom endpoint the user named
+        // explicitly in config.json must keep that exact spelling, never routed
+        // through the builtin alias/lowercasing path meant for the five builtins.
+        let mut settings = Settings::default();
+        settings.custom_endpoints.insert(
+            "MyGateway".to_string(),
+            crate::config::CloudEndpoint {
+                api: crate::config::Api::OpenAiCompatible,
+                base_url: "https://example.invalid/v1".into(),
+                default_model: "some-model".into(),
+            },
+        );
+        assert_eq!(
+            resolve_canonical_service("MyGateway", &settings),
+            "MyGateway"
         );
     }
 }

@@ -436,8 +436,8 @@ impl LocalBinaryProvider {
         // `.take(MAX_OUTPUT_BYTES as u64)` bounds this the same way `MAX_OUTPUT_BYTES`
         // already bounds stdout below (see `accumulated_bytes`): without it, a child
         // that floods stderr — a misbehaving CLI dumping a stack trace in a loop, or
-        // one deliberately hostile — grows this `String` without limit, since
-        // `read_to_string` reads until EOF. Once the cap is hit, this task stops
+        // one deliberately hostile — grows this buffer without limit, since a read
+        // loop otherwise continues until EOF. Once the cap is hit, this task stops
         // reading, so a child that keeps writing past `MAX_OUTPUT_BYTES` of stderr
         // can still fill its pipe buffer and block on a further write — but that is
         // no longer an unbounded hang: `CLI_IDLE_TIMEOUT`/`CLI_TOTAL_TIMEOUT` above
@@ -446,10 +446,18 @@ impl LocalBinaryProvider {
         // already own liveness.
         let stderr_task: tokio::task::JoinHandle<String> = tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
-            let mut buf = String::new();
+            // Bytes, not `String` via `read_to_string`: a child's stderr is not
+            // guaranteed to be valid UTF-8, and `read_to_string` rejects the *whole*
+            // buffer on a single invalid byte sequence, leaving an empty string. That
+            // discards the one thing the user needed — the diagnostic explaining why
+            // the child failed — precisely when a failure is what's being reported.
+            // `from_utf8_lossy` below mirrors how stdout already handles this same
+            // class of failure elsewhere in this file (see `send_with_timeout`'s
+            // comment on `923b934`).
+            let mut buf = Vec::new();
             let _ = (&mut reader)
                 .take(MAX_OUTPUT_BYTES as u64)
-                .read_to_string(&mut buf)
+                .read_to_end(&mut buf)
                 .await;
             // Keep draining past the cap, discarding the excess. Stopping at the cap
             // would drop `ChildStderr`, closing the pipe under a child that is still
@@ -460,7 +468,7 @@ impl LocalBinaryProvider {
             // because only the first `MAX_OUTPUT_BYTES` are kept; the time this can
             // take is bounded by the same idle and total timeouts as everything else.
             let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
-            buf
+            String::from_utf8_lossy(&buf).into_owned()
         });
 
         let mut lines = BufReader::new(stdout).lines();
@@ -468,6 +476,17 @@ impl LocalBinaryProvider {
         let mut stream_error: Option<String> = None;
         let mut assistant_text = String::new();
         let mut accumulated_bytes = 0usize;
+        // Set once `accumulated_bytes` passes `MAX_OUTPUT_BYTES` and further
+        // `AssistantText` events stop being appended (see the loop below). Needed
+        // because `assistant_text.len()` alone can't tell truncation happened: the
+        // counter that trips the cap is `accumulated_bytes`, which includes every
+        // line's raw JSON (tool-call events, envelope fields, …), not just the text
+        // actually pushed onto `assistant_text` — so the accumulated string can sit
+        // well under `MAX_OUTPUT_BYTES` even though real reply content was dropped.
+        // Without this flag, `send_streaming`'s later `text.len() > MAX_OUTPUT_BYTES`
+        // check would miss exactly that case and hand back a silently shortened
+        // fallback reply with no truncation marker.
+        let mut assistant_text_truncated = false;
 
         // Not reset on each loop iteration — deliberately: `CLI_TOTAL_TIMEOUT` is a
         // single absolute backstop across the whole call, unlike the idle timeout
@@ -516,6 +535,8 @@ impl LocalBinaryProvider {
                                 StreamLineEffect::AssistantText(text) => {
                                     if accumulated_bytes <= MAX_OUTPUT_BYTES {
                                         assistant_text.push_str(&text);
+                                    } else {
+                                        assistant_text_truncated = true;
                                     }
                                 }
                                 StreamLineEffect::Result(text) => result_text = Some(text),
@@ -572,11 +593,11 @@ impl LocalBinaryProvider {
         }
 
         // Prefer the dialect's terminal result event; fall back to whatever
-        // assistant-text events arrived if the stream ended without one (the child
-        // exited cleanly but the CLI's own output never sent a `result`/`result`
-        // event — treat partial progress as better than nothing).
-        let mut text = result_text.unwrap_or(assistant_text);
-        let mut truncated = false;
+        // assistant-text events arrived if the stream ended without one, or if it
+        // arrived but carried no text — see `select_stream_reply` for why an empty
+        // result must not beat real accumulated text.
+        let (mut text, mut truncated) =
+            select_stream_reply(result_text, assistant_text, assistant_text_truncated);
         if text.len() > MAX_OUTPUT_BYTES {
             let mut bytes = text.into_bytes();
             bytes.truncate(MAX_OUTPUT_BYTES);
@@ -602,6 +623,35 @@ impl LocalBinaryProvider {
             text,
             rate_limit: RateLimit::default(),
         })
+    }
+}
+
+/// Chooses `send_streaming`'s final reply text from the dialect's terminal result
+/// event (if any) and the assistant-text accumulated as a fallback, plus whether that
+/// fallback dropped text on the floor (see `assistant_text_truncated` at its call
+/// site). Returns the chosen text and whether it should carry a truncation marker.
+///
+/// Precedence: a non-empty result wins outright; failing that, non-empty accumulated
+/// assistant text; failing that, whatever is left (letting the caller's own "produced
+/// no output" error fire honestly for a genuinely empty run). An empty terminal
+/// result must NOT beat non-empty assistant text — a stream that already delivered a
+/// full answer as `AssistantText` events and then closes with a blank `result`/
+/// `response` field (observed from `agy` on a denied tool call, but not dialect-
+/// specific) used to have that blank value win via `unwrap_or`, silently discarding a
+/// complete answer and reporting "produced no output" instead. Kept as a free
+/// function, pure of the process-spawning code around it, for the same reason
+/// `compose_call` and `summarize_stderr` above are: it's the part worth unit-testing
+/// directly.
+fn select_stream_reply(
+    result_text: Option<String>,
+    assistant_text: String,
+    assistant_text_truncated: bool,
+) -> (String, bool) {
+    match result_text {
+        Some(text) if !text.trim().is_empty() => (text, false),
+        _ if !assistant_text.trim().is_empty() => (assistant_text, assistant_text_truncated),
+        Some(text) => (text, false),
+        None => (assistant_text, assistant_text_truncated),
     }
 }
 
@@ -1507,12 +1557,16 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bug_streaming_assistant_text_fallback_silently_omits_truncation_marker() {
-        // When an NDJSON stream produces accumulated lines exceeding MAX_OUTPUT_BYTES,
-        // assistant_text stops being appended to. However, because assistant_text.len() <= MAX_OUTPUT_BYTES,
-        // send_streaming's check `if text.len() > MAX_OUTPUT_BYTES` evaluates to false,
-        // so `truncated` is false and no truncation marker is appended to the reply.
-        // Downstream callers receive a cut reply without any indication that it was truncated!
+    async fn streaming_assistant_text_fallback_carries_its_truncation_marker() {
+        // Regression guard: an NDJSON stream with no terminal result event produces
+        // accumulated lines exceeding MAX_OUTPUT_BYTES, so `AssistantText` stops being
+        // appended (see `accumulated_bytes` in `send_streaming`). Because that counter
+        // includes each line's full JSON envelope, not just the text pushed onto
+        // `assistant_text`, the resulting string can sit under MAX_OUTPUT_BYTES even
+        // though real content was dropped — `text.len() > MAX_OUTPUT_BYTES` alone
+        // would miss it. `assistant_text_truncated` (fed into `select_stream_reply`)
+        // is what catches this and keeps the marker attached, matching the
+        // non-streaming path's `send_with_timeout`.
         let chunk = "A".repeat(1024);
         let p = LocalBinaryProvider::new(
             "sh",
@@ -1539,23 +1593,30 @@ mod tests {
             .unwrap();
 
         // Total emitted was 1100 * 1024 = 1,126,400 bytes (> 1,048,576 MAX_OUTPUT_BYTES).
-        // The reply was truncated (stopped accumulating), but does NOT contain the truncation marker!
+        // Fixture guard: the fallback must have actually been cut, or the marker
+        // assertion below would pass even with the fix removed and the accumulation
+        // never having reached the cap in the first place.
         assert!(
-            !reply.text.contains("output truncated"),
-            "Proof of bug: text was cut off but has no truncation notice: len={}",
+            reply.text.len() < 1100 * 1024,
+            "fixture didn't actually exceed MAX_OUTPUT_BYTES, so this proves nothing: len={}",
             reply.text.len()
         );
-        // It has less than 1100 * 1024 characters because it stopped accumulating:
-        assert!(reply.text.len() < 1100 * 1024);
+        assert!(
+            reply.text.contains("output truncated"),
+            "a cut fallback reply must say so: len={}",
+            reply.text.len()
+        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn bug_streaming_empty_terminal_result_overwrites_and_discards_valid_assistant_text() {
-        // If an agent streams several assistant text chunks, and then emits a terminal result
-        // event where `result` or `response` is empty `""`, line 578 sets `result_text = Some("")`.
-        // `result_text.unwrap_or(assistant_text)` evaluates to `""`, completely discarding the
-        // accumulated assistant_text, and then errors with "produced no output"!
+    async fn streaming_empty_terminal_result_keeps_accumulated_assistant_text() {
+        // Regression guard: a stream that already delivered a full answer via
+        // `AssistantText` events, then closes with a terminal result carrying an
+        // empty `result`/`response` field, must not have that empty value win. See
+        // `select_stream_reply` for the precedence and why (an empty terminal result
+        // is far more likely to mean "the CLI didn't populate this field" than "throw
+        // away the real answer").
         let p = LocalBinaryProvider::new(
             "sh",
             "/bin/sh",
@@ -1574,16 +1635,118 @@ mod tests {
         )
         .unwrap();
 
+        let reply = p
+            .send_with_progress(None, "ignored", &ProgressSink::disconnected())
+            .await
+            .unwrap();
+
+        // The accumulated assistant text must survive, not be discarded in favour of
+        // the terminal event's empty `result` field.
+        assert_eq!(reply.text, "Here is the full and complete answer.");
+    }
+
+    // --- select_stream_reply --------------------------------------------------
+    //
+    // Pure-function tests for the precedence rules behind Fix 1 (a truncated
+    // fallback reply must carry its marker) and Fix 2 (an empty terminal result must
+    // not discard real accumulated text) — mirrors why `compose_call` and
+    // `summarize_stderr` above are tested the same way, independent of process
+    // spawning.
+
+    #[test]
+    fn select_stream_reply_prefers_a_nonempty_result_over_assistant_text() {
+        let (text, truncated) = select_stream_reply(Some("final".into()), "partial".into(), false);
+        assert_eq!(text, "final");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn select_stream_reply_falls_back_to_assistant_text_when_no_result_arrived() {
+        let (text, truncated) = select_stream_reply(None, "partial".into(), true);
+        assert_eq!(text, "partial");
+        assert!(truncated, "the fallback's own truncation flag must survive");
+    }
+
+    #[test]
+    fn select_stream_reply_prefers_nonempty_assistant_text_over_an_empty_result() {
+        // Fix 2: an empty terminal result must not beat a real accumulated answer.
+        let (text, truncated) =
+            select_stream_reply(Some(String::new()), "the real answer".into(), false);
+        assert_eq!(text, "the real answer");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn select_stream_reply_a_whitespace_only_result_also_counts_as_empty() {
+        let (text, _truncated) =
+            select_stream_reply(Some("   \n".into()), "the real answer".into(), false);
+        assert_eq!(text, "the real answer");
+    }
+
+    #[test]
+    fn select_stream_reply_keeps_the_truncated_flag_when_falling_back_on_an_empty_result() {
+        // Fix 1: falling back to assistant text (here, because the result was empty)
+        // must still carry whatever truncation the fallback accumulation itself hit.
+        let (text, truncated) = select_stream_reply(Some("  ".into()), "cut off".into(), true);
+        assert_eq!(text, "cut off");
+        assert!(truncated);
+    }
+
+    #[test]
+    fn select_stream_reply_returns_the_empty_result_when_everything_is_empty() {
+        // Both sides empty: let the caller's own "produced no output" error fire
+        // honestly for a genuinely empty run, rather than inventing content here.
+        let (text, truncated) = select_stream_reply(Some(String::new()), String::new(), false);
+        assert_eq!(text, "");
+        assert!(!truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_stderr_survives_invalid_utf8_instead_of_vanishing() {
+        // Regression guard for Fix 3: `read_to_string` rejects the WHOLE buffer on a
+        // single invalid byte, so one non-UTF-8 byte anywhere in stderr used to wipe
+        // out the entire diagnostic, leaving the user with a bare
+        // "sh exited with exit status: 3: " and no explanation. `\301` (octal) is
+        // 0xC1, never a valid UTF-8 lead byte, standing in for the stray byte a real
+        // CLI's stack trace or mangled-locale output could contain.
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec![
+                    "-c".into(),
+                    "printf 'boom \\301 explanation of the failure' >&2; exit 3".into(),
+                ],
+                system_arg: None,
+                dialect: Some(StreamDialect::ClaudeJson),
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+
         let err = p
             .send_with_progress(None, "ignored", &ProgressSink::disconnected())
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
 
-        // PROOF OF BUG: The provider errored out with "produced no output" even though valid
-        // assistant_text ("Here is the full and complete answer.") was streamed and should have been returned.
         assert!(
-            err.to_string().contains("produced no output"),
-            "Unexpected error: {err}"
+            err.contains('3'),
+            "the child's own exit status did not survive: {err}"
+        );
+        // Fixture + fix guard: with `read_to_string`, the single invalid byte drops
+        // the ENTIRE buffer, so text on BOTH sides of it would be lost — checking
+        // just one side could pass by accident if only a prefix or suffix survived.
+        assert!(
+            err.contains("boom"),
+            "diagnostic text before the bad byte was lost: {err}"
+        );
+        assert!(
+            err.contains("explanation of the failure"),
+            "diagnostic text after the bad byte was lost: {err}"
         );
     }
 }

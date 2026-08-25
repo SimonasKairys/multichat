@@ -454,8 +454,43 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     } else {
         Style::default()
     };
+
+    // Interior space inside the input block's borders: a border on each side eats 2
+    // columns and 2 rows, so below that there is no content cell to draw text or a
+    // caret on at all. The old version of this function computed `chunks[1].y + 1`
+    // unconditionally, assuming the block was always at least 3 rows tall — on a
+    // short terminal (`Constraint::Length(3)` is a request, not a guarantee) that
+    // landed the caret past the block, sometimes past the frame itself
+    // (`bug_draw_cursor_position_out_of_bounds_on_small_height`, inverted below as
+    // `draw_keeps_the_caret_inside_the_frame_on_a_short_terminal`).
+    let interior_width = chunks[1].width.saturating_sub(2);
+    let interior_height = chunks[1].height.saturating_sub(2);
+
+    // Caret column measured from the very start of the rendered line ("> " + input),
+    // in characters — the same unit `cursor_column()` uses, which is right for this
+    // project's Latin and Lithuanian text but would drift on double-width CJK, since
+    // measuring that needs a grapheme-width table this crate deliberately does not
+    // carry.
+    let caret_in_line = 2 + app.cursor_column() as u16;
+    // How far the line must scroll left so the caret's column stays inside the field
+    // instead of running off the right edge. Zero (no scroll) as long as the caret
+    // still fits; once it doesn't, this pins the caret to the last visible column and
+    // scrolls the text out from under it instead — the previous version scrolled
+    // neither, so a line wider than the field just made the caret's `x` fail the
+    // bounds check and vanish instead of following the text
+    // (`bug_draw_cursor_disappears_when_input_exceeds_terminal_width`, inverted below
+    // as `draw_scrolls_a_long_line_so_the_caret_stays_on_the_right_character`).
+    // `interior_width - 1` cannot underflow: this is only evaluated when
+    // `interior_width > 0`.
+    let offset = if interior_width > 0 {
+        caret_in_line.saturating_sub(interior_width - 1)
+    } else {
+        0
+    };
+
     let input = Paragraph::new(format!("> {}", app.input))
         .style(style)
+        .scroll((0, offset))
         .block(
             Block::default()
                 .title(format!(" {} ", app.status_line()))
@@ -464,18 +499,14 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     frame.render_widget(input, chunks[1]);
 
     // Place the terminal's own caret. Without this the arrow keys move an invisible
-    // position and editing mid-line is guesswork. Skipped while busy, where the input is
-    // greyed out and not accepting text — a caret there would invite typing that goes
-    // nowhere. The offset is the border (1) plus the `"> "` prompt (2); the column is
-    // counted in characters, which is right for this project's Latin and Lithuanian
-    // text but would drift on double-width CJK, since measuring that needs a
-    // grapheme-width table this crate deliberately does not carry.
-    if !app.busy {
-        let x = chunks[1].x + 3 + app.cursor_column() as u16;
+    // position and editing mid-line is guesswork. Skipped while busy, where the input
+    // is greyed out and not accepting text — a caret there would invite typing that
+    // goes nowhere — and skipped when the block has no interior cell at all, where
+    // there is nowhere on-screen placement could even mean.
+    if !app.busy && interior_width > 0 && interior_height > 0 {
+        let x = chunks[1].x + 1 + (caret_in_line - offset);
         let y = chunks[1].y + 1;
-        if x < chunks[1].x + chunks[1].width.saturating_sub(1) {
-            frame.set_cursor_position((x, y));
-        }
+        frame.set_cursor_position((x, y));
     }
 }
 
@@ -574,7 +605,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[tokio::test]
-    async fn bug_handle_key_allows_local_command_to_prematurely_clear_busy_while_turn_in_flight() {
+    async fn handle_key_does_not_let_a_local_command_clear_busy_while_a_turn_is_in_flight() {
         let mut app = App::new(
             "ollama:llama3",
             &["ollama:llama3".to_string()],
@@ -605,59 +636,131 @@ mod tests {
         )
         .await;
 
-        // BUG: handle_key accepts input while busy and executes local command,
-        // which clears app.busy to false while the background orchestrator is still processing!
+        // `submit()` (see `app.rs`) now refuses to start anything while `busy` is
+        // already true, so the local command never runs and never gets a chance to
+        // clear the real turn's busy flag.
         assert!(
-            !app.busy,
-            "app.busy was prematurely cleared to false while turn was in flight"
+            app.busy,
+            "busy must stay true: the background turn is still in flight"
+        );
+        assert_eq!(
+            app.input, "/commander",
+            "the typed command must be preserved, not swallowed"
         );
     }
 
+    /// Inverts `bug_draw_cursor_position_out_of_bounds_on_small_height`: on a
+    /// terminal too short to fit the input block's borders plus a content row, the
+    /// caret must simply not be placed rather than land on a row outside the frame.
+    /// Covers both a 1-row and a 2-row terminal, per the audit's request — the old
+    /// code was wrong for both, just in slightly different ways (see the table this
+    /// was derived from: `Layout::split` gives the input chunk height 0 at h=1 and
+    /// height 1 at h=2, neither of which has room for a content row).
     #[test]
-    fn bug_draw_cursor_position_out_of_bounds_on_small_height() {
-        let app = App::new(
-            "ollama:llama3",
-            &["ollama:llama3".to_string()],
-            "/tmp".to_string(),
-        );
-        let backend = TestBackend::new(80, 2);
-        let mut terminal = Terminal::new(backend).unwrap();
+    fn draw_keeps_the_caret_inside_the_frame_on_a_short_terminal() {
+        for height in [1u16, 2] {
+            let app = App::new(
+                "ollama:llama3",
+                &["ollama:llama3".to_string()],
+                "/tmp".to_string(),
+            );
+            let backend = TestBackend::new(80, height);
+            let mut terminal = Terminal::new(backend).unwrap();
 
-        terminal
-            .draw(|frame| {
-                draw(frame, &app);
-                // Layout splits: chunks[0] height=1, chunks[1] height=1 (y=1).
-                // chunks[1].y + 1 = 2.
-                // On a terminal with height 2, valid rows are 0 and 1. Row 2 is out of bounds!
-                // ratatui's draw calculates x = 3, y = 2.
-            })
-            .unwrap();
+            terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+            // Either the caret was left un-placed (there is no content row to put it
+            // on), or — if it was placed — it must land on an actual row/column of
+            // this frame. The old code always placed it, at a row past the frame's
+            // last valid index, which is exactly what this catches.
+            if terminal.backend().cursor_visible() {
+                let pos = terminal.backend().cursor_position();
+                assert!(
+                    pos.y < height,
+                    "caret row {} is outside a {height}-row frame",
+                    pos.y
+                );
+                assert!(pos.x < 80, "caret column {} is outside the frame", pos.x);
+            }
+        }
     }
 
+    /// Inverts `bug_draw_cursor_disappears_when_input_exceeds_terminal_width`: once
+    /// the line is wider than the field, the field must scroll to keep the caret
+    /// visible, and the caret must land on the exact character it is editing — not
+    /// merely somewhere on screen. Uses 30 distinct characters, not a repeated run,
+    /// so a wrong scroll offset that happens to land on a same-looking character
+    /// can't pass by accident.
     #[test]
-    fn bug_draw_cursor_disappears_when_input_exceeds_terminal_width() {
+    fn draw_scrolls_a_long_line_so_the_caret_stays_on_the_right_character() {
         let mut app = App::new(
             "ollama:llama3",
             &["ollama:llama3".to_string()],
             "/tmp".to_string(),
         );
-        for _ in 0..40 {
-            app.push_char('x');
+        let text = "0123456789ABCDEFGHIJKLMNOPQRST"; // 30 distinct characters
+        for c in text.chars() {
+            app.push_char(c);
         }
-        assert_eq!(app.cursor_column(), 40);
+        // Off the very end, so this also exercises "mid-line", not just "at the end".
+        for _ in 0..5 {
+            app.cursor_left();
+        }
+        assert_eq!(app.cursor_column(), 25);
 
-        // Terminal width 30
-        let backend = TestBackend::new(30, 10);
+        let backend = TestBackend::new(20, 10); // interior width 18 < the 30-char line
         let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
 
-        terminal
-            .draw(|frame| {
-                draw(frame, &app);
-                // chunks[1].width is 30.
-                // x = chunks[1].x + 3 + 40 = 43.
-                // chunks[1].width.saturating_sub(1) = 29.
-                // x < 29 is false, so set_cursor_position is NOT called.
-            })
-            .unwrap();
+        assert!(
+            terminal.backend().cursor_visible(),
+            "the caret must not disappear just because the line is wider than the field"
+        );
+        let pos = terminal.backend().cursor_position();
+        assert!(
+            pos.x < 20 && pos.y < 10,
+            "caret must stay inside the frame: {pos:?}"
+        );
+
+        let expected_char = text.chars().nth(app.cursor_column()).unwrap();
+        let cell = terminal
+            .backend()
+            .buffer()
+            .cell((pos.x, pos.y))
+            .expect("caret position must be inside the buffer");
+        assert_eq!(
+            cell.symbol(),
+            expected_char.to_string(),
+            "the caret must land on the character it is actually editing"
+        );
+    }
+
+    /// This crate has shipped byte-index panics on multi-byte input before
+    /// (923b934). `cursor_column()` counts characters, not bytes, so the caret
+    /// arithmetic in `draw` is safe by construction — this stress-tests that across
+    /// every caret position, a range of terminal sizes including degenerate ones (0,
+    /// 1, and 2 rows/columns, where the offset math takes its early-out paths), and
+    /// therefore every possible scroll offset for this input.
+    #[test]
+    fn draw_never_panics_on_multibyte_input_at_any_caret_position_or_terminal_size() {
+        let text = "ąčęėįšųūž";
+        for width in [0u16, 1, 2, 3, 5, 10, 30] {
+            for height in [0u16, 1, 2, 3, 10] {
+                let mut app = App::new(
+                    "ollama:llama3",
+                    &["ollama:llama3".to_string()],
+                    "/tmp".to_string(),
+                );
+                for c in text.chars() {
+                    app.push_char(c);
+                }
+                for _ in 0..=text.chars().count() {
+                    let backend = TestBackend::new(width, height);
+                    let mut terminal = Terminal::new(backend).unwrap();
+                    terminal.draw(|frame| draw(frame, &app)).unwrap();
+                    app.cursor_left();
+                }
+            }
+        }
     }
 }

@@ -252,10 +252,21 @@ impl Settings {
         }
     }
 
+    /// Writes `config.json` atomically (temp file + rename), not with a bare
+    /// `fs::write`. `fs::write` truncates the file before writing its new content, so a
+    /// crash, power loss, or full disk in that window — and this file is rewritten on
+    /// every picker submit, so the window recurs constantly — leaves `config.json`
+    /// truncated or empty. `Settings::load` then fails to parse it at startup, taking
+    /// the user's whole connection set and provider endpoints down with it until they
+    /// repair or delete the file by hand. `vault.rs` already solved exactly this problem
+    /// for `vault.enc`; `write_atomically` there is reused rather than duplicated here,
+    /// per the audit's own observation that the fix was "lifting an existing function."
     pub fn save(&self, paths: &Paths) -> Result<()> {
         let raw = serde_json::to_string_pretty(self)?;
-        fs::write(&paths.config_file, raw)
-            .with_context(|| format!("failed to write {}", paths.config_file.display()))
+        // `write_atomically`'s own errors already name the temp and target paths, so no
+        // extra `.context(...)` is added here — layering one on would just repeat the
+        // same path in the message twice.
+        crate::vault::write_atomically(&paths.config_file, raw.as_bytes())
     }
 
     /// Resolves a provider name to an endpoint, preferring user overrides.
@@ -352,6 +363,90 @@ mod tests {
         assert_eq!(
             Settings::load(&paths).unwrap().default_provider,
             "anthropic"
+        );
+    }
+
+    #[test]
+    fn saving_over_a_longer_config_leaves_no_trailing_bytes() {
+        // The concrete failure a bare `fs::write` hides: it truncates only up front, so
+        // if a crash ever landed between the truncate and the new bytes landing, a
+        // shorter save could in principle leave old bytes trailing after the new
+        // content. Atomic replace (temp file + rename) never partially exposes the old
+        // file at all, so this must hold for an ordinary, uninterrupted save too — a
+        // long config's file length must not survive a subsequent short save.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+
+        let mut long = Settings {
+            default_provider: "anthropic".into(),
+            ..Default::default()
+        };
+        for i in 0..200 {
+            long.custom_endpoints.insert(
+                format!("provider-{i}"),
+                CloudEndpoint {
+                    api: Api::OpenAiCompatible,
+                    base_url: format!("https://example.invalid/{i}"),
+                    default_model: format!("model-{i}"),
+                },
+            );
+        }
+        long.save(&paths).unwrap();
+        let long_len = fs::metadata(&paths.config_file).unwrap().len();
+
+        let short = Settings {
+            default_provider: "ollama".into(),
+            ..Default::default()
+        };
+        short.save(&paths).unwrap();
+        let short_len = fs::metadata(&paths.config_file).unwrap().len();
+
+        // Fixture guard: if the long config somehow failed to actually grow the file
+        // (e.g. a future change made `custom_endpoints` stop serializing), this
+        // assertion would pass vacuously no matter what the second save did.
+        assert!(
+            long_len > short_len,
+            "fixture did not produce a longer file to truncate: long={long_len} short={short_len}"
+        );
+
+        let raw = fs::read_to_string(&paths.config_file).unwrap();
+        assert_eq!(
+            raw.len() as u64,
+            short_len,
+            "file length must match its own content exactly, with nothing trailing"
+        );
+        let reloaded: Settings = serde_json::from_str(&raw)
+            .expect("a config overwritten with a shorter one must still parse cleanly");
+        assert_eq!(reloaded.default_provider, "ollama");
+        assert!(
+            reloaded.custom_endpoints.is_empty(),
+            "endpoints from the longer, earlier save must not survive"
+        );
+    }
+
+    #[test]
+    fn saving_leaves_no_tmp_file_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+
+        let settings = Settings::default();
+        settings.save(&paths).unwrap();
+
+        // Fixture guard: confirm the save actually landed before concluding anything
+        // from an empty-looking directory listing.
+        assert!(
+            paths.config_file.is_file(),
+            "fixture did not produce a config file to check alongside"
+        );
+
+        let leftovers: Vec<_> = fs::read_dir(&paths.data_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp file(s) left behind after a successful save: {leftovers:?}"
         );
     }
 

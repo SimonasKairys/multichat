@@ -218,11 +218,22 @@ impl Workspace {
     }
 
     /// Refuses any write whose path passes through a `.git` component.
+    ///
+    /// The comparison is ASCII-case-insensitive, not exact. macOS and Windows default
+    /// to case-insensitive filesystems, where `.GIT` and `.Git` name the very same
+    /// directory `.git` does — so an `==` comparison let those spellings past the guard
+    /// while still landing in the real `.git`, on two of the three supported platforms.
+    /// ASCII folding is the right level because the thing matched against is a fixed
+    /// ASCII literal, and `to_string_lossy` cannot manufacture a match: U+FFFD replaces
+    /// only invalid bytes and is not an ASCII letter.
+    ///
+    /// Applied on every platform, Linux included. A case-insensitive mount (CIFS,
+    /// exFAT, NTFS) can sit under a Linux root, and a guard whose behaviour depends on
+    /// the host is one people reason about wrongly.
     fn reject_git_writes(requested: &str, candidate: &Path) -> Result<()> {
-        if candidate
-            .components()
-            .any(|c| matches!(c, Component::Normal(name) if name == ".git"))
-        {
+        if candidate.components().any(|c| {
+            matches!(c, Component::Normal(name) if name.to_string_lossy().eq_ignore_ascii_case(".git"))
+        }) {
             return Err(anyhow!(
                 "project path `{requested}` would write into `.git`, which is refused"
             ));
@@ -248,6 +259,16 @@ impl Workspace {
                 content.len()
             ));
         }
+
+        // Before anything below touches the filesystem. `create_dir_all` a few lines
+        // down will happily create a `.git`-named directory that does not exist yet,
+        // and it runs before the resolved-path check has anything to resolve — so a
+        // caller that reaches `write` without `precheck` (every test here, and the
+        // orchestrator if a call site ever forgets) could make this method create part
+        // of a `.git` tree and only then refuse. A guard that fires after its own side
+        // effect is not a guard. The resolved-path check below stays for the case this
+        // lexical one cannot see: a symlink whose target lands inside `.git`.
+        Self::reject_git_writes(requested, candidate)?;
 
         let joined = self.root.join(candidate);
 
@@ -315,10 +336,13 @@ impl Workspace {
         // string, so a symlink whose target lands inside `.git` is caught too, not
         // just a request that spells `.git` out directly. Reading `.git` is not
         // special-cased — only a write can corrupt it.
-        // `precheck` already ran this against the lexical path, as an early-out so a
-        // doomed write is never put to the user for approval. This re-runs it against
-        // the RESOLVED path, which is the load-bearing one: it is what catches a
-        // symlink whose target lands inside `.git`.
+        // `precheck` (for the caller's benefit) and this method's own lexical check
+        // above (so `write` is safe to call directly, without `precheck` first) have
+        // both already run this against the lexical `requested` path, before any
+        // directory got created. This third run is against the RESOLVED path, and is
+        // the one that catches what neither of the lexical checks can: a symlink
+        // whose target lands inside `.git` even though `requested` never spells
+        // `.git` out itself.
         Self::reject_git_writes(requested, &resolved)?;
 
         // A symlink at the final path — even one whose parent is legitimately inside
@@ -440,5 +464,63 @@ mod tests {
         w.write("notes.txt", "first").unwrap();
         let path = w.write("notes.txt", "second").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+    }
+
+    // The regression this guards against: an exact, case-sensitive `==` comparison in
+    // `reject_git_writes` let `.GIT`, `.Git`, etc. sail past the refusal on the
+    // case-insensitive filesystems macOS and Windows CI actually run on, even though
+    // those spellings name the very same `.git` directory a case-sensitive match would
+    // have caught. Each test below asserts BOTH that the write was refused AND that
+    // nothing landed on disk — a refusal that returns an error but writes the file
+    // anyway would be just as dangerous, and would still make an `unwrap_err()`-only
+    // assertion pass.
+
+    #[test]
+    fn an_uppercase_git_directory_write_is_refused() {
+        let (_guard, w) = workspace();
+        let err = w.write(".GIT/config", "[core]").unwrap_err().to_string();
+        assert!(err.contains(".git"), "unexpected error: {err}");
+        assert!(!w.root().join(".GIT").exists());
+    }
+
+    #[test]
+    fn a_mixed_case_git_directory_write_is_refused() {
+        let (_guard, w) = workspace();
+        let err = w
+            .write(".Git/hooks/pre-commit", "#!/bin/sh\nrm -rf /")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".git"), "unexpected error: {err}");
+        assert!(!w.root().join(".Git").exists());
+    }
+
+    #[test]
+    fn a_nested_mixed_case_git_component_is_refused() {
+        let (_guard, w) = workspace();
+        let err = w
+            .write("src/vendor/.gIt/objects/pack/pack-x.pack", "garbage")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".git"), "unexpected error: {err}");
+        // The refusal must happen before any directory creation, same as the
+        // lexical-`.git` case this mirrors: nothing under `src/vendor` should exist.
+        assert!(!w.root().join("src").join("vendor").exists());
+    }
+
+    #[test]
+    fn a_gitignore_file_is_still_allowed() {
+        let (_guard, w) = workspace();
+        // Guards against the guard: the component match must be against the whole
+        // component, not a prefix or substring check, or a legitimately named
+        // `.gitignore` would be wrongly refused as if it were `.git`.
+        let path = w.write(".gitignore", "target/\n").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "target/\n");
+    }
+
+    #[test]
+    fn a_file_merely_containing_git_in_its_name_is_still_allowed() {
+        let (_guard, w) = workspace();
+        let path = w.write("mygit/notes.txt", "not the real .git").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not the real .git");
     }
 }

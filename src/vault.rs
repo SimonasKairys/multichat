@@ -370,12 +370,92 @@ fn random_salt() -> Vec<u8> {
     salt
 }
 
-/// Writes via a temporary file and rename so a crash mid-write cannot truncate an
-/// existing vault.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+/// Writes via a temporary file and rename so a crash, power loss, or full disk mid-write
+/// cannot truncate an existing file. Shared with `config.rs::Settings::save`, which had
+/// the identical problem for `config.json` — see the comment on `Settings::save` for why
+/// that call goes through here rather than duplicating this logic. Kept in this module
+/// (as `pub(crate)`) rather than moved to a new one: the crate wires its module list in
+/// `main.rs`, which is outside what this change touches, and a single ~15-line helper
+/// does not earn a module of its own when one of its two callers already lives next to
+/// it.
+///
+/// The temp file is created *in `path`'s own directory*, never under a system temp dir
+/// like `/tmp` — `fs::rename` is only atomic when source and destination are on the same
+/// filesystem (a cross-filesystem rename has to copy, which reintroduces the exact
+/// truncation window this function exists to close). Both `config.json` and `vault.enc`
+/// live under the per-user data directory, so the temp file always lands there too.
+///
+/// Windows note: `std::fs::rename` is not POSIX `rename(2)` under the hood, but on
+/// Windows it is implemented via `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, so it
+/// does replace an existing destination atomically the same as it does on Unix — no
+/// platform-specific fallback is needed here. (It can still fail if another process
+/// holds the destination open without `FILE_SHARE_DELETE`, but `simon` never has two
+/// processes writing the same config or vault concurrently.)
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = tmp_path_for(path);
+    // A failed write leaves only the temp file behind, never a touched `path`, so
+    // nothing to clean up on this branch.
     fs::write(&tmp, bytes).map_err(|e| anyhow!("failed to write {}: {e}", tmp.display()))?;
-    fs::rename(&tmp, path).map_err(|e| anyhow!("failed to replace {}: {e}", path.display()))?;
+
+    // `fs::write` on a brand-new file gets whatever the process umask allows (typically
+    // world-readable). A plain `fs::write` straight to `path` would instead have
+    // truncated-in-place, keeping `path`'s *existing* inode and its permission bits.
+    // Renaming a new file over `path` replaces the inode outright, so without this step
+    // switching to atomic writes would silently loosen `config.json`/`vault.enc` back to
+    // the umask default on every single save — undoing any tightening a user (or a
+    // future version of this code) had applied. Carry the current file's mode forward;
+    // if there is no current file, default to owner-only rather than the umask, since
+    // both files hold data — connection endpoints, an encrypted transcript — that has no
+    // reason to be group- or world-readable.
+    if let Err(e) = preserve_permissions(path, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // If the rename fails (e.g. a permissions or disk error on the directory entry
+    // itself), the write above already succeeded, so `path` is untouched and safe — but
+    // the temp file would otherwise sit there forever as debris. Best-effort clean it up;
+    // its own removal failing is not worth reporting over the original error.
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow!("failed to replace {}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// Derives the temp path by *appending* `.tmp` rather than `Path::with_extension`
+/// (`vault.enc` → `vault.tmp`), which was the original approach here. `with_extension`
+/// replaces the extension, not appends to it, so two targets in the same directory that
+/// share a stem but differ only in extension would collide on the same temp path — not
+/// a problem for `vault.enc` alone, but it became one the moment `config.json` started
+/// sharing this helper (and would again for any future file added to the data dir).
+/// Appending keeps every target's temp path unique to it: `vault.enc.tmp`,
+/// `config.json.tmp`. This does rename the vault's own temp file from the historical
+/// `vault.tmp` to `vault.enc.tmp` — noted because nothing else in the tree parses or
+/// depends on that name (checked: it appears nowhere outside this function).
+fn tmp_path_for(target: &Path) -> PathBuf {
+    let mut name = target.as_os_str().to_owned();
+    name.push(".tmp");
+    PathBuf::from(name)
+}
+
+/// See the call site in [`write_atomically`] for why this exists. Unix-only because
+/// `config.rs`'s `restrict_to_owner` (which locks the data directory down to
+/// owner-only) uses this same `#[cfg(unix)]` split — on other platforms file mode bits
+/// either don't exist in this form or aren't how access is controlled, so there is
+/// nothing analogous to preserve.
+#[cfg(unix)]
+fn preserve_permissions(target: &Path, tmp: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(target)
+        .map(|m| m.permissions().mode())
+        .unwrap_or(0o600);
+    fs::set_permissions(tmp, fs::Permissions::from_mode(mode))
+        .map_err(|e| anyhow!("failed to set permissions on {}: {e}", tmp.display()))
+}
+
+#[cfg(not(unix))]
+fn preserve_permissions(_target: &Path, _tmp: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -578,6 +658,72 @@ mod tests {
         // Still fail-safe underneath: no wrap-around, no bogus expiry.
         assert_eq!(status.idle_secs, 0);
         assert!(!status.idle_expired);
+    }
+
+    #[test]
+    fn write_atomically_appends_dot_tmp_rather_than_replacing_the_extension() {
+        // Regression guard for the collision bug `with_extension("tmp")` had: it
+        // replaces rather than appends, so `vault.enc` and `config.json` — sharing this
+        // helper today, and any future same-stem pair — would land on the identical
+        // temp path and could clobber each other's in-flight write. Assert the actual
+        // path shape rather than just that saves succeed, since two colliding writes in
+        // a single-threaded test could still coincidentally "succeed" while masking the
+        // bug.
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            tmp_path_for(&dir.path().join("vault.enc")),
+            dir.path().join("vault.enc.tmp")
+        );
+        assert_eq!(
+            tmp_path_for(&dir.path().join("config.json")),
+            dir.path().join("config.json.tmp")
+        );
+    }
+
+    #[test]
+    fn write_atomically_leaves_no_tmp_file_behind_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("vault.enc");
+        write_atomically(&target, b"payload").unwrap();
+
+        // Fixture guard: confirm the write actually landed before trusting an
+        // empty-looking directory listing below.
+        assert!(target.is_file(), "fixture write did not land");
+        assert!(
+            !dir.path().join("vault.enc.tmp").exists(),
+            "temp file left behind after a successful write"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_preserves_an_existing_files_tightened_permissions() {
+        // The regression this guards: renaming a freshly created temp file over an
+        // existing target replaces the target's *inode*, unlike an in-place
+        // `fs::write`, which truncates the existing inode and keeps its mode bits. A
+        // naive atomic-write helper would therefore silently reset a file the user (or
+        // this crate) had tightened to owner-only back to the process umask on the very
+        // next save. Assert the tightened mode survives a second write.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("vault.enc");
+        write_atomically(&target, b"first").unwrap();
+
+        // Simulate a file that had been tightened to owner-only by some means other
+        // than this helper (e.g. an older build, or a user running `chmod`).
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+        let tightened = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(tightened, 0o600, "fixture failed to tighten permissions");
+
+        write_atomically(&target, b"second, longer payload").unwrap();
+
+        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an atomic save must not loosen an existing file's permissions"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"second, longer payload");
     }
 
     #[test]

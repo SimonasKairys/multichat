@@ -1999,4 +1999,52 @@ mod tests {
         assert!(!text.contains("the diff adds a timeout"));
         assert!(!text.contains("be terse and cite sources"));
     }
+
+    #[test]
+    fn bug_parse_delegations_swallows_subsequent_delegations_on_same_line() {
+        // When multiple delegations appear on the same line, `parse_delegations`'s use of
+        // `rfind(')')` matches the closing parenthesis of the LAST delegation.
+        // As a result, the first delegation's prompt absorbs the second delegation action,
+        // and the second delegation is completely missed!
+        let reply = "I will delegate: `ACTION: delegate_task(worker1, task one)` and `ACTION: delegate_task(worker2, task two)`";
+        let found = SwarmLedger::parse_delegations(reply);
+
+        // PROOF OF BUG: Expected 2 delegations, but only 1 is returned because the second was swallowed into prompt 1
+        assert_eq!(
+            found.len(),
+            1,
+            "Expected only 1 corrupted delegation parsed instead of 2"
+        );
+        assert_eq!(found[0].target, "worker1");
+        assert!(
+            found[0].prompt.contains("ACTION: delegate_task(worker2"),
+            "First prompt swallowed second delegation: {}",
+            found[0].prompt
+        );
+    }
+
+    #[test]
+    fn bug_parse_delegations_absorbs_trailing_parentheses_into_prompt() {
+        // When prose with parentheses follows a delegation on the same line,
+        // `rfind(')')` matches the closing parenthesis of the prose instead of the delegation!
+        let reply = "ACTION: delegate_task(worker, run tests) (ensure clean exit)";
+        let found = SwarmLedger::parse_delegations(reply);
+
+        assert_eq!(found.len(), 1);
+        // PROOF OF BUG: The prompt contains the closing parenthesis of delegate_task AND trailing commentary
+        assert_eq!(found[0].prompt, "run tests) (ensure clean exit");
+    }
+
+    #[test]
+    fn bug_parse_delegations_backticked_arguments_retain_backticks_breaking_dispatch() {
+        // When a model wraps arguments in inline markdown backticks, `target` retains the backticks,
+        // which fails registry lookup in `orchestrator.rs`.
+        let reply = "ACTION: delegate_task(`ollama:llama3`, `do task`)";
+        let found = SwarmLedger::parse_delegations(reply);
+
+        assert_eq!(found.len(), 1);
+        // PROOF OF BUG: target is `ollama:llama3` with literal backticks, not ollama:llama3
+        assert_eq!(found[0].target, "`ollama:llama3`");
+        assert_eq!(found[0].prompt, "`do task`");
+    }
 }

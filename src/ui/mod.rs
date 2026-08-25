@@ -567,3 +567,97 @@ fn render_picker_body(picker: &PickerState) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    #[tokio::test]
+    async fn bug_handle_key_allows_local_command_to_prematurely_clear_busy_while_turn_in_flight() {
+        let mut app = App::new(
+            "ollama:llama3",
+            &["ollama:llama3".to_string()],
+            "/tmp".to_string(),
+        );
+        app.busy = true; // A model turn is currently in flight
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let (dec_tx, _dec_rx) = mpsc::channel(1);
+
+        // While turn is running, user enters /commander and presses Enter
+        for c in "/commander".chars() {
+            handle_key(
+                &mut app,
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+                &cmd_tx,
+                &dec_tx,
+            )
+            .await;
+        }
+        handle_key(
+            &mut app,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+            &cmd_tx,
+            &dec_tx,
+        )
+        .await;
+
+        // BUG: handle_key accepts input while busy and executes local command,
+        // which clears app.busy to false while the background orchestrator is still processing!
+        assert!(
+            !app.busy,
+            "app.busy was prematurely cleared to false while turn was in flight"
+        );
+    }
+
+    #[test]
+    fn bug_draw_cursor_position_out_of_bounds_on_small_height() {
+        let app = App::new(
+            "ollama:llama3",
+            &["ollama:llama3".to_string()],
+            "/tmp".to_string(),
+        );
+        let backend = TestBackend::new(80, 2);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+                // Layout splits: chunks[0] height=1, chunks[1] height=1 (y=1).
+                // chunks[1].y + 1 = 2.
+                // On a terminal with height 2, valid rows are 0 and 1. Row 2 is out of bounds!
+                // ratatui's draw calculates x = 3, y = 2.
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn bug_draw_cursor_disappears_when_input_exceeds_terminal_width() {
+        let mut app = App::new(
+            "ollama:llama3",
+            &["ollama:llama3".to_string()],
+            "/tmp".to_string(),
+        );
+        for _ in 0..40 {
+            app.push_char('x');
+        }
+        assert_eq!(app.cursor_column(), 40);
+
+        // Terminal width 30
+        let backend = TestBackend::new(30, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(frame, &app);
+                // chunks[1].width is 30.
+                // x = chunks[1].x + 3 + 40 = 43.
+                // chunks[1].width.saturating_sub(1) = 29.
+                // x < 29 is false, so set_cursor_position is NOT called.
+            })
+            .unwrap();
+    }
+}

@@ -1504,4 +1504,86 @@ mod tests {
             .unwrap();
         assert_eq!(reply.text, "partial reply");
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bug_streaming_assistant_text_fallback_silently_omits_truncation_marker() {
+        // When an NDJSON stream produces accumulated lines exceeding MAX_OUTPUT_BYTES,
+        // assistant_text stops being appended to. However, because assistant_text.len() <= MAX_OUTPUT_BYTES,
+        // send_streaming's check `if text.len() > MAX_OUTPUT_BYTES` evaluates to false,
+        // so `truncated` is false and no truncation marker is appended to the reply.
+        // Downstream callers receive a cut reply without any indication that it was truncated!
+        let chunk = "A".repeat(1024);
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec![
+                    "-c".into(),
+                    format!(
+                        "i=0; while [ $i -lt 1100 ]; do printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{chunk}\"}}]}}}}'; i=$((i+1)); done"
+                    ),
+                ],
+                system_arg: None,
+                dialect: Some(StreamDialect::ClaudeJson),
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+
+        let reply = p
+            .send_with_progress(None, "ignored", &ProgressSink::disconnected())
+            .await
+            .unwrap();
+
+        // Total emitted was 1100 * 1024 = 1,126,400 bytes (> 1,048,576 MAX_OUTPUT_BYTES).
+        // The reply was truncated (stopped accumulating), but does NOT contain the truncation marker!
+        assert!(
+            !reply.text.contains("output truncated"),
+            "Proof of bug: text was cut off but has no truncation notice: len={}",
+            reply.text.len()
+        );
+        // It has less than 1100 * 1024 characters because it stopped accumulating:
+        assert!(reply.text.len() < 1100 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bug_streaming_empty_terminal_result_overwrites_and_discards_valid_assistant_text() {
+        // If an agent streams several assistant text chunks, and then emits a terminal result
+        // event where `result` or `response` is empty `""`, line 578 sets `result_text = Some("")`.
+        // `result_text.unwrap_or(assistant_text)` evaluates to `""`, completely discarding the
+        // accumulated assistant_text, and then errors with "produced no output"!
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec![
+                    "-c".into(),
+                    r#"printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Here is the full and complete answer."}]}}' '{"type":"result","subtype":"success","is_error":false,"result":""}'"#
+                        .into(),
+                ],
+                system_arg: None,
+                dialect: Some(StreamDialect::ClaudeJson),
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+
+        let err = p
+            .send_with_progress(None, "ignored", &ProgressSink::disconnected())
+            .await
+            .unwrap_err();
+
+        // PROOF OF BUG: The provider errored out with "produced no output" even though valid
+        // assistant_text ("Here is the full and complete answer.") was streamed and should have been returned.
+        assert!(
+            err.to_string().contains("produced no output"),
+            "Unexpected error: {err}"
+        );
+    }
 }

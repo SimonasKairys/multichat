@@ -1209,4 +1209,37 @@ mod tests {
         assert!(app.body().contains("you › hi"));
         assert!(app.body().contains("ollama:llama3 › hello"));
     }
+
+    #[test]
+    fn bug_reconfigured_event_leaves_busy_flag_stuck_true() {
+        let mut app = app();
+        app.busy = true;
+
+        app.apply(Event::Reconfigured {
+            primary: "anthropic:claude-opus-5".into(),
+            roster: vec!["anthropic:claude-opus-5".into()],
+        });
+
+        // BUG: Event::Reconfigured does NOT reset app.busy to false.
+        // As a result, app.busy remains true indefinitely, status_line remains "working...",
+        // and input prompt remains disabled.
+        assert!(app.busy, "app.busy remains stuck at true");
+        assert!(app.status_line().contains("working…"));
+    }
+
+    #[test]
+    fn bug_submit_does_not_reset_scroll_leaving_user_stranded() {
+        let mut app = app();
+        app.scroll = 20; // User scrolled up to inspect previous output
+
+        for c in "new query".chars() {
+            app.push_char(c);
+        }
+        let submitted = app.submit();
+        assert_eq!(submitted.as_deref(), Some("new query"));
+
+        // BUG: submit() resets cursor and input, but fails to reset scroll.
+        // The user remains stranded at the old scroll offset and cannot view the newly submitted message.
+        assert_eq!(app.scroll, 20);
+    }
 }

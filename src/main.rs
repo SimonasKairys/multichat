@@ -339,6 +339,18 @@ fn verify_audit(paths: &Paths, reset_anchor: bool, reset_key: bool) -> Result<()
                 report.entries
             );
         }
+        // Also not a hard failure — see `AnchorStatus::Unreadable`'s doc comment. An
+        // anchor file exists but couldn't be parsed, most likely a crash mid-write;
+        // that's a reason to distrust *this* anchor, not evidence the log was tampered
+        // with, so it gets the same "verified, but unconfirmed" treatment as `Missing`.
+        AnchorStatus::Unreadable => {
+            println!(
+                "Audit chain verified: {} entries intact, but the anchor file could not \
+                 be read (it may be corrupt or left over from an interrupted write), so \
+                 the tail hasn't been confirmed against it.",
+                report.entries
+            );
+        }
     }
     Ok(())
 }
@@ -764,5 +776,22 @@ mod tests {
         assert_eq!(fmt_hms(0), "0h 0m");
         assert_eq!(fmt_hms(90 * 60), "1h 30m");
         assert_eq!(fmt_hms(crate::vault::MAX_IDLE_SECS), "24h 0m");
+    }
+
+    #[test]
+    fn bug_top_level_chat_flags_rejected_without_explicit_chat_subcommand() {
+        // Chat is advertised as the default subcommand (None => chat),
+        // but passing chat flags like -m or --vault at the top level is rejected.
+        let res_model = Cli::try_parse_from(["simon", "-m", "ollama:llama3"]);
+        assert!(
+            res_model.is_err(),
+            "Top-level -m is rejected without explicit `chat` subcommand"
+        );
+
+        let res_vault = Cli::try_parse_from(["simon", "--vault"]);
+        assert!(
+            res_vault.is_err(),
+            "Top-level --vault is rejected without explicit `chat` subcommand"
+        );
     }
 }

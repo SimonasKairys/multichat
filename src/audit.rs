@@ -171,6 +171,20 @@ pub enum AnchorStatus {
     /// the keyring write in that bootstrap sync itself fails (e.g. no Secret Service
     /// running), not as an everyday state of a working install.
     Missing,
+    /// A sidecar anchor file exists but could not be parsed — e.g. a 0-byte or
+    /// partially-written file left by a process that crashed mid-`write_sidecar_anchor`.
+    /// This is reported as a **warning**, like `Missing`, not a hard failure: the
+    /// chain itself is still fully verified either way, and there is no basis to call
+    /// this tampering (a *tampered* anchor is syntactically valid JSON whose MAC
+    /// doesn't check out — that's an active forgery attempt, which is a hard failure;
+    /// this file couldn't even be parsed, which is what an interrupted write looks
+    /// like). It is also not the same claim as `Missing`: an anchor file *was* found
+    /// here, it just isn't usable as evidence — collapsing the two would tell an
+    /// operator "no anchor was ever written" when the truer statement is "one was
+    /// written but this run can't read it". If a valid keyring anchor is also
+    /// available, it is used as the reference and this variant is not reported —
+    /// there is nothing to warn about when a working anchor still confirmed the tail.
+    Unreadable,
 }
 
 /// The result of walking the chain and comparing it against its anchor.
@@ -531,14 +545,26 @@ impl AuditLogger {
             Err(e) => return Err(e).context("failed to open audit log for verification"),
         }
 
-        let sidecar = read_sidecar_anchor(&self.anchor_path)?;
-        if let Some(anchor) = &sidecar
-            && !self.anchor_is_valid(anchor)
-        {
-            return Err(anyhow!(
-                "audit anchor file has been tampered with (MAC mismatch)"
-            ));
-        }
+        let sidecar_corrupt;
+        let sidecar = match read_sidecar_anchor(&self.anchor_path)? {
+            SidecarAnchor::Present(anchor) if !self.anchor_is_valid(&anchor) => {
+                return Err(anyhow!(
+                    "audit anchor file has been tampered with (MAC mismatch)"
+                ));
+            }
+            SidecarAnchor::Present(anchor) => {
+                sidecar_corrupt = false;
+                Some(anchor)
+            }
+            SidecarAnchor::Corrupt => {
+                sidecar_corrupt = true;
+                None
+            }
+            SidecarAnchor::Absent => {
+                sidecar_corrupt = false;
+                None
+            }
+        };
         let keyring = self
             .keyring_anchor
             .as_ref()
@@ -558,7 +584,14 @@ impl AuditLogger {
         let Some(reference) = reference else {
             return Ok(VerifyReport {
                 entries: count as usize,
-                anchor: if count > 0 {
+                anchor: if sidecar_corrupt {
+                    // A corrupt sidecar is worth reporting even over `Missing`: an
+                    // anchor file *was* found, it just couldn't be read as one. A
+                    // keyring anchor (if any) already took priority above via
+                    // `reference`, so reaching here means there was truly nothing
+                    // usable to compare against.
+                    AnchorStatus::Unreadable
+                } else if count > 0 {
                     AnchorStatus::Missing
                 } else {
                     AnchorStatus::Current
@@ -659,14 +692,28 @@ fn default_anchor_path(log_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn read_sidecar_anchor(anchor_path: &Path) -> Result<Option<Anchor>> {
+/// What was found at the sidecar anchor path. Distinct from `Option<Anchor>` so a
+/// present-but-unparseable file (see `AnchorStatus::Unreadable`) can be told apart
+/// from a genuinely absent one instead of both collapsing to `None` — `verify()`
+/// needs that distinction to report the honest state rather than claiming "no
+/// anchor was ever written" about a file that's sitting right there, corrupt.
+enum SidecarAnchor {
+    Absent,
+    Corrupt,
+    Present(Anchor),
+}
+
+fn read_sidecar_anchor(anchor_path: &Path) -> Result<SidecarAnchor> {
     match std::fs::read_to_string(anchor_path) {
-        Ok(s) => {
-            let anchor: Anchor =
-                serde_json::from_str(&s).context("audit anchor file is not valid JSON")?;
-            Ok(Some(anchor))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        // A parse failure here is not propagated as an `Err`: unlike a real I/O error,
+        // it's the expected shape of a crash-interrupted write (0-byte or truncated
+        // JSON), not something the caller should have `verify()` abort over. See
+        // `AnchorStatus::Unreadable`.
+        Ok(s) => Ok(match serde_json::from_str(&s) {
+            Ok(anchor) => SidecarAnchor::Present(anchor),
+            Err(_) => SidecarAnchor::Corrupt,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(SidecarAnchor::Absent),
         Err(e) => Err(e).context("failed to read audit anchor file"),
     }
 }
@@ -806,14 +853,39 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// Decodes a hex string into bytes without ever slicing `s` by byte index.
+///
+/// The previous implementation checked `s.len()` (a byte count) for evenness, then
+/// sliced `&s[i..i+2]` at those byte offsets. Both the length check and the slice
+/// bounds are byte-based, but a keyring value is attacker- or corruption-controlled
+/// input that can contain multi-byte UTF-8 (an emoji, a Lithuanian letter): the byte
+/// length could still be even while a 2-byte cut lands inside a multi-byte
+/// codepoint, and `&str` indexing panics with "byte index is not a char boundary"
+/// rather than returning an error. This crate has shipped exactly this failure class
+/// before (fixed in 923b934) — the fix here is the same principle: work on
+/// `as_bytes()` throughout so there is no `&str` index to ever land wrong, and let
+/// any byte outside `0-9a-fA-F` (which includes every continuation/lead byte of a
+/// multi-byte UTF-8 sequence) fail the digit match cleanly instead of panicking.
 fn unhex(s: &str) -> Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err(anyhow!("odd-length hex string"));
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Ok((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
         .collect()
+}
+
+/// A single ASCII hex digit's value, or an error for anything else — including any
+/// byte of a multi-byte UTF-8 sequence, all of which fall outside `0-9a-fA-F`.
+fn hex_digit(b: u8) -> Result<u8> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(anyhow!("bad hex digit: 0x{b:02x}")),
+    }
 }
 
 #[cfg(test)]
@@ -1296,5 +1368,74 @@ mod tests {
         let short_hex = hex(&short);
         let err = decide_key(Some(&short_hex)).unwrap_err().to_string();
         assert!(!err.contains("42424242"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn decide_key_rejects_multibyte_utf8_in_keyring_without_panicking() {
+        // Was `bug_proof_unhex_panics_on_multibyte_utf8_in_keyring`: this used to
+        // reproduce a crash, not guard against one. "00\u{1f512}" is 6 bytes (an even
+        // byte length, so it passed the old length check), but \u{1f512} alone is 4
+        // bytes — `unhex` used to slice `&s[2..4]`, landing mid-codepoint, and panic
+        // with "byte index is not a char boundary". That's reachable from a startup
+        // path (`load_or_create_key` -> `decide_key` -> `validate_key` -> `unhex`) on
+        // nothing more than a keyring value with a stray emoji or accented letter —
+        // a crash where the surrounding code already had a `.context(...)` in place
+        // that shows the intent was always to reject cleanly, not abort the process.
+        let corrupt_keyring_value = "00\u{1f512}";
+        let res = std::panic::catch_unwind(|| decide_key(Some(corrupt_keyring_value)));
+        let decision = res.expect("decide_key must not panic on multi-byte UTF-8 input");
+        assert!(
+            decision.is_err(),
+            "a keyring value containing non-hex UTF-8 is not a valid key and must be rejected"
+        );
+    }
+
+    #[test]
+    fn unhex_rejects_malformed_input_without_panicking() {
+        // Broader sweep over `unhex` itself, per the audit's requested coverage: an
+        // emoji and a Lithuanian string (both multi-byte UTF-8, exercising the same
+        // class as the test above but at the `unhex` level directly), an odd byte
+        // length, and non-hex ASCII. All four must return `Err`, never panic.
+        for (label, input) in [
+            ("emoji", "00\u{1f512}"),
+            ("lithuanian text", "ąžuolas"),
+            ("odd length", "abc"),
+            ("non-hex ascii", "zzzz"),
+        ] {
+            let result = std::panic::catch_unwind(|| unhex(input))
+                .unwrap_or_else(|_| panic!("unhex panicked on {label} input {input:?}"));
+            assert!(
+                result.is_err(),
+                "unhex accepted invalid {label} input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_truncated_sidecar_anchor_is_reported_not_a_verify_failure() {
+        // Was `bug_proof_truncated_sidecar_anchor_causes_verify_failure`: this used to
+        // reproduce `verify()` hard-failing on a 0-byte anchor — the shape left by a
+        // crash mid-`write_sidecar_anchor` — with a "not valid JSON" error, which is
+        // indistinguishable from an attacker's deliberate tampering (see
+        // `verify_detects_a_tampered_anchor`, a syntactically valid anchor with a
+        // wrong MAC). That overstated what's actually known: the log's own hash chain
+        // is still fully intact either way. Correct behaviour is `verify()` succeeding
+        // with `AnchorStatus::Unreadable` — the same "warning, not a hard failure"
+        // treatment as `Missing`, but distinct from it, because an anchor file *was*
+        // found here, just not a readable one.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = logger(&dir);
+        log.log("session.start", "ok").unwrap();
+        log.log("prompt.sent", "ok").unwrap();
+
+        let anchor_file = default_anchor_path(&dir.path().join("audit.log"));
+        std::fs::write(&anchor_file, b"").unwrap();
+
+        let report = log.verify().unwrap();
+        assert_eq!(
+            report.entries, 2,
+            "the chain itself is still fully verified"
+        );
+        assert_eq!(report.anchor, AnchorStatus::Unreadable);
     }
 }

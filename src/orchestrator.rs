@@ -4352,4 +4352,72 @@ mod tests {
         assert!(listings[0].outcome.contains("a.txt"));
         assert!(listings[0].outcome.contains("b.txt"));
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn bug_audit_log_leaks_raw_error_text_on_delegation_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let secret = "SECRET_API_KEY_OR_PAYLOAD_12345";
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "ollama:llama3".into(),
+            Arc::new(StubProvider {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                remote: false,
+            }),
+        );
+        providers.insert(
+            "ollama:flaky".into(),
+            Arc::new(FlakyProvider {
+                provider: "ollama".into(),
+                model: "flaky".into(),
+                remaining_failures: std::sync::Mutex::new(1),
+                error: format!("upstream refused: {secret}"),
+            }),
+        );
+        let reg = Registry {
+            providers,
+            primary: "ollama:llama3".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![7u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:flaky, do the thing)",
+        )
+        .await;
+
+        let log_content = std::fs::read_to_string(&paths.audit_log).unwrap();
+        // Look for the task.retrying line in the audit log
+        let retry_line = log_content
+            .lines()
+            .find(|line| line.contains("task.retrying"))
+            .expect("expected task.retrying entry in audit log");
+
+        // PROOF OF VULNERABILITY / INVARIANT VIOLATION:
+        // The audit log contains the raw secret error string because line 1754 logs
+        // `error={reason}` using `error.to_string()` instead of using `safe_error_detail(&error)`.
+        assert!(
+            retry_line.contains(secret),
+            "Audit log leaked secret error text: {retry_line}"
+        );
+    }
 }

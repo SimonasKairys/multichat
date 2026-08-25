@@ -868,4 +868,78 @@ mod tests {
         assert!(picker.is_commander(0, 0));
         assert!(!picker.is_commander(0, 1));
     }
+
+    #[test]
+    fn bug_cycle_transport_selects_unavailable_transport_and_submits_it() {
+        // 1. Setup candidate with CLI available and API unavailable
+        let candidate = candidate_dual("anthropic", true);
+        let mut picker = PickerState::new(vec![candidate], &BTreeMap::new(), None, false);
+
+        // 2. Select CLI (index 0) and set as commander
+        picker.toggle();
+        picker.set_commander();
+        assert!(picker.is_commander(0, 0));
+        assert!(picker.is_checked(0, 0));
+
+        // 3. User presses Tab (cycle_transport)
+        picker.cycle_transport();
+
+        // BUG: The transport was cycled to index 1 (API), which is UNAVAILABLE ("no key stored").
+        // PickerState marks it as checked and marks it as commander despite being unavailable!
+        assert!(
+            picker.is_checked(0, 1),
+            "Unavailable transport 1 is now marked checked"
+        );
+        assert!(
+            picker.is_commander(0, 1),
+            "Unavailable transport 1 is now marked as commander"
+        );
+        assert!(
+            !picker.candidates()[0].transports[1]
+                .availability
+                .is_available()
+        );
+
+        // BUG: submit() allows submitting this unavailable transport as enabled and commander!
+        let (connections, commander) = picker
+            .submit()
+            .expect("submit succeeded with unavailable transport");
+        assert_eq!(commander.as_deref(), Some("anthropic"));
+        let conn = &connections["anthropic"];
+        assert!(conn.enabled);
+        assert_eq!(conn.transport, Some(Transport::Api));
+    }
+
+    #[test]
+    fn bug_submit_permits_submitting_unavailable_saved_connection_and_commander() {
+        // Setup candidate that is unavailable (e.g. cloud API refused under --classified)
+        let candidate = candidate_refused("anthropic", "cloud APIs are refused under --classified");
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "anthropic".into(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Api),
+                path: None,
+                model: None,
+            },
+        );
+
+        // Load saved connection state
+        let mut picker = PickerState::new(vec![candidate], &connections, Some("anthropic"), false);
+        assert!(picker.is_checked(0, 0));
+        assert!(picker.is_commander(0, 0));
+        assert!(
+            !picker.candidates()[0].transports[0]
+                .availability
+                .is_available()
+        );
+
+        // BUG: submit() does not validate availability, returning an unavailable connection and commander
+        let (conns, commander) = picker
+            .submit()
+            .expect("submit succeeded despite unavailable commander");
+        assert!(conns["anthropic"].enabled);
+        assert_eq!(commander.as_deref(), Some("anthropic"));
+    }
 }

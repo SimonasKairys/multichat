@@ -46,6 +46,13 @@ const MAGIC: &[u8; 8] = b"MCVAULT1";
 const VERSION: u8 = 1;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
+/// AES-GCM's authentication tag. Every well-formed body carries one, so a body shorter
+/// than this cannot be a truncated *message* — it is a truncated *file*.
+const TAG_LEN: usize = 16;
+/// Argon2 refuses a salt below 8 bytes. A header claiming less is malformed, and
+/// accepting it used to brick `save`, which reuses the stored salt and then cannot
+/// derive a key from it ever again.
+const MIN_SALT_LEN: usize = 8;
 const KEY_LEN: usize = 32;
 const HEADER_FIXED_LEN: usize = 8 + 1 + 1 + 8 + 1; // magic..salt_len inclusive
 
@@ -149,9 +156,21 @@ impl EncryptedVault {
                 .map_err(|_| VaultError::Corrupt("truncated timestamp".into()))?,
         );
         let salt_len = raw[18] as usize;
+        if salt_len < MIN_SALT_LEN {
+            return Err(VaultError::Corrupt(format!(
+                "header claims a {salt_len}-byte salt, below Argon2's {MIN_SALT_LEN}-byte minimum"
+            )));
+        }
         let salt_end = HEADER_FIXED_LEN + salt_len;
-        if raw.len() < salt_end + NONCE_LEN {
-            return Err(VaultError::Corrupt("truncated salt or nonce".into()));
+        // The body must have room for the nonce *and* the GCM tag. Without this check a
+        // file truncated after the nonce reached the decrypt below, failed for a
+        // structural reason, and was charged to the user as a wrong password — five of
+        // those and the damaged file was destroyed, with the correct password typed
+        // every time. A malformed file is `Corrupt`; it is never a failed attempt.
+        if raw.len() < salt_end + NONCE_LEN + TAG_LEN {
+            return Err(VaultError::Corrupt(
+                "file is too short to hold a nonce and an authentication tag".into(),
+            ));
         }
         Ok(Header {
             attempts,
@@ -225,12 +244,23 @@ impl EncryptedVault {
 
         let mut header = Self::parse_header(&raw)?;
 
-        if header.attempts >= MAX_ATTEMPTS {
-            self.destroy();
-            return Err(VaultError::Destroyed(format!(
-                "{MAX_ATTEMPTS} consecutive failed unlock attempts"
-            )));
-        }
+        // The attempt counter is NOT acted on here, only below, and only after a
+        // password has actually been tried and failed.
+        //
+        // This used to `destroy()` on the count alone, before the password was checked
+        // — the identical mistake the idle-expiry comment below describes, three lines
+        // apart in the same function, and it survived that fix because the fix was
+        // written for the clock rather than for the shape. Byte 9 is outside the AEAD's
+        // authenticated data (see `Header::aad`), so it is attacker-writable and
+        // bit-rot-reachable; setting it to `MAX_ATTEMPTS` was enough to destroy a
+        // vault irreversibly on the next unlock *with the correct password*.
+        //
+        // The counter was never a defence against someone who can write the file — the
+        // README says plainly that such an attacker can lower it. It only ever bounded
+        // guessing by someone who cannot, and the failure path below still does that:
+        // a wrong password increments and, on reaching the limit, destroys. A correct
+        // password unlocks and resets the count to zero, so a forged value costs the
+        // legitimate user nothing.
 
         // Idle expiry is deliberately NOT enforced here. It used to `destroy()` the
         // file at this point, before the password was even checked. The window is pure
@@ -274,7 +304,17 @@ impl EncryptedVault {
             }
             Err(_) => {
                 header.attempts = header.attempts.saturating_add(1);
-                let _ = self.rewrite_header(&raw, &header);
+                // Refuse rather than grant a free guess. This was `let _ = …`, so on a
+                // read-only file or directory the increment never reached disk and the
+                // count reset to its old value on every call — unlimited attempts, with
+                // `remaining` cheerfully reporting the same number forever. An attempt
+                // that cannot be recorded must not be spent.
+                if let Err(e) = self.rewrite_header(&raw, &header) {
+                    return Err(VaultError::Corrupt(format!(
+                        "refusing to continue: a failed attempt could not be recorded, \
+                         so the attempt limit cannot be enforced ({e})"
+                    )));
+                }
                 if header.attempts >= MAX_ATTEMPTS {
                     self.destroy();
                     return Err(VaultError::Destroyed(format!(
@@ -821,6 +861,131 @@ mod tests {
         assert_eq!(restored[1].text, "hi there");
         assert!(
             matches!(&restored[1].speaker, Speaker::Model(m) if m == "anthropic:claude-opus-5")
+        );
+    }
+
+    #[test]
+    fn a_truncated_file_is_corrupt_and_never_charged_as_a_failed_attempt() {
+        // Was `bug_proof_truncated_ciphertext_triggers_self_destruct_instead_of_corrupt`.
+        // A file cut after the nonce has no GCM tag, so decryption fails for a
+        // structural reason — which used to be reported as a wrong password and, after
+        // five tries with the *correct* one, destroyed the damaged file outright.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("correct_pw".to_string());
+        vault.save(b"my transcript", &pw).unwrap();
+
+        let raw = fs::read(vault.path()).unwrap();
+        let truncated_len = HEADER_FIXED_LEN + SALT_LEN + NONCE_LEN;
+        assert!(
+            raw.len() > truncated_len,
+            "fixture did not actually truncate anything"
+        );
+        fs::write(vault.path(), &raw[..truncated_len]).unwrap();
+
+        for _ in 0..(MAX_ATTEMPTS + 2) {
+            match vault.load(&pw) {
+                Err(VaultError::Corrupt(_)) => {}
+                other => panic!("expected Corrupt for a structurally invalid file, got {other:?}"),
+            }
+            assert!(vault.exists(), "a corrupt file must never be destroyed");
+        }
+    }
+
+    #[test]
+    fn a_header_claiming_an_undersized_salt_is_rejected_rather_than_reused() {
+        // Was `bug_proof_short_salt_breaks_save_permanently`. `save` reuses the stored
+        // salt so an unchanged password keeps working; a header claiming a salt below
+        // Argon2's minimum was accepted on read and then reused, so key derivation
+        // failed and the vault could never be written again.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("password".to_string());
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(MAGIC);
+        raw.push(VERSION);
+        raw.push(0);
+        raw.extend_from_slice(&0u64.to_be_bytes());
+        raw.push(0); // salt_len = 0
+        raw.extend_from_slice(&[0u8; NONCE_LEN]);
+        raw.extend_from_slice(&[0u8; TAG_LEN]);
+        fs::write(vault.path(), &raw).unwrap();
+
+        vault
+            .save(b"fresh transcript", &pw)
+            .expect("save must recover by generating a fresh salt");
+        assert_eq!(vault.load(&pw).unwrap(), b"fresh transcript");
+    }
+
+    #[test]
+    fn a_forged_attempt_count_cannot_destroy_a_vault_the_password_still_opens() {
+        // Was `bug_proof_unauthenticated_byte_9_causes_instant_destruction`. Byte 9 sits
+        // outside the AEAD's authenticated data, so anyone who can write the file — or a
+        // single flipped bit — could set it to MAX_ATTEMPTS, and `load` destroyed the
+        // vault on that number alone, before the password was ever tried.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("secret_password".to_string());
+        vault.save(b"valuable secret transcript", &pw).unwrap();
+
+        let mut raw = fs::read(vault.path()).unwrap();
+        raw[9] = MAX_ATTEMPTS;
+        fs::write(vault.path(), &raw).unwrap();
+        assert_eq!(
+            fs::read(vault.path()).unwrap()[9],
+            MAX_ATTEMPTS,
+            "fixture failed to forge the attempt count, so this proves nothing"
+        );
+
+        let opened = vault
+            .load(&pw)
+            .expect("the correct password must still open it");
+        assert_eq!(opened, b"valuable secret transcript");
+        assert!(
+            vault.exists(),
+            "the vault was destroyed despite a correct password"
+        );
+        assert_eq!(
+            fs::read(vault.path()).unwrap()[9],
+            0,
+            "a successful unlock must reset the forged count"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn an_attempt_that_cannot_be_recorded_is_refused_rather_than_given_away() {
+        // Was `bug_proof_readonly_vault_bypasses_brute_force_limit`. The failed-attempt
+        // increment was written with `let _ = …`, so on a read-only directory it never
+        // reached disk: every guess re-read the same count and `remaining` reported the
+        // same number forever, which is unlimited guessing wearing a limit's clothes.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("correct".to_string());
+        let wrong = SecretString::from("wrong".to_string());
+        vault.save(b"secret", &pw).unwrap();
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = vault.load(&wrong);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        match result {
+            Err(VaultError::Corrupt(msg)) => assert!(
+                msg.contains("could not be recorded"),
+                "unexpected refusal reason: {msg}"
+            ),
+            other => {
+                panic!("expected a refusal when the attempt cannot be recorded, got {other:?}")
+            }
+        }
+        assert!(vault.exists(), "refusing must not destroy the vault");
+        assert_eq!(
+            vault.load(&pw).unwrap(),
+            b"secret",
+            "the vault must still open"
         );
     }
 }

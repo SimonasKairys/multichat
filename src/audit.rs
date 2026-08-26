@@ -137,9 +137,11 @@ use anyhow::{Context, Result, anyhow};
 use blake2::digest::{Digest, Mac};
 use blake2::{Blake2s256, Blake2sMac256};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::Credentials;
@@ -294,6 +296,25 @@ pub struct AuditLogger {
     use_keyring_anchor: bool,
 }
 
+/// Process-local exclusion for one log path, layered *under* the file lock.
+///
+/// The file lock alone is not enough, and the difference is a platform one that only CI
+/// could see. `flock` on Unix conflicts between any two open file descriptions, so two
+/// `AuditLogger`s in one process serialise against each other for free. Windows'
+/// `LockFileEx` grants exclusive access to *the locking process's threads* — a second
+/// handle in the same process is not blocked at all. So on Windows two loggers in one
+/// process both "acquired" the lock, appended concurrently, and broke the very chain
+/// this lock was added to protect, while the cross-process test passed.
+///
+/// Both layers are needed and neither replaces the other: this mutex bounds threads
+/// inside one process, the file lock bounds separate processes.
+fn log_mutex_for(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(guard.entry(path.to_path_buf()).or_default())
+}
+
 impl AuditLogger {
     /// Opens (or starts) the log, recovering the chain head from the existing file.
     ///
@@ -410,6 +431,11 @@ impl AuditLogger {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
+        // Held for the whole of this function, outside the file lock — see
+        // `log_mutex_for` for why a file lock alone does not exclude threads on Windows.
+        let process_lock = log_mutex_for(&self.path);
+        let _in_process = process_lock.lock().unwrap_or_else(|e| e.into_inner());
+
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -426,10 +452,7 @@ impl AuditLogger {
         // trusting `self.last_mac`/`self.count`: those can be stale the instant
         // another process (or another `AuditLogger` on this same path) has appended
         // since this logger last read the file.
-        let (count, last_mac) = read_chain_tail_from(
-            file.try_clone()
-                .context("failed to duplicate the audit log handle to read its tail")?,
-        )?;
+        let (count, last_mac) = read_chain_tail_from(&file)?;
         let last_mac = last_mac.unwrap_or_else(|| GENESIS.to_string());
 
         let mac = self.mac(&last_mac, ts, action, details)?;
@@ -772,7 +795,7 @@ fn read_chain_tail(path: &Path) -> Result<(u64, Option<String>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, None)),
         Err(e) => return Err(e).context("failed to read audit log"),
     };
-    read_chain_tail_from(file)
+    read_chain_tail_from(&file)
 }
 
 /// Reads the tail from an already-open handle.
@@ -786,7 +809,7 @@ fn read_chain_tail(path: &Path) -> Result<(u64, Option<String>)> {
 /// holding the append lock therefore worked on Linux and macOS and failed on Windows
 /// with a lock violation. Reading through the locking handle itself is correct
 /// everywhere: a handle may always read the range it owns.
-fn read_chain_tail_from(mut file: File) -> Result<(u64, Option<String>)> {
+fn read_chain_tail_from(mut file: &File) -> Result<(u64, Option<String>)> {
     // The handle is opened for append, so the write position is pinned to the end
     // regardless of where reading leaves the cursor — seeking back to the start to read
     // cannot misplace the append that follows.
@@ -1060,6 +1083,34 @@ mod tests {
             .map(str::to_string)
             .collect();
         std::fs::write(&path, kept.join("\n") + "\n").unwrap();
+    }
+
+    #[test]
+    fn the_process_local_lock_is_shared_per_path_and_not_across_paths() {
+        // The threads test cannot prove this on Unix: `flock` already serialises open
+        // file descriptions there, so removing this mutex changes nothing locally and
+        // everything on Windows. Pin the mapping directly instead — two loggers on one
+        // path must contend, two on different paths must not.
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("audit.log");
+        let b = dir.path().join("other.log");
+
+        assert!(
+            Arc::ptr_eq(&log_mutex_for(&a), &log_mutex_for(&a)),
+            "the same path must map to one mutex, or two loggers on it never contend"
+        );
+        assert!(
+            !Arc::ptr_eq(&log_mutex_for(&a), &log_mutex_for(&b)),
+            "separate logs must not serialise against each other"
+        );
+
+        // And it must actually exclude: holding it makes a second acquisition fail.
+        let held = log_mutex_for(&a);
+        let _guard = held.lock().unwrap();
+        assert!(
+            log_mutex_for(&a).try_lock().is_err(),
+            "the shared mutex did not exclude a second holder"
+        );
     }
 
     #[test]
@@ -1657,6 +1708,15 @@ mod tests {
     }
 
     #[test]
+    // Unix-only, and the reason is the finding itself. This holds the file lock from a
+    // second handle *in the same process* and expects the append to time out. `flock`
+    // conflicts between open file descriptions, so on Unix it does. Windows'
+    // `LockFileEx` grants the whole locking process access, so the second handle sails
+    // through and nothing times out — which is exactly why `log` also takes a
+    // process-local mutex now. Cross-process contention, the case that matters in
+    // production, is covered on every platform by
+    // `two_real_processes_interleaved_appends_produce_a_valid_chain`.
+    #[cfg(unix)]
     fn append_lock_contention_times_out_visibly_instead_of_hanging_or_dropping_the_entry() {
         // Simulates another process's in-progress `log()` call by holding the
         // exclusive lock from outside any `AuditLogger`. Checks the contention

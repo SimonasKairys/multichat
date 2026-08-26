@@ -80,6 +80,55 @@
 //! anchor first would invert the failure mode: a crash there would leave the anchor
 //! claiming an entry the file doesn't have yet, which is indistinguishable from an
 //! attacker having truncated that entry away.
+//!
+//! ## Cross-process append locking (§3.5)
+//!
+//! `SIMON_DATA_DIR` names one log file, but nothing stops two `simon` processes from
+//! opening it at once (two terminals, one `SIMON_DATA_DIR`). Each `AuditLogger` caches
+//! the chain head (`last_mac`) in memory, so without locking, two processes each read
+//! the same tail, each link their next entry to it, and the second write to land is a
+//! second entry with the *same* `prev` — `verify()` reports that as a broken chain,
+//! indistinguishable from tampering. This is the same failure mode the anchors exist to
+//! catch, produced by concurrency instead of an attacker.
+//!
+//! [`log`](AuditLogger::log) closes this with an OS advisory lock on the log file
+//! itself, taken with [`File::try_lock`]/[`File::lock`] — stabilised in Rust 1.89, no
+//! extra dependency needed, and implemented on Linux, macOS *and* Windows, unlike
+//! `flock`-only crates. Three decisions worth recording:
+//!
+//! * **What the lock covers.** The race isn't in the `write_all` call, it's between
+//!   reading the chain head and writing the entry that links to it — so the lock has to
+//!   span read-tail-through-append-through-sidecar-write as one critical section, not
+//!   just the final write. `log()` acquires the lock before its first read and holds it
+//!   until the sidecar anchor for that same entry has been written, so a second writer
+//!   can never see a torn state (an appended entry whose anchor isn't there yet) or
+//!   interleave its own entry between this one and its anchor.
+//!
+//! * **Re-read the head under the lock, every time, rather than lock for the logger's
+//!   whole lifetime.** A lock is only half the fix: even serialised, a logger that
+//!   trusts its in-memory `last_mac` from `open()` time still writes a broken link if
+//!   another process appended since then. The alternative — hold the lock from `open()`
+//!   to `Drop` — would fix that too, but it means a second `simon chat` in another
+//!   terminal can never log anything for as long as the first is running, which is a
+//!   worse failure than the extra read: `log()` already does one file read per call
+//!   just to *append* (the `OpenOptions::open` below), so a second small read for the
+//!   tail is not a new order of cost, and it's the only option that lets independent
+//!   `simon` processes coexist at all.
+//!
+//! * **Advisory, not a lock-file's existence.** A `<log>.lock` file whose mere presence
+//!   means "locked" needs something to delete it after a crash, or every subsequent run
+//!   finds it still there and either hangs or refuses to log. `File::lock` is released
+//!   by the OS the moment every file descriptor referencing it closes — including on
+//!   process death, no cleanup code required. This is exactly the same trade the module
+//!   docs above make for the keyring anchor over a plain marker file.
+//!
+//! **Contention** is bounded by [`APPEND_LOCK_TIMEOUT`], not blocked on forever and not
+//! failed instantly: a legitimate concurrent writer holds the lock only for the length
+//! of one `log()` call (microseconds), so a short wait resolves almost all contention,
+//! but a bug that wedges a holder must not be able to hang every future caller
+//! indefinitely. Timing out returns an `Err` from `log()` — the entry is never silently
+//! dropped; the caller sees the failure and decides what to do with it, the same as any
+//! other I/O error this function can already return.
 
 use anyhow::{Context, Result, anyhow};
 // Blake2 has a native keyed mode, so no separate HMAC construction is needed. `Blake2s256`
@@ -91,7 +140,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::Credentials;
 use crate::security::LockedBuffer;
@@ -106,6 +155,32 @@ const KEYRING_SERVICE: &str = "audit-hmac";
 /// instead — so any leftover value here is inert; `open()` best-effort deletes it so
 /// it doesn't sit around looking meaningful.
 const LEGACY_KEYRING_ANCHOR_SERVICE: &str = "audit-anchor-hmac";
+
+/// How long [`AuditLogger::log`] waits to acquire the cross-process append lock before
+/// giving up — see the module docs' "cross-process append locking" section. A real
+/// holder only keeps the lock for one `log()` call (microseconds), so this is sized to
+/// absorb ordinary scheduling jitter under load, not to make a wedged holder wait
+/// tolerable.
+///
+/// One value for tests and production alike, deliberately.
+///
+/// Tests used to get a 200 ms variant so the deliberate-contention test would not spend
+/// real seconds proving a timeout happens. That made the *other* lock test flaky in
+/// exactly the conditions this lock exists for: under `cargo mutants`, which runs the
+/// suite with several jobs in parallel, two worker processes appending 40 entries each
+/// legitimately needed longer than 200 ms and one of them was refused. A test that only
+/// passes on an idle machine is not evidence about a contended one, and the second-order
+/// cost — a suite that fails depending on machine load — is worse than a few seconds.
+///
+/// A legitimate writer stalled by disk or scheduler pressure should get a fair chance to
+/// finish before this process gives up on it, and giving up means refusing to record an
+/// audit entry, which is the outcome worth spending seconds to avoid.
+const APPEND_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll interval while waiting for the append lock. `std::fs::File::lock` blocks with
+/// no way to attach a timeout, so the wait below is a `try_lock` poll loop instead —
+/// this is how often it retries.
+const APPEND_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// One line of the log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -324,18 +399,41 @@ impl AuditLogger {
     }
 
     /// Appends an event, linking it to the current chain head.
+    ///
+    /// Locked end-to-end against other writers — see the module docs'
+    /// "cross-process append locking" section for why the lock has to cover
+    /// read-tail-through-sidecar-write as one unit, and why the head is re-read from
+    /// disk here rather than trusted from `self.last_mac`.
     pub fn log(&mut self, action: &str, details: &str) -> Result<()> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let mac = self.mac(&self.last_mac, ts, action, details)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open audit log {}", self.path.display()))?;
+        // Everything below, up to `file` going out of scope at the end of this
+        // function, runs under this exclusive lock. Releasing it is just letting
+        // `file` drop — see `lock_exclusive_with_timeout` for why that (an advisory
+        // lock tied to the fd) is the point, not an afterthought.
+        lock_exclusive_with_timeout(&file, &self.path)?;
+
+        // Re-read the chain tail from disk now that the lock is held, instead of
+        // trusting `self.last_mac`/`self.count`: those can be stale the instant
+        // another process (or another `AuditLogger` on this same path) has appended
+        // since this logger last read the file.
+        let (count, last_mac) = read_chain_tail(&self.path)?;
+        let last_mac = last_mac.unwrap_or_else(|| GENESIS.to_string());
+
+        let mac = self.mac(&last_mac, ts, action, details)?;
         let entry = AuditEntry {
             ts,
             action: action.to_string(),
             details: details.to_string(),
-            prev: self.last_mac.clone(),
+            prev: last_mac,
             mac: mac.clone(),
         };
 
@@ -344,25 +442,20 @@ impl AuditLogger {
 
         // Append to the log FIRST — see the module docs' crash-safety section for why
         // this order, and not the reverse, is the one that fails safe.
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("failed to open audit log {}", self.path.display()))?;
         file.write_all(line.as_bytes())
             .with_context(|| format!("failed to append to {}", self.path.display()))?;
         file.flush()?;
 
+        self.count = count + 1;
         self.last_mac = mac.clone();
-        self.count += 1;
 
-        // Then the sidecar anchor. This is a small local write, not a keyring round
-        // trip, so it's cheap enough to do on every entry — this is what actually
-        // closes the truncation finding day to day; the keyring anchor is only the
-        // backstop for losing both files at once (see module docs).
-        self.write_sidecar_anchor(self.count, &mac)?;
-
-        Ok(())
+        // Then the sidecar anchor, still inside the same locked section — so a second
+        // writer's entry can never land between this entry and its anchor. This is a
+        // small local write, not a keyring round trip, so it's cheap enough to do on
+        // every entry — this is what actually closes the truncation finding day to
+        // day; the keyring anchor is only the backstop for losing both files at once
+        // (see module docs).
+        self.write_sidecar_anchor(self.count, &mac)
     }
 
     fn write_sidecar_anchor(&self, count: u64, last_mac: &str) -> Result<()> {
@@ -463,18 +556,18 @@ impl AuditLogger {
     /// reporting truncation with no way to clear it. Wired to `simon audit
     /// --reset-anchor`, which requires the caller to ask for this by name.
     ///
-    /// Re-reads the log from disk rather than trusting this logger's own in-memory
-    /// head, because the whole point of this method is responding to the file having
-    /// changed since it was opened (that's exactly what "an admin deleted or trimmed
-    /// it" means). If the log still exists, the reset is recorded as a new entry
-    /// before the keyring anchor is re-baselined, so the reset itself is on the
-    /// record rather than a silent break in it; if the log is gone entirely, both
-    /// anchors are simply cleared, since there is no chain left to append a record to.
+    /// Does not pre-read the chain head into `self.count`/`self.last_mac` before
+    /// calling `log()` below — the whole point of this method is responding to the
+    /// file having changed since it was opened (that's exactly what "an admin deleted
+    /// or trimmed it" means), and `log()` itself now always re-reads the true head
+    /// from disk under its append lock rather than trusting this logger's in-memory
+    /// state (see its doc comment), so a separate pre-read here would just be the same
+    /// work done twice. If the log still exists, the reset is recorded as a new entry
+    /// before the keyring anchor is re-baselined, so the reset itself is on the record
+    /// rather than a silent break in it; if the log is gone entirely, both anchors are
+    /// simply cleared, since there is no chain left to append a record to.
     pub fn reset_anchor(&mut self, reason: &str) -> Result<()> {
         if self.path.exists() {
-            let (count, last_mac) = read_chain_tail(&self.path)?;
-            self.count = count;
-            self.last_mac = last_mac.unwrap_or_else(|| GENESIS.to_string());
             self.log("audit.anchor_reset", reason)?;
             self.force_write_keyring_anchor();
         } else {
@@ -630,6 +723,40 @@ impl Drop for AuditLogger {
         // Coarse-cadence sync #2: commit this session's writes to the keyring anchor
         // on close. No-ops immediately when `use_keyring_anchor` is false.
         self.sync_keyring_anchor();
+    }
+}
+
+/// Acquires an exclusive advisory lock on `file`, waiting up to [`APPEND_LOCK_TIMEOUT`].
+///
+/// `std::fs::File::lock` blocks with no built-in way to bound the wait, so this polls
+/// `try_lock` instead — the only portable way to get a timeout without a second thread
+/// or an extra dependency. On success the lock is held by `file` until it is dropped or
+/// explicitly unlocked; on timeout, nothing has been written and the caller gets an
+/// `Err` instead of `log()` either hanging forever or silently no-oping.
+fn lock_exclusive_with_timeout(file: &File, path: &Path) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| {
+                    format!("failed to lock audit log {} for appending", path.display())
+                });
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if start.elapsed() >= APPEND_LOCK_TIMEOUT {
+                    return Err(anyhow!(
+                        "timed out after {:?} waiting for the audit log lock on {} — \
+                         another simon process is appending to it. If that process \
+                         crashed while holding the lock, the OS releases it \
+                         automatically on exit, so retrying should succeed.",
+                        APPEND_LOCK_TIMEOUT,
+                        path.display()
+                    ));
+                }
+                std::thread::sleep(APPEND_LOCK_POLL_INTERVAL);
+            }
+        }
     }
 }
 
@@ -1439,5 +1566,215 @@ mod tests {
             "the chain itself is still fully verified"
         );
         assert_eq!(report.anchor, AnchorStatus::Unreadable);
+    }
+
+    // --- §3.5: cross-process append locking --------------------------------------
+
+    #[test]
+    fn two_loggers_interleaved_on_the_same_path_produce_a_valid_chain() {
+        // The core §3.5 bug, reproduced without needing real concurrency: two
+        // independent `AuditLogger`s on the same path each used to cache their own
+        // chain head. Before the fix, `b`'s second write still carried the
+        // `last_mac` it cached at `open()` (GENESIS) because nothing told it `a` had
+        // since appended, so its `prev` no longer matched the file's true tail and
+        // `verify()` reported a broken chain — indistinguishable from tampering. The
+        // fix makes every `log()` call re-read the true tail from disk under the
+        // append lock, so taking turns like this must now produce a chain `verify()`
+        // accepts regardless of which logger instance wrote most recently.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let key = vec![7u8; 32];
+
+        let mut a = AuditLogger::with_key(path.clone(), key.clone()).unwrap();
+        let mut b = AuditLogger::with_key(path.clone(), key.clone()).unwrap();
+
+        for i in 0..20 {
+            a.log("a.tick", &i.to_string()).unwrap();
+            b.log("b.tick", &i.to_string()).unwrap();
+        }
+
+        let verifier = AuditLogger::with_key(path, key).unwrap();
+        let report = verifier.verify().unwrap();
+        assert_eq!(report.entries, 40);
+        assert_eq!(report.anchor, AnchorStatus::Current);
+    }
+
+    #[test]
+    fn two_loggers_on_separate_threads_appending_concurrently_produce_a_valid_chain() {
+        // A stronger version of the test above: real OS-thread concurrency, so the
+        // interleaving is driven by the scheduler rather than program order. Threads
+        // still share the process's memory, so this alone cannot rule out a bug that
+        // only a separate address space would expose — see
+        // `two_real_processes_interleaved_appends_produce_a_valid_chain` below for
+        // that.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let key = vec![7u8; 32];
+        let n = 50;
+
+        let (path_a, key_a) = (path.clone(), key.clone());
+        let handle = std::thread::spawn(move || {
+            let mut logger = AuditLogger::with_key(path_a, key_a).unwrap();
+            for i in 0..n {
+                logger.log("a.tick", &i.to_string()).unwrap();
+            }
+        });
+
+        let mut b = AuditLogger::with_key(path.clone(), key.clone()).unwrap();
+        for i in 0..n {
+            b.log("b.tick", &i.to_string()).unwrap();
+        }
+        handle.join().unwrap();
+
+        let verifier = AuditLogger::with_key(path, key).unwrap();
+        let report = verifier.verify().unwrap();
+        assert_eq!(report.entries, n * 2);
+        assert_eq!(report.anchor, AnchorStatus::Current);
+    }
+
+    #[test]
+    fn append_lock_contention_times_out_visibly_instead_of_hanging_or_dropping_the_entry() {
+        // Simulates another process's in-progress `log()` call by holding the
+        // exclusive lock from outside any `AuditLogger`. Checks the contention
+        // design end to end: `log()` neither hangs forever nor silently no-ops — it
+        // returns an `Err` the caller can see — and nothing partial gets written
+        // while it waits.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+
+        let holder = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .unwrap();
+        holder.lock().unwrap();
+
+        let mut logger = AuditLogger::with_key(path.clone(), vec![7u8; 32]).unwrap();
+        let err = logger.log("a", "one").unwrap_err().to_string();
+        assert!(err.contains("timed out"), "unexpected error: {err}");
+
+        drop(holder); // release the stand-in lock
+
+        // The log must be otherwise completely unharmed by the failed attempt: no
+        // partial entry, no corrupted anchor.
+        logger.log("a", "one").unwrap();
+        let report = logger.verify().unwrap();
+        assert_eq!(
+            report.entries, 1,
+            "the timed-out attempt must not have written anything"
+        );
+        assert_eq!(report.anchor, AnchorStatus::Current);
+    }
+
+    /// Worker half of `two_real_processes_interleaved_appends_produce_a_valid_chain`.
+    /// Not a `#[test]` itself — invoked by re-execing the test binary (see that test)
+    /// with `SIMON_AUDIT_WORKER` set to `"<path>\n<key hex>\n<n>\n<label>"`. Appends
+    /// `n` entries to the shared log as fast as possible; a failure here panics,
+    /// which fails the child process's own libtest run and gives it a nonzero exit
+    /// code the parent test can detect.
+    fn run_audit_worker(spec: &str) {
+        let mut parts = spec.split('\n');
+        let path = PathBuf::from(parts.next().expect("worker spec missing path"));
+        let key_hex = parts.next().expect("worker spec missing key");
+        let n: usize = parts
+            .next()
+            .expect("worker spec missing n")
+            .parse()
+            .expect("worker spec n is not a number");
+        let label = parts.next().expect("worker spec missing label");
+
+        let key = unhex(key_hex).expect("worker spec key is not valid hex");
+        let mut logger = AuditLogger::with_key(path, key).expect("worker failed to open logger");
+        for i in 0..n {
+            logger
+                .log(&format!("{label}.entry"), &i.to_string())
+                .expect("worker log() call failed");
+        }
+    }
+
+    #[test]
+    fn two_real_processes_interleaved_appends_produce_a_valid_chain() {
+        // The finding as stated: "nothing stops a user running `simon chat` in two
+        // terminals against the same SIMON_DATA_DIR" — two independent OS processes,
+        // not threads, which share nothing but the file system and so can expose a
+        // race the in-process tests above cannot rule out on their own.
+        //
+        // There is no subprocess-spawning dependency in this crate, and adding one
+        // is out of scope (`Cargo.toml` may only change to add a *locking*
+        // dependency), so this gets a second real process the cheapest way
+        // available: it re-execs the test binary itself (`std::env::current_exe()`)
+        // filtered to just this one test (`--exact`), with `SIMON_AUDIT_WORKER` set.
+        // When that env var is present, this same function immediately diverts into
+        // `run_audit_worker` instead of acting as the test orchestrator — so the
+        // child process really is a second, independent audit writer in its own
+        // address space, not a simulated one.
+        if let Ok(spec) = std::env::var("SIMON_AUDIT_WORKER") {
+            run_audit_worker(&spec);
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let key = vec![7u8; 32];
+        let key_hex = hex(&key);
+        let n_per_worker = 40usize;
+
+        let exe = std::env::current_exe().expect("test binary must have a current_exe path");
+        let spawn = |label: &str| -> std::process::Child {
+            std::process::Command::new(&exe)
+                .arg("audit::tests::two_real_processes_interleaved_appends_produce_a_valid_chain")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(
+                    "SIMON_AUDIT_WORKER",
+                    format!(
+                        "{}\n{}\n{}\n{}",
+                        path.display(),
+                        key_hex,
+                        n_per_worker,
+                        label
+                    ),
+                )
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("failed to spawn worker process")
+        };
+
+        // Spawned back-to-back, not spawned-then-waited, so both processes are
+        // genuinely racing for the file lock rather than running one after the
+        // other.
+        let proc_a = spawn("a");
+        let proc_b = spawn("b");
+
+        let out_a = proc_a
+            .wait_with_output()
+            .expect("worker process a failed to run");
+        let out_b = proc_b
+            .wait_with_output()
+            .expect("worker process b failed to run");
+        assert!(
+            out_a.status.success(),
+            "worker a failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out_a.stdout),
+            String::from_utf8_lossy(&out_a.stderr)
+        );
+        assert!(
+            out_b.status.success(),
+            "worker b failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out_b.stdout),
+            String::from_utf8_lossy(&out_b.stderr)
+        );
+
+        let verifier = AuditLogger::with_key(path, key).unwrap();
+        let report = verifier.verify().expect(
+            "two real OS processes appending concurrently must produce a chain verify() \
+             accepts — this is the §3.5 finding itself: without locking, an interleaved \
+             write from a second process breaks the hash chain, indistinguishable from \
+             tampering",
+        );
+        assert_eq!(report.entries, n_per_worker * 2);
+        assert_eq!(report.anchor, AnchorStatus::Current);
     }
 }

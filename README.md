@@ -31,6 +31,7 @@ simon chat --vault           # persist the transcript, encrypted, across session
 simon chat --project ~/code/myapp  # confine models to this folder instead of cwd
 simon vault status           # vault path, failed attempts, idle window
 simon vault destroy          # permanently delete the vault (typed "yes" to confirm)
+simon vault prune --keep 500 # discard all but the newest 500 transcript lines
 simon audit                  # verify the audit log's hash chain
 simon audit --reset-anchor   # re-baseline tamper-evidence after deleting the log
 ```
@@ -143,6 +144,12 @@ one asking.
 
 ### Delegation
 
+**A delegation result leaves the machine too.** A local Ollama model can be asked to
+summarise a private document, and its reply is recorded in the ledger and then sent to
+whichever cloud provider is primary on the next turn. Delegating *to* a local model does
+not keep the answer local. Same mitigation, same caveat as skills above: `--classified`
+refuses every remote provider, and there is no narrower control.
+
 Every model receives a shared ledger in its system prompt listing the other reachable
 models, observed rate-limit budgets, and open tasks. A model delegates by emitting:
 
@@ -225,6 +232,15 @@ transcript gets a line when a delegation is dispatched and another when it finis
 with outcome and duration.
 
 ### Skills
+
+**A loaded skill leaves the machine.** Once a model emits `ACTION: read_skill(...)`, that
+file's contents sit in the ledger and go into the system prompt of *every* subsequent
+call for the rest of the session — including calls to Anthropic, OpenAI, OpenRouter or
+Groq if any of them is connected. Nothing about typing a skill name looks like sending a
+file to a cloud provider, so it is said here plainly: it is. This is what "shared
+blackboard" means and it is what makes the feature work, but it is a real change in where
+your data goes. `--classified` is the complete mitigation — it refuses every provider
+whose traffic leaves the machine, so nothing egresses — and it is currently the only one.
 
 The system prompt lists every file in the read-only skills directory, each with the
 one-line description parsed from its optional frontmatter:
@@ -395,6 +411,21 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   orchestrator writes many entries per turn. Deleting a log on purpose is legitimate,
   so `simon audit --reset-anchor` re-baselines the evidence, says plainly that it is
   discarding it, and records the reset in the new chain.
+- **Appends are serialised, so two `simon` processes cannot break the chain.** Each
+  logger used to cache the chain head in memory and append without coordination, so a
+  second process linked its entry to a `prev` that was no longer the file's tail — and
+  `simon audit` then reported the result as a broken chain, indistinguishable from
+  tampering. Appending now takes an exclusive advisory lock on the log and re-reads the
+  tail underneath it, because the race is between reading the head and writing the entry
+  that links to it, not in the write alone. The lock lives on the file descriptor, so the
+  kernel releases it if a process dies holding it; a lock *file* whose existence meant
+  "locked" would strand the log after a crash.
+- **The saved transcript is bounded.** It used to grow forever: every clean exit
+  re-derived a key and re-encrypted the entire history, every unlock decrypted all of it,
+  and the whole plaintext sat in memory that `mlockall` pins and so cannot be paged out.
+  It is now capped at 2,000 lines, oldest dropped first, with a marker line left in their
+  place so a shortened history is visible rather than silent. `simon vault prune --keep N`
+  does it deliberately.
 - **Failures are logged by kind, never by text.** The log's invariant is sizes, counts,
   and paths only — but every error path used to format the error's own message into it,
   and an error can carry a fragment of a provider's response or a path a model chose. A

@@ -27,6 +27,13 @@
 //! additional authenticated data, so tampering with them fails decryption. The attempt
 //! counter and timestamp are deliberately excluded from the AAD because they must be
 //! rewritten without re-encrypting the payload.
+//!
+//! The plaintext *payload* — the transcript itself — is capped at [`MAX_TRANSCRIPT_LINES`]
+//! lines by [`trim_transcript_to_cap`], applied by `main.rs` on every load and save.
+//! AUDIT-2026-07-30 §3.6: without a cap, every clean exit re-encrypts (and every
+//! unlock decrypts) a transcript that only ever grows, and the plaintext sits
+//! `mlockall`-pinned in memory for the process's whole life. See that function's doc
+//! comment for what gets dropped and how a truncated transcript stays valid.
 
 use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
@@ -40,6 +47,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::app::{Line, Speaker};
 use crate::security::LockedBuffer;
 
 const MAGIC: &[u8; 8] = b"MCVAULT1";
@@ -68,6 +76,25 @@ pub const MAX_IDLE_SECS: u64 = 24 * 60 * 60;
 /// unlock time. Four hours gives someone who works in a normal daily rhythm a real
 /// chance to notice before a missed day quietly puts the vault past its window.
 pub const IDLE_WARNING_THRESHOLD_SECS: u64 = 4 * 60 * 60;
+
+/// Upper bound on how many [`Line`]s a vaulted transcript keeps, enforced by
+/// [`trim_transcript_to_cap`].
+///
+/// Lines, not bytes or age. Bytes would make the limit depend on what happens to be
+/// said — one long pasted file makes a single `Line` enormous while a hundred short
+/// replies stay tiny — so two transcripts a user would call "the same length" could
+/// hit wildly different caps. Age (the audit's `--before <date>` suggestion) was
+/// rejected because `Line` (`src/app.rs`) carries no timestamp, and adding one is an
+/// `app.rs` change outside this fix's file ownership. Lines is what is actually on
+/// screen and what a user reasons about ("keep my last N exchanges"), and it is the
+/// unit the audit itself used ("cap retained lines").
+///
+/// 2,000 is generous for months of ordinary daily use — a busy day of chatting is a
+/// few dozen lines — while still bounding the cost that scales with transcript size:
+/// Argon2id plus AES-GCM over the whole payload on every clean exit, decryption of
+/// all of it on every unlock, and the `mlockall`-pinned plaintext this process holds
+/// for its entire life (§3.6).
+pub const MAX_TRANSCRIPT_LINES: usize = 2_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
@@ -432,6 +459,87 @@ fn random_salt() -> Vec<u8> {
     let mut salt = vec![0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
     salt
+}
+
+/// Marks the single system line [`trim_transcript_to_cap`] leaves behind in place of
+/// whatever it drops. Distinct enough that no ordinary transcript line is likely to
+/// collide with it, and recognised by [`take_leading_marker`] so a later trim updates
+/// the running total instead of stacking a second marker underneath the first.
+const DROP_MARKER_PREFIX: &str = "[vault] ";
+
+fn drop_marker(total_dropped: u64, cap: usize) -> Line {
+    Line {
+        speaker: Speaker::System,
+        text: format!(
+            "{DROP_MARKER_PREFIX}{total_dropped} earlier line(s) were dropped, oldest \
+             first, to keep this transcript within its {cap}-line vault cap. Run \
+             `simon vault prune` to manage this by hand."
+        ),
+    }
+}
+
+/// If `transcript` currently starts with a marker this module wrote, removes it and
+/// returns the total it recorded (0 otherwise). Removing it before counting is what
+/// keeps the marker itself from ever being treated as content subject to the cap.
+fn take_leading_marker(transcript: &mut Vec<Line>) -> u64 {
+    let is_marker = transcript.first().is_some_and(|l| {
+        matches!(l.speaker, Speaker::System) && l.text.starts_with(DROP_MARKER_PREFIX)
+    });
+    if !is_marker {
+        return 0;
+    }
+    let line = transcript.remove(0);
+    line.text[DROP_MARKER_PREFIX.len()..]
+        .split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Bounds `transcript` to at most `cap` lines, oldest first, in place. Returns how
+/// many lines were newly dropped *by this call* — 0 if `transcript` was already
+/// within `cap`, which callers use to decide whether to tell the user anything
+/// happened (see `vault_unlock_for_chat` and `vault_save_after_chat` in `main.rs`).
+///
+/// A transcript at exactly `cap` is left completely untouched, not merely trimmed to
+/// no visible effect: this boundary is deliberate, not incidental — the audit's
+/// mutation-testing pass found every `>` vs `>=` in this codebase untested before
+/// today, and getting this one backwards would either trim a transcript that fits or
+/// silently let one grow one line past the cap forever.
+///
+/// What gets dropped is replaced with a single [`drop_marker`] line rather than left
+/// unmarked, so a reloaded transcript reads as "N lines omitted, then the
+/// conversation continues" instead of jumping into the middle of an exchange with no
+/// indication anything is missing. Repeated calls (each save, each load) accumulate
+/// into that one marker's count via [`take_leading_marker`] rather than leaving a
+/// trail of markers behind — the marker's own line does not itself count against
+/// `cap`, so trimming to `cap` never produces `cap + 1` lines once the marker is
+/// added back.
+pub fn trim_transcript_to_cap(transcript: &mut Vec<Line>, cap: usize) -> u64 {
+    debug_assert!(
+        cap >= 1,
+        "a zero-line cap leaves no room for the marker itself"
+    );
+    let previously_dropped = take_leading_marker(transcript);
+
+    if transcript.len() <= cap {
+        // Nothing new to drop. Put back an unchanged marker if one was already
+        // there — its count is still true, it just isn't growing this time.
+        if previously_dropped > 0 {
+            transcript.insert(0, drop_marker(previously_dropped, cap));
+        }
+        return 0;
+    }
+
+    // One slot of `cap` is reserved for the marker itself, so content-plus-marker
+    // never exceeds `cap` once it's inserted below.
+    let keep = cap.saturating_sub(1);
+    let content_len = transcript.len();
+    let newly_dropped = (content_len - keep) as u64;
+    transcript.drain(0..content_len - keep);
+    let total_dropped = previously_dropped + newly_dropped;
+    transcript.insert(0, drop_marker(total_dropped, cap));
+    newly_dropped
 }
 
 /// Writes via a temporary file and rename so a crash, power loss, or full disk mid-write
@@ -885,8 +993,9 @@ mod tests {
         // The actual feature: the vault stores the TUI's `Vec<Line>` transcript, not
         // arbitrary bytes. Encrypting and decrypting could "work" while the JSON
         // underneath silently lost the model label on a `Speaker::Model` line, so
-        // this checks the full path, not just AES-GCM.
-        use crate::app::{Line, Speaker};
+        // this checks the full path, not just AES-GCM. (`Line`/`Speaker` come in via
+        // this module's own top-level `use crate::app::{Line, Speaker}` now that
+        // `trim_transcript_to_cap` needs them outside tests too.)
 
         let dir = tempfile::tempdir().unwrap();
         let vault = vault_in(&dir);
@@ -1122,6 +1231,180 @@ mod tests {
         assert_eq!(
             victim_mode, 0o644,
             "the symlink target's own permissions must be untouched"
+        );
+    }
+
+    /// `n` lines of throwaway conversation, oldest first — `Speaker::You` with the
+    /// index in the text so ordering/content can be asserted on directly.
+    fn lines(n: usize) -> Vec<Line> {
+        (0..n)
+            .map(|i| Line {
+                speaker: Speaker::You,
+                text: format!("line {i}"),
+            })
+            .collect()
+    }
+
+    /// `Line` has no `PartialEq` (nothing in the product needs it, and it lives in
+    /// `app.rs`, outside this fix's file ownership), so tests compare transcripts by
+    /// their rendered text — `Line::render` already folds in the speaker, so two
+    /// transcripts with identical rendered output are identical for every purpose
+    /// this module cares about.
+    fn rendered(transcript: &[Line]) -> Vec<String> {
+        transcript.iter().map(Line::render).collect()
+    }
+
+    #[test]
+    fn a_transcript_at_exactly_the_cap_is_left_completely_untouched() {
+        // The boundary the audit's mutation-testing note called out: this must be
+        // `>`, not `>=`, or a transcript that exactly fits gets needlessly mangled.
+        let mut transcript = lines(MAX_TRANSCRIPT_LINES);
+        let original = rendered(&transcript);
+
+        let dropped = trim_transcript_to_cap(&mut transcript, MAX_TRANSCRIPT_LINES);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            rendered(&transcript),
+            original,
+            "an at-cap transcript must be left completely unchanged"
+        );
+    }
+
+    #[test]
+    fn a_transcript_under_the_cap_is_left_alone_with_no_marker_inserted() {
+        let mut transcript = lines(MAX_TRANSCRIPT_LINES - 1);
+        let original = rendered(&transcript);
+
+        let dropped = trim_transcript_to_cap(&mut transcript, MAX_TRANSCRIPT_LINES);
+
+        assert_eq!(dropped, 0);
+        assert_eq!(rendered(&transcript), original);
+    }
+
+    #[test]
+    fn a_transcript_over_the_cap_is_trimmed_oldest_first_and_reloads_cleanly() {
+        let cap = 10;
+        let mut transcript = lines(15);
+
+        let dropped = trim_transcript_to_cap(&mut transcript, cap);
+
+        // 15 lines in, cap 10: the marker itself takes one of the 10 slots, so 9
+        // lines of content survive and 6 (not 5) are dropped.
+        assert_eq!(dropped, 6, "the marker occupies one of the cap's own slots");
+        assert_eq!(transcript.len(), cap, "trimmed to the cap, not below it");
+        // Line 0 is now the marker; the surviving content is the most recent lines,
+        // still in order, with nothing from the dropped head sneaking through.
+        assert!(matches!(transcript[0].speaker, Speaker::System));
+        assert!(transcript[0].text.starts_with(DROP_MARKER_PREFIX));
+        assert_eq!(transcript[1].text, "line 6", "oldest surviving line");
+        assert_eq!(transcript[9].text, "line 14", "newest line");
+
+        // "Reloads cleanly": the actual save/load path serializes this as JSON and
+        // hands it back to `App::transcript` unmodified — round-trip it the same way.
+        let payload = serde_json::to_vec(&transcript).unwrap();
+        let reloaded: Vec<Line> = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(rendered(&reloaded), rendered(&transcript));
+    }
+
+    #[test]
+    fn repeated_trims_accumulate_one_running_marker_instead_of_stacking_new_ones() {
+        let cap = 10;
+        let mut transcript = lines(15);
+        let first_dropped = trim_transcript_to_cap(&mut transcript, cap);
+        assert_eq!(first_dropped, 6);
+
+        // Simulate a session appending more lines to an already-trimmed transcript
+        // (exactly what happens between one `--vault` session's load and its own
+        // save), then trimming again.
+        for i in 15..23 {
+            transcript.push(Line {
+                speaker: Speaker::You,
+                text: format!("line {i}"),
+            });
+        }
+        let second_dropped = trim_transcript_to_cap(&mut transcript, cap);
+
+        assert_eq!(transcript.len(), cap);
+        // Exactly one marker, at the front, carrying the *cumulative* total — not
+        // just this call's delta — and not a second marker line stacked below it.
+        let markers = transcript
+            .iter()
+            .filter(|l| {
+                matches!(l.speaker, Speaker::System) && l.text.starts_with(DROP_MARKER_PREFIX)
+            })
+            .count();
+        assert_eq!(markers, 1, "must not stack a second marker line");
+        assert_eq!(
+            transcript[0].text,
+            drop_marker(first_dropped + second_dropped, cap).text,
+            "the marker must report the running total, not just the latest delta"
+        );
+    }
+
+    #[test]
+    fn a_transcript_back_under_cap_keeps_its_existing_marker_and_count_unchanged() {
+        // The boundary the audit's mutation-testing pass found untested: once
+        // `take_leading_marker` pulls the marker off the front, `previously_dropped
+        // > 0` is what decides whether it goes back on. Get this backwards (`< 0`,
+        // always false for a `u64`) and a transcript that already carries a marker
+        // but happens to be at/under `cap` after the marker's own removal loses that
+        // marker — and the record of everything it dropped earlier — silently.
+        let cap = 10;
+        let mut transcript = lines(15);
+        let first_dropped = trim_transcript_to_cap(&mut transcript, cap);
+        assert_eq!(first_dropped, 6);
+        assert_eq!(transcript.len(), cap);
+
+        // Drop content lines (never index 0, the marker) until what remains, plus
+        // the marker, is back under `cap` — simulating a vault that was pruned by
+        // hand after having already been auto-trimmed once.
+        while transcript.len() > 4 {
+            transcript.remove(1);
+        }
+        assert!(
+            matches!(transcript[0].speaker, Speaker::System)
+                && transcript[0].text.starts_with(DROP_MARKER_PREFIX),
+            "fixture guard: the marker must still be present before the call under test"
+        );
+
+        let second_dropped = trim_transcript_to_cap(&mut transcript, cap);
+
+        assert_eq!(
+            second_dropped, 0,
+            "already under cap; this call must not drop anything new"
+        );
+        assert!(
+            matches!(transcript[0].speaker, Speaker::System)
+                && transcript[0].text.starts_with(DROP_MARKER_PREFIX),
+            "the existing marker must be preserved, not silently dropped"
+        );
+        assert_eq!(
+            transcript[0].text,
+            drop_marker(first_dropped, cap).text,
+            "the preserved marker must still report the original total, unchanged"
+        );
+    }
+
+    #[test]
+    fn take_leading_marker_ignores_a_system_line_that_only_resembles_one() {
+        // A `Speaker::System` line that merely starts with similar-looking text but
+        // not the exact marker prefix must not be misread as a marker and eaten.
+        let mut transcript = vec![
+            Line {
+                speaker: Speaker::System,
+                text: "vault status: everything is fine".into(),
+            },
+            Line {
+                speaker: Speaker::You,
+                text: "hello".into(),
+            },
+        ];
+        assert_eq!(take_leading_marker(&mut transcript), 0);
+        assert_eq!(
+            transcript.len(),
+            2,
+            "the unrelated system line must survive"
         );
     }
 }

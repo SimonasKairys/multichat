@@ -146,6 +146,18 @@ enum VaultCommand {
     Status,
     /// Permanently delete the vault file after a typed confirmation.
     Destroy,
+    /// Drop the oldest lines from an existing vault down to a limit, on demand.
+    ///
+    /// Independent of the automatic cap `simon chat --vault` already applies to
+    /// every clean exit (see `vault::MAX_TRANSCRIPT_LINES`) — this is for a user who
+    /// wants to reclaim space or discard old history right now rather than wait for
+    /// their next chat session. AUDIT-2026-07-30 §3.6 asked for exactly this.
+    Prune {
+        /// How many of the most recent lines to keep. Defaults to the same cap
+        /// applied automatically on save.
+        #[arg(long)]
+        keep: Option<usize>,
+    },
 }
 
 #[tokio::main]
@@ -495,6 +507,27 @@ struct VaultSession {
     password: SecretString,
 }
 
+/// Decides whether the "vault cap" notice should print, and what it says, from the
+/// drop count alone. Pulled out of both call sites (load-time in
+/// `vault_unlock_for_chat`, save-time in `vault_save_after_chat`) precisely because a
+/// `dropped > 0` inlined at each site is untestable without going through a real
+/// vault unlock or an interactive save — this way the comparison itself, the one
+/// thing a mutation can flip to make the tool lie about whether it touched anything,
+/// is pinned by a direct test. `subject`/`suffix` carry the two call sites' different
+/// wording ("the saved transcript held" at load time vs. "this session's transcript
+/// passed … before saving" at save time); everything else about the message is
+/// identical.
+fn cap_drop_notice(dropped: u64, cap: usize, subject: &str, suffix: &str) -> Option<String> {
+    if dropped == 0 {
+        return None;
+    }
+    Some(format!(
+        "Notice: {subject} more than the {cap}-line vault cap, so the oldest \
+         {dropped} line(s) were dropped (oldest first){suffix}; a marker line was \
+         left in their place. Run `simon vault prune` to manage this by hand."
+    ))
+}
+
 /// Prompts for and applies a vault password, restoring prior history into `app` when
 /// there is any to restore. Called before the TUI takes over the terminal — see the
 /// comment at its call site in `chat`.
@@ -575,6 +608,24 @@ fn vault_unlock_for_chat(paths: &Paths, app: &mut App) -> Result<VaultSession> {
                 }
                 match serde_json::from_slice::<Vec<Line>>(&bytes) {
                     Ok(mut restored) => {
+                        // Capped here, before merging in this session's fresh banner
+                        // lines, so a vault that already exceeds the cap (an older
+                        // build's file, or the cap having since been lowered) is
+                        // trimmed on the way in rather than only at the next save —
+                        // and the just-created banner lines are never at risk of
+                        // being counted as "old" and dropped themselves.
+                        let dropped = crate::vault::trim_transcript_to_cap(
+                            &mut restored,
+                            crate::vault::MAX_TRANSCRIPT_LINES,
+                        );
+                        if let Some(notice) = cap_drop_notice(
+                            dropped,
+                            crate::vault::MAX_TRANSCRIPT_LINES,
+                            "the saved transcript held",
+                            "",
+                        ) {
+                            println!("{notice}");
+                        }
                         // Restored history first, then the fresh "commander: …" /
                         // "swarm: …" banner `App::new` already seeded, so the
                         // transcript reads as "prior session(s) ... new session
@@ -661,6 +712,25 @@ fn prompt_new_vault_password() -> Result<SecretString> {
 /// Serializes `transcript` and saves it once. Called exactly once, at the end of a
 /// chat session — see the "save once at clean exit" comment in `chat`.
 fn vault_save_after_chat(paths: &Paths, session: VaultSession, transcript: &[Line]) -> Result<()> {
+    // Capped on the way out, every save — this (not the load-time cap above) is what
+    // actually bounds the vault's steady-state growth, since a session's own new
+    // lines are exactly what pushes an already-capped transcript back over the line.
+    // Cloned rather than trimmed in place: `transcript` is a borrow of the live
+    // `App` the caller still owns (see the call site in `chat`), and this function
+    // must not mutate what's on screen out from under it.
+    let mut transcript = transcript.to_vec();
+    let dropped =
+        crate::vault::trim_transcript_to_cap(&mut transcript, crate::vault::MAX_TRANSCRIPT_LINES);
+    if let Some(notice) = cap_drop_notice(
+        dropped,
+        crate::vault::MAX_TRANSCRIPT_LINES,
+        "this session's transcript passed",
+        " before saving",
+    ) {
+        println!("{notice}");
+    }
+    let transcript = transcript.as_slice();
+
     let payload = serde_json::to_vec(transcript)
         .context("failed to serialize the transcript for the vault")?;
     session.vault.save(&payload, &session.password)?;
@@ -700,6 +770,7 @@ fn vault_command(paths: &Paths, action: VaultCommand) -> Result<()> {
     match action {
         VaultCommand::Status => vault_status(&vault),
         VaultCommand::Destroy => vault_destroy(paths, &vault),
+        VaultCommand::Prune { keep } => vault_prune(paths, &vault, keep),
     }
 }
 
@@ -793,9 +864,194 @@ fn vault_destroy(paths: &Paths, vault: &EncryptedVault) -> Result<()> {
     Ok(())
 }
 
+/// What `vault_prune` should do before it ever touches the terminal or the vault
+/// file's contents, decided from two plain values: whether a vault file exists, and
+/// the `--keep` the caller asked for. Split out of `vault_prune` itself so its two
+/// guards — "no vault to prune" and "`--keep` must be positive" — are pinned by a
+/// direct test. Inlined, both were only reachable by way of the interactive password
+/// prompt a few lines below them, which a test cannot drive without a real terminal;
+/// a mutation to either comparison would otherwise ship unnoticed (see the module's
+/// audit note on `trim_transcript_to_cap` for why that shape is exactly the risk).
+#[derive(Debug, PartialEq, Eq)]
+enum PruneStart {
+    /// No vault file; nothing to do, and not an error.
+    NoVault,
+    /// `--keep` was 0; refused before reading anything.
+    KeepMustBePositive,
+    /// Clear to proceed, with `--keep` resolved to the value actually in effect.
+    Proceed(usize),
+}
+
+fn plan_prune_start(vault_exists: bool, keep: Option<usize>) -> PruneStart {
+    if !vault_exists {
+        return PruneStart::NoVault;
+    }
+    let keep = keep.unwrap_or(crate::vault::MAX_TRANSCRIPT_LINES);
+    if keep == 0 {
+        return PruneStart::KeepMustBePositive;
+    }
+    PruneStart::Proceed(keep)
+}
+
+/// What `vault_prune` should tell the user once the transcript is decrypted and
+/// `keep` is known, decided from the drop count `trim_transcript_to_cap` already
+/// computed on a preview clone. Split out for the same reason as `plan_prune_start`
+/// above: `dropped == 0` gates whether a real, destructive confirmation prompt
+/// appears at all, and that comparison needs to be reachable by a test without an
+/// encrypted vault and a typed password in the way.
+#[derive(Debug, PartialEq, Eq)]
+enum PrunePlan {
+    /// Already at or under `keep`; nothing would be discarded.
+    NothingToDo(String),
+    /// Discarding `dropped` of `total` lines requires confirmation; here is the
+    /// notice to show before asking for it.
+    WouldDiscard(String),
+}
+
+fn plan_prune_discard(dropped: u64, total: usize, keep: usize) -> PrunePlan {
+    if dropped == 0 {
+        return PrunePlan::NothingToDo(format!(
+            "Transcript has {total} line(s), at or under the requested {keep}; nothing to \
+             prune."
+        ));
+    }
+    PrunePlan::WouldDiscard(format!(
+        "This will permanently discard the oldest {dropped} of {total} line(s), oldest \
+         first, keeping the most recent {keep}. This cannot be undone."
+    ))
+}
+
+/// Whether a line typed at `vault_prune`'s confirmation prompt should be treated as
+/// a decline — the default for anything that isn't an exact, trimmed `"yes"`. Named
+/// for what it returns (a decline) rather than as `is_confirmed`, so the call site
+/// reads as an early-exit guard (`if confirmation_declined(...) { return }`) without
+/// needing its own `!`, which is exactly the operator a mutation flipped unnoticed
+/// before this comparison had a test of its own.
+fn confirmation_declined(raw: &str) -> bool {
+    raw.trim() != "yes"
+}
+
+/// Drops the oldest lines from an existing vault down to `keep` (or
+/// [`crate::vault::MAX_TRANSCRIPT_LINES`] if unspecified), independent of the
+/// automatic cap `vault_save_after_chat` already applies on every clean `--vault`
+/// exit. AUDIT-2026-07-30 §3.6 asked for exactly this alongside the automatic cap —
+/// for a user who wants to reclaim space or discard old history right now, not on
+/// their next chat session.
+///
+/// Requires the password: unlike `vault_status`/`vault_destroy`, which never decrypt
+/// anything, pruning has to read the transcript to know what it would discard, then
+/// rewrite the encrypted payload. Confirmation follows `vault_destroy`'s pattern —
+/// state exactly what will be discarded, then require a typed `yes` — because the
+/// dropped lines are exactly as unrecoverable as a full destroy, there are just fewer
+/// of them.
+fn vault_prune(paths: &Paths, vault: &EncryptedVault, keep: Option<usize>) -> Result<()> {
+    let keep = match plan_prune_start(vault.exists(), keep) {
+        PruneStart::NoVault => {
+            println!(
+                "No vault exists at {}; nothing to prune.",
+                vault.path().display()
+            );
+            return Ok(());
+        }
+        PruneStart::KeepMustBePositive => {
+            bail!(
+                "--keep must be at least 1 (a 0-line vault is what `simon vault destroy` is for)"
+            );
+        }
+        PruneStart::Proceed(keep) => keep,
+    };
+
+    let password = SecretString::from(
+        rpassword::prompt_password("Vault password (input hidden): ")
+            .context("failed to read the vault password from the terminal")?,
+    );
+    let bytes = match vault.load(&password) {
+        Ok(bytes) => bytes,
+        // Single attempt, not the retry loop `vault_unlock_for_chat` uses: this is a
+        // one-shot admin command, not the start of a session, so a wrong password
+        // just means "run it again" rather than needing its own loop.
+        Err(VaultError::WrongPassword { remaining }) => {
+            bail!("wrong password ({remaining} attempt(s) left before the vault self-destructs)")
+        }
+        Err(VaultError::Destroyed(reason)) => bail!("vault destroyed: {reason}"),
+        Err(VaultError::Corrupt(msg)) => bail!("vault file is corrupt: {msg}"),
+        Err(VaultError::Missing) => bail!("vault file disappeared before it could be read"),
+    };
+    let transcript: Vec<Line> = serde_json::from_slice(&bytes).context(
+        "the saved transcript could not be parsed; refusing to prune a payload this build \
+         cannot read back correctly",
+    )?;
+    let total = transcript.len();
+
+    // Preview on a clone: state exactly what will be discarded *before* touching
+    // anything on disk, and only ever write back the real thing once confirmed.
+    let mut preview = transcript.clone();
+    let dropped = crate::vault::trim_transcript_to_cap(&mut preview, keep);
+    let notice = match plan_prune_discard(dropped, total, keep) {
+        PrunePlan::NothingToDo(msg) => {
+            println!("{msg}");
+            return Ok(());
+        }
+        PrunePlan::WouldDiscard(msg) => msg,
+    };
+
+    println!("{notice}");
+    print!("Type `yes` to confirm: ");
+    std::io::Write::flush(&mut std::io::stdout()).context("failed to flush stdout")?;
+    let mut confirmation = String::new();
+    std::io::stdin()
+        .read_line(&mut confirmation)
+        .context("failed to read the confirmation from the terminal")?;
+    if confirmation_declined(&confirmation) {
+        println!("Not confirmed; leaving the vault in place.");
+        return Ok(());
+    }
+
+    let payload = serde_json::to_vec(&preview)
+        .context("failed to serialize the pruned transcript for the vault")?;
+    vault.save(&payload, &password)?;
+    println!("Pruned. Vault now holds {} line(s).", preview.len());
+    // Best-effort, but surfaced — same reasoning as the equivalent audit calls in
+    // `vault_destroy` and `vault_save_after_chat`: the prune itself has already
+    // happened and must not be undone by an audit hiccup, but a corrupt-key failure
+    // here (§3.5) is exactly the kind of thing a user needs to be told about.
+    match AuditLogger::open(paths.audit_log.clone()) {
+        Ok(mut audit) => {
+            if let Err(e) = audit.log(
+                "vault.pruned",
+                &format!("kept={keep} dropped={dropped} total_before={total}"),
+            ) {
+                eprintln!("[audit] failed to record vault.pruned: {e}");
+            }
+        }
+        Err(e) => eprintln!("[audit] failed to open the audit log to record vault.pruned: {e}"),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::Speaker;
+
+    #[test]
+    fn vault_prune_parses_with_and_without_an_explicit_keep_count() {
+        let cli = Cli::parse_from(["simon", "vault", "prune"]);
+        match cli.command {
+            Some(Commands::Vault {
+                action: VaultCommand::Prune { keep },
+            }) => assert_eq!(keep, None, "unset --keep must default inside vault_prune"),
+            _ => panic!("expected the Vault Prune subcommand to have been parsed"),
+        }
+
+        let cli = Cli::parse_from(["simon", "vault", "prune", "--keep", "50"]);
+        match cli.command {
+            Some(Commands::Vault {
+                action: VaultCommand::Prune { keep },
+            }) => assert_eq!(keep, Some(50)),
+            _ => panic!("expected the Vault Prune subcommand to have been parsed"),
+        }
+    }
 
     #[test]
     fn classified_and_vault_flags_combine_on_the_chat_subcommand() {
@@ -892,6 +1148,165 @@ mod tests {
         assert_eq!(
             resolve_canonical_service("MyGateway", &settings),
             "MyGateway"
+        );
+    }
+
+    #[test]
+    fn cap_drop_notice_is_silent_iff_nothing_was_dropped() {
+        assert_eq!(
+            cap_drop_notice(0, 2_000, "the saved transcript held", ""),
+            None,
+            "a `dropped` of 0 must not produce a notice at all"
+        );
+
+        let notice = cap_drop_notice(3, 2_000, "the saved transcript held", "")
+            .expect("a nonzero `dropped` must produce a notice");
+        assert!(
+            notice.contains("the saved transcript held") && notice.contains("2000"),
+            "notice must name the subject and the cap: {notice}"
+        );
+        assert!(
+            notice.contains("oldest 3 line(s)"),
+            "notice must name the exact drop count: {notice}"
+        );
+
+        // The two real call sites differ only in wording, carried through untouched.
+        let save_notice = cap_drop_notice(
+            1,
+            2_000,
+            "this session's transcript passed",
+            " before saving",
+        )
+        .expect("a nonzero `dropped` must produce a notice");
+        assert!(save_notice.contains("before saving"), "{save_notice}");
+    }
+
+    #[test]
+    fn plan_prune_start_refuses_before_touching_a_missing_vault_or_a_zero_keep() {
+        assert_eq!(plan_prune_start(false, None), PruneStart::NoVault);
+        // A missing vault is checked first: an absurd `--keep` on a vault that isn't
+        // even there must not surface as the wrong error.
+        assert_eq!(plan_prune_start(false, Some(0)), PruneStart::NoVault);
+
+        assert_eq!(
+            plan_prune_start(true, Some(0)),
+            PruneStart::KeepMustBePositive
+        );
+        assert_eq!(
+            plan_prune_start(true, None),
+            PruneStart::Proceed(crate::vault::MAX_TRANSCRIPT_LINES),
+            "an unset --keep must default to the same cap the automatic trim uses"
+        );
+        assert_eq!(plan_prune_start(true, Some(7)), PruneStart::Proceed(7));
+    }
+
+    #[test]
+    fn plan_prune_discard_is_a_no_op_notice_exactly_when_nothing_would_drop() {
+        match plan_prune_discard(0, 10, 10) {
+            PrunePlan::NothingToDo(msg) => assert!(msg.contains("10")),
+            other => panic!("expected NothingToDo, got {other:?}"),
+        }
+
+        match plan_prune_discard(3, 10, 7) {
+            PrunePlan::WouldDiscard(msg) => {
+                assert!(msg.contains("oldest 3 of 10"), "{msg}");
+                assert!(msg.contains("most recent 7"), "{msg}");
+            }
+            other => panic!("expected WouldDiscard, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirmation_declined_requires_an_exact_trimmed_yes() {
+        assert!(
+            !confirmation_declined("yes\n"),
+            "trailing newline must be trimmed"
+        );
+        assert!(!confirmation_declined("yes"));
+        assert!(confirmation_declined("no\n"));
+        assert!(
+            confirmation_declined(""),
+            "an empty line must not count as consent"
+        );
+        assert!(
+            confirmation_declined("Yes"),
+            "must be exact, not case-folded — a stray typo must not confirm a destructive prune"
+        );
+    }
+
+    #[test]
+    fn vault_save_after_chat_actually_persists_the_transcript_for_reload() {
+        // The stub this guards against (`vault_save_after_chat -> Ok(())`) would
+        // report success without writing anything — no test of a helper function can
+        // catch that, since the helper never runs. This drives the real function and
+        // reads the encrypted file back to confirm the save actually happened.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(dir.path().to_path_buf()).unwrap();
+        let vault = EncryptedVault::new(paths.vault_file.clone());
+        assert!(
+            !vault.exists(),
+            "fixture guard: nothing must exist before the save under test"
+        );
+        let password = SecretString::from("correct horse battery staple".to_string());
+        let session = VaultSession {
+            vault,
+            password: password.clone(),
+        };
+
+        let transcript = vec![
+            Line {
+                speaker: Speaker::You,
+                text: "hello".into(),
+            },
+            Line {
+                speaker: Speaker::Model("anthropic:claude-opus-5".into()),
+                text: "hi there".into(),
+            },
+        ];
+
+        vault_save_after_chat(&paths, session, &transcript).expect("save must succeed");
+
+        let reloaded_vault = EncryptedVault::new(paths.vault_file.clone());
+        assert!(
+            reloaded_vault.exists(),
+            "the save must actually have created the vault file"
+        );
+        let bytes = reloaded_vault
+            .load(&password)
+            .expect("the saved vault must decrypt with the same password");
+        let restored: Vec<Line> =
+            serde_json::from_slice(&bytes).expect("the saved payload must be valid JSON");
+        assert_eq!(
+            restored.iter().map(Line::render).collect::<Vec<_>>(),
+            transcript.iter().map(Line::render).collect::<Vec<_>>(),
+            "the transcript actually written must match what was passed in"
+        );
+    }
+
+    #[test]
+    fn vault_command_dispatches_to_prune_and_propagates_its_zero_keep_refusal() {
+        // Exercises the real `vault_command` dispatcher through to `vault_prune`'s
+        // `--keep 0` guard, which fires before any password prompt or confirmation
+        // read — the only branch reachable deterministically in a test, since
+        // neither `rpassword` nor stdin can be faked here. A stub of either
+        // `vault_command` or `vault_prune` to `-> Ok(())` would return success where
+        // the real dispatch must bail.
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(dir.path().to_path_buf()).unwrap();
+        let vault = EncryptedVault::new(paths.vault_file.clone());
+        vault
+            .save(b"placeholder", &SecretString::from("pw".to_string()))
+            .unwrap();
+        assert!(
+            vault.exists(),
+            "fixture guard: the vault must exist for `--keep 0` to be what's tested"
+        );
+
+        let err = vault_command(&paths, VaultCommand::Prune { keep: Some(0) })
+            .expect_err("--keep 0 must be refused, not silently accepted");
+        assert!(
+            err.to_string().contains("--keep must be at least 1"),
+            "unexpected error: {err}"
         );
     }
 }

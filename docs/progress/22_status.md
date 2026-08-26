@@ -4,8 +4,8 @@
 "Security posture", those are correct.
 
 **Shipped**: provider routing, keyring keys (never argv), vault salt + wipe policy,
-anchored keyed-MAC audit chain, bounded system prompt, `--classified`, Linux
-`mlockall` + per-alloc locking, skills traversal guard, SOCKS5, Ollama discovery,
-delegation, CI.
+capped transcript, locked + anchored MAC audit chain, capped system prompt,
+`--classified`, Linux `mlockall`, skills guard, SOCKS5, Ollama discovery, delegation,
+CI + mutants.
 
-**Not implemented**: seccomp, TLS pinning, process-wide locking off Linux, clipboard clear.
+**Not implemented**: seccomp, TLS pinning, process-wide lock off Linux, clipboard.

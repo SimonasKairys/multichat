@@ -3885,19 +3885,30 @@ mod tests {
         std::fs::create_dir(project.path().join(".git")).unwrap();
         std::fs::write(project.path().join(".git/HEAD"), "ref: refs/heads/main").unwrap();
         let (event_tx, mut event_rx) = mpsc::channel(16);
-        // Nothing is ever sent on this channel: if the code asked, it would block
-        // forever rather than pass.
+        // Nothing is ever sent on this channel, so asking would block on `recv`.
         let (_dec_tx, dec_rx) = mpsc::channel(1);
         let mut orch = orch_with_write_gate(project.path(), &paths, event_tx, dec_rx);
 
-        orch.run_file_writes(
-            "ollama:llama3",
-            vec![crate::swarm::FileWrite {
-                path: ".git/HEAD".into(),
-                content: "ref: refs/heads/pwned".into(),
-            }],
+        // The timeout is the assertion. Without it, a regression that made this code
+        // ask the user did not fail the test — it hung the whole test binary, because
+        // the harness cannot exit while a spawned test thread is parked on `recv`. The
+        // rest of the suite reported its failures in under a second and the process
+        // still sat there. `cargo mutants` found it: gutting either `Workspace::precheck`
+        // or `Workspace::reject_git_writes` was reported as a TIMEOUT rather than a
+        // caught mutant, which is the worse outcome — the next person to meet a hanging
+        // suite raises the limit instead of asking why it hangs.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            orch.run_file_writes(
+                "ollama:llama3",
+                vec![crate::swarm::FileWrite {
+                    path: ".git/HEAD".into(),
+                    content: "ref: refs/heads/pwned".into(),
+                }],
+            ),
         )
-        .await;
+        .await
+        .expect("a doomed write must be refused without asking, not block on the gate");
 
         assert_eq!(
             std::fs::read_to_string(project.path().join(".git/HEAD")).unwrap(),

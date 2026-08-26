@@ -288,6 +288,30 @@ impl Credentials {
             .with_context(|| format!("failed to open keyring entry for {service}"))
     }
 
+    // `get` and `delete` cross into the OS keyring (Keychain, Credential Manager,
+    // Secret Service) unconditionally — every line of each needs a real backend, and
+    // none of CI's three platforms has one available: Secret Service needs a D-Bus
+    // session and an unlocked collection that headless Linux runners don't provide,
+    // and the macOS/Windows runners are equally headless. A test that opened a real
+    // `Entry` would either hang waiting for a prompt or fail with a backend error
+    // everywhere it matters, so it would never actually run the assertions it exists
+    // to make. Rather than let that show up as a silently-green suite, both are
+    // marked `#[mutants::skip]` so `cargo mutants` reports them as skipped, not
+    // missed. What's untested as a result:
+    // *   `get`: that `NoEntry` maps to `Ok(None)` (not an error) and that any other
+    //     keyring error is wrapped and returned as `Err`, distinct from "not set".
+    // *   `delete`: that `NoEntry` is treated as success (delete is idempotent) and
+    //     that any other keyring error still propagates as `Err`.
+    // `set` is deliberately *not* skipped: its empty-secret guard runs and returns
+    // before `Self::entry` is ever called, so `set("x", "")` never touches a
+    // backend and is covered by `setting_an_empty_credential_is_rejected_before_any_
+    // keyring_call` below. What that test does not reach — a non-empty secret
+    // actually being written through to `set_password` — is untested for the same
+    // reason as `get`/`delete` above.
+    // If a real keyring ever becomes available in CI (e.g. via a Secret Service
+    // stub), these should gain a live test and lose the attribute rather than the
+    // two states silently drifting apart.
+    #[cfg_attr(test, mutants::skip)]
     pub fn get(service: &str) -> Result<Option<SecretString>> {
         match Self::entry(service)?.get_password() {
             Ok(secret) => Ok(Some(SecretString::from(secret))),
@@ -309,6 +333,7 @@ impl Credentials {
             .with_context(|| format!("failed to store {service} credential in keyring"))
     }
 
+    #[cfg_attr(test, mutants::skip)]
     pub fn delete(service: &str) -> Result<()> {
         match Self::entry(service)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -335,6 +360,70 @@ mod tests {
         assert_eq!(openai.api, Api::OpenAiCompatible);
         assert_ne!(anthropic.base_url, openai.base_url);
         assert!(anthropic.base_url.contains("anthropic.com"));
+    }
+
+    #[test]
+    fn every_builtin_provider_is_pinned_to_its_own_wire_format() {
+        // Mutation-testing regression: deleting a whole match arm (e.g. "openrouter")
+        // makes that provider fall through to the `_ => None` catch-all, which
+        // `unknown_provider_has_no_builtin_endpoint` cannot distinguish from a
+        // genuinely unknown provider. Pinning every arm's exact base_url and
+        // default_model (not just "is Some") is what catches a deleted or
+        // mis-copied arm rather than just a missing one.
+        let cases = [
+            (
+                "anthropic",
+                Api::Anthropic,
+                "https://api.anthropic.com",
+                "claude-opus-5",
+            ),
+            (
+                "claude",
+                Api::Anthropic,
+                "https://api.anthropic.com",
+                "claude-opus-5",
+            ),
+            (
+                "openai",
+                Api::OpenAiCompatible,
+                "https://api.openai.com/v1",
+                "gpt-4o",
+            ),
+            (
+                "google",
+                Api::OpenAiCompatible,
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "gemini-2.5-pro",
+            ),
+            (
+                "gemini",
+                Api::OpenAiCompatible,
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+                "gemini-2.5-pro",
+            ),
+            (
+                "openrouter",
+                Api::OpenAiCompatible,
+                "https://openrouter.ai/api/v1",
+                "openai/gpt-4o",
+            ),
+            (
+                "groq",
+                Api::OpenAiCompatible,
+                "https://api.groq.com/openai/v1",
+                "llama-3.3-70b-versatile",
+            ),
+        ];
+        for (provider, api, base_url, default_model) in cases {
+            let endpoint = builtin_endpoint(provider)
+                .unwrap_or_else(|| panic!("expected a builtin endpoint for {provider}"));
+            assert_eq!(endpoint.api, api, "wrong Api dialect for {provider}");
+            assert_eq!(endpoint.base_url, base_url, "wrong base_url for {provider}");
+            assert_eq!(
+                endpoint.default_model, default_model,
+                "wrong default_model for {provider}"
+            );
+        }
     }
 
     #[test]
@@ -394,6 +483,34 @@ mod tests {
         assert_eq!(
             Settings::load(&paths).unwrap().default_provider,
             "anthropic"
+        );
+    }
+
+    #[test]
+    fn a_non_notfound_read_error_is_not_swallowed_as_defaults() {
+        // Mutation-testing regression: replacing the `NotFound` guard with `true`
+        // makes `Settings::load` treat *any* read failure as "no config file yet"
+        // and silently hand back defaults. A permission error or a corrupt-directory
+        // error would then look identical to a fresh install and quietly discard the
+        // user's real settings instead of surfacing the problem. `settings_round_trip
+        // _through_disk` already covers the genuine "file absent" case; this covers
+        // the other branch — an error that is present but not `NotFound` must
+        // propagate as an `Err`, not fall back to `Self::default()`.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+
+        // Put a directory where the config file is expected. Reading a directory as a
+        // file fails on every platform, but with a `io::Error` whose kind is not
+        // `NotFound` (the path plainly exists) — exactly the class of error the guard
+        // exists to distinguish from a missing file.
+        fs::create_dir(&paths.config_file).unwrap();
+
+        let err = Settings::load(&paths).expect_err(
+            "a directory in place of the config file must not be read as a fresh install",
+        );
+        assert!(
+            err.to_string().contains("failed to read"),
+            "expected the read-failure context, got: {err:#}"
         );
     }
 
@@ -492,6 +609,66 @@ mod tests {
         assert!(settings.connections.is_empty());
         assert!(settings.commander.is_none());
         assert_eq!(settings.ollama_host, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn settings_endpoint_prefers_custom_over_builtin_and_falls_back_to_it() {
+        // Mutation-testing regression: `Settings::endpoint -> None` for every call is
+        // undetected unless something checks it actually resolves both paths it
+        // promises — the user's own override, and falling back to the builtin table.
+        let mut settings = Settings::default();
+
+        // No override and no matching builtin: None.
+        assert!(settings.endpoint("definitely-not-a-provider").is_none());
+
+        // No override: falls back to the builtin table.
+        let builtin = settings.endpoint("openai").expect("openai is a builtin");
+        assert_eq!(builtin.base_url, "https://api.openai.com/v1");
+
+        // An override for a name that also has a builtin must win over the builtin,
+        // not merely add to it.
+        settings.custom_endpoints.insert(
+            "openai".into(),
+            CloudEndpoint {
+                api: Api::OpenAiCompatible,
+                base_url: "https://my-openai-gateway.example".into(),
+                default_model: "custom-model".into(),
+            },
+        );
+        let overridden = settings.endpoint("openai").unwrap();
+        assert_eq!(overridden.base_url, "https://my-openai-gateway.example");
+        assert_eq!(overridden.default_model, "custom-model");
+
+        // An override for a name with no builtin counterpart must still resolve.
+        settings.custom_endpoints.insert(
+            "my-gateway".into(),
+            CloudEndpoint {
+                api: Api::OpenAiCompatible,
+                base_url: "https://gateway.example".into(),
+                default_model: "gateway-model".into(),
+            },
+        );
+        assert_eq!(
+            settings.endpoint("my-gateway").unwrap().base_url,
+            "https://gateway.example"
+        );
+    }
+
+    #[test]
+    fn setting_an_empty_credential_is_rejected_before_any_keyring_call() {
+        // Mutation-testing regression: `Credentials::set -> Ok(())` unconditionally
+        // is undetected unless something calls it and checks the result. This can be
+        // checked without a real OS keyring because the empty-secret guard returns
+        // before `Self::entry` (and therefore any backend call) ever runs — see the
+        // comment on `Credentials::get`/`delete` for why the rest of `set` is not
+        // covered here.
+        let err = Credentials::set("simon-test-service", "   ")
+            .expect_err("an empty (or whitespace-only) secret must be rejected");
+        assert!(
+            err.to_string()
+                .contains("refusing to store an empty credential"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]

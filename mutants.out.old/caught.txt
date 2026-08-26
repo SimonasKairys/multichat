@@ -1,3 +1,0 @@
-src/audit.rs:870:5: replace unhex -> Result<Vec<u8>> with Ok(vec![])
-src/audit.rs:870:5: replace unhex -> Result<Vec<u8>> with Ok(vec![1])
-src/audit.rs:870:5: replace unhex -> Result<Vec<u8>> with Ok(vec![0])

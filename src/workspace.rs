@@ -433,6 +433,129 @@ mod tests {
         assert!(!w.root().join("big.txt").exists());
     }
 
+    // The constant's numeric value (262144, not e.g. 256 + 1024 = 1280) is otherwise
+    // untested: every other test below computes its boundary *relative* to
+    // `MAX_FILE_BYTES`, so it would still pass unchanged even if the constant's
+    // definition were quietly wrong, as long as every use site agreed with itself.
+    // This assertion's right-hand side is a separate `256 * 1024` written directly in
+    // the test, independent of the constant's own definition a few lines up in this
+    // file — so if that definition's `*` were ever mutated to `+` (or otherwise
+    // miscomputed), this is the one assertion that would actually notice.
+    #[test]
+    fn max_file_bytes_is_256_kib() {
+        assert_eq!(MAX_FILE_BYTES, 256 * 1024);
+    }
+
+    // `read`'s size cap (`meta.len() > MAX_FILE_BYTES as u64`) is inclusive: a file of
+    // exactly the limit is readable, and only strictly over it is refused. Both sides
+    // of that boundary need a test, or `>` is indistinguishable from `==` or `>=` to
+    // the test suite — nothing before this exercised the exact limit at all.
+    #[test]
+    fn a_file_of_exactly_the_max_size_is_readable() {
+        let (_guard, w) = workspace();
+        let content = "x".repeat(MAX_FILE_BYTES);
+        w.write("exact.txt", &content).unwrap();
+        let read = w.read("exact.txt").unwrap();
+        assert_eq!(read.len(), MAX_FILE_BYTES);
+    }
+
+    #[test]
+    fn a_file_one_byte_over_the_max_size_is_refused_on_read() {
+        let (_guard, w) = workspace();
+        // Written directly, bypassing `Workspace::write`'s own size cap: the point
+        // here is to pin `read`'s limit specifically, not `write`'s (that boundary is
+        // covered separately by `a_write_of_exactly_the_max_size_is_allowed` and
+        // `an_oversized_write_is_refused`).
+        let content = "x".repeat(MAX_FILE_BYTES + 1);
+        fs::write(w.root().join("over.txt"), &content).unwrap();
+        let err = w.read("over.txt").unwrap_err().to_string();
+        assert!(err.contains("limit"), "unexpected error: {err}");
+    }
+
+    // `write`'s size cap is inclusive the same way `read`'s is: exactly the limit must
+    // be allowed. `an_oversized_write_is_refused` above already pins the "one byte
+    // over" side; this pins the other, which is what actually distinguishes `>` from
+    // `>=`.
+    #[test]
+    fn a_write_of_exactly_the_max_size_is_allowed() {
+        let (_guard, w) = workspace();
+        let content = "x".repeat(MAX_FILE_BYTES);
+        let path = w.write("exact.txt", &content).unwrap();
+        assert_eq!(fs::read(&path).unwrap().len(), MAX_FILE_BYTES);
+    }
+
+    // `precheck`'s size cap mirrors `write`'s, checked before any filesystem work so a
+    // doomed write can be refused before the user is asked to approve it (see the
+    // doc comment on `precheck`). Same inclusive boundary, same need for both sides.
+    #[test]
+    fn precheck_allows_content_of_exactly_the_max_size() {
+        let (_guard, w) = workspace();
+        w.precheck("f.txt", MAX_FILE_BYTES).unwrap();
+    }
+
+    #[test]
+    fn precheck_refuses_content_one_byte_over_the_max_size() {
+        let (_guard, w) = workspace();
+        let err = w
+            .precheck("f.txt", MAX_FILE_BYTES + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("limit"), "unexpected error: {err}");
+    }
+
+    // `list`'s empty-or-`.` special case (`trimmed.is_empty() || trimmed == "."`)
+    // means "the project root itself", handled without a call to `resolve`. Nothing
+    // before this exercised the `else` branch — a real subdirectory name — at all: a
+    // request for "" or "." happens to canonicalize to the same path `resolve` would
+    // have produced anyway, so a mutant that flips this to `trimmed != "."` still
+    // listed the *root* for those two inputs and only misbehaves on everything else.
+    // Only a subdirectory request, checked against the subdirectory's own contents
+    // (not the root's), can tell the branches apart.
+    #[test]
+    fn listing_a_subdirectory_returns_its_own_entries_not_the_roots() {
+        let (_guard, w) = workspace();
+        fs::write(w.root().join("root_file.txt"), "x").unwrap();
+        fs::create_dir(w.root().join("sub")).unwrap();
+        fs::write(w.root().join("sub").join("inner.txt"), "x").unwrap();
+
+        let entries = w.list("sub").unwrap();
+        assert_eq!(entries, vec!["inner.txt".to_string()]);
+    }
+
+    // `list`'s truncation (`total > MAX_LIST_ENTRIES`) is inclusive the same way the
+    // size caps above are: a directory with exactly the limit's worth of entries must
+    // come back whole, with no truncation notice, and only one entry more must
+    // truncate. Nothing before this created a directory anywhere near the limit.
+    #[test]
+    fn a_directory_with_exactly_the_max_entries_is_not_truncated() {
+        let (_guard, w) = workspace();
+        for i in 0..MAX_LIST_ENTRIES {
+            fs::write(w.root().join(format!("f{i:04}.txt")), "x").unwrap();
+        }
+        let entries = w.list("").unwrap();
+        assert_eq!(entries.len(), MAX_LIST_ENTRIES);
+        assert!(
+            !entries.iter().any(|e| e.contains("more entries")),
+            "an exact-limit listing must not report truncation: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn a_directory_one_entry_over_the_max_is_truncated() {
+        let (_guard, w) = workspace();
+        for i in 0..MAX_LIST_ENTRIES + 1 {
+            fs::write(w.root().join(format!("f{i:04}.txt")), "x").unwrap();
+        }
+        let entries = w.list("").unwrap();
+        // MAX_LIST_ENTRIES real entries plus the one truncation-notice entry appended
+        // in their place.
+        assert_eq!(entries.len(), MAX_LIST_ENTRIES + 1);
+        assert!(
+            entries.last().unwrap().contains("1 more entries"),
+            "expected a truncation notice reporting exactly 1 hidden entry: {entries:?}"
+        );
+    }
+
     // Unix-only: `std::os::unix::fs::symlink` has no direct Windows equivalent — see
     // the same gating on the sibling tests in `skills.rs`.
     #[cfg(unix)]

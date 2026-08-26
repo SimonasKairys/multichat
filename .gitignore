@@ -6,6 +6,11 @@
 # Generated knowledge-graph artifacts (graphify)
 /graphify-out/
 
+# cargo-mutants working output: build logs and per-mutant diffs, tens of thousands of
+# lines regenerated on every run. Committed once by accident via `git add -A`.
+/mutants.out/
+/mutants.out.old/
+
 # Secrets and local configuration — never commit these
 .env
 .env.*

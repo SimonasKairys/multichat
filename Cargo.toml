@@ -50,6 +50,11 @@ async-trait = "0.1"
 futures = "0.3"
 rpassword = "7"
 zeroize = "1"
+# `#[cfg_attr(test, mutants::skip)]` marks functions cargo-mutants should not mutate
+# (an OS-keyring boundary this suite cannot exercise in CI — see config.rs). Must be a
+# regular dependency, not a dev-dependency: the annotation sits on non-test code, so it
+# has to resolve in ordinary builds too, not just `cargo test`.
+mutants = "0.0.3"
 
 # One `cfg(unix)` block rather than a per-OS block each. `security.rs` guards the
 # platform-specific calls internally (`mlockall` is Linux-only, per-allocation `mlock`

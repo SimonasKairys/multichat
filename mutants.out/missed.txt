@@ -1,9 +1,0 @@
-src/config.rs:125:9: delete match arm "google" | "gemini" in builtin_endpoint
-src/config.rs:135:9: delete match arm "groq" in builtin_endpoint
-src/config.rs:130:9: delete match arm "openrouter" in builtin_endpoint
-src/config.rs:74:5: replace restrict_to_owner -> Result<()> with Ok(())
-src/config.rs:248:23: replace match guard e.kind() == std::io::ErrorKind::NotFound with true in Settings::load
-src/config.rs:274:9: replace Settings::endpoint -> Option<CloudEndpoint> with None
-src/config.rs:292:9: replace Credentials::get -> Result<Option<SecretString>> with Ok(None)
-src/config.rs:302:9: replace Credentials::set -> Result<()> with Ok(())
-src/config.rs:313:9: replace Credentials::delete -> Result<()> with Ok(())

@@ -410,12 +410,14 @@ pub(crate) fn handle_picker_key(
             {
                 PickerKeyOutcome::Cancel
             }
-            // `cargo mutants` reports the guard here as a survivor and always will:
-            // the arm above already claimed every `Char('c')`/`Char('C')` that carries
-            // CONTROL, so by the time matching reaches this arm CONTROL is structurally
-            // absent and `!contains(CONTROL)` is always true. It is an equivalent
-            // mutant, not a missing test — do not go hunting for a test that kills it.
-            KeyCode::Char('c') if !modifiers.contains(KeyModifiers::CONTROL) => {
+            // No `if !modifiers.contains(CONTROL)` guard here, deliberately: the arm
+            // directly above already claims every `Char('c')`/`Char('C')` carrying
+            // CONTROL, so matching only reaches this arm with CONTROL absent and such a
+            // guard would always be true. `cargo mutants` is what surfaced it — the
+            // guard was an unkillable equivalent mutant, which is its way of saying the
+            // condition is dead. Keep this arm *below* the Ctrl one; swapping them
+            // would make plain `c` and Ctrl+C do the same thing.
+            KeyCode::Char('c') => {
                 state.set_commander();
                 PickerKeyOutcome::Continue
             }

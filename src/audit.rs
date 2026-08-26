@@ -2017,8 +2017,25 @@ mod tests {
         );
     }
 
+    /// Every other test in this module builds its logger with `with_key`/
+    /// `with_key_and_anchor`, which do no keyring I/O at all. This one cannot: it is
+    /// specifically about `sync_keyring_anchor`, so it needs a real keyring. CI
+    /// runners have none on Linux (no D-Bus secret service), where `AuditLogger::open`
+    /// fails at `load_or_create_key`. Probe once and skip rather than fail — a test
+    /// that cannot run in an environment is not the same as a test that failed in it.
+    fn keyring_is_available() -> bool {
+        const PROBE: &str = "simon-test-keyring-probe";
+        let ok = Credentials::set(PROBE, "probe").is_ok();
+        let _ = Credentials::delete(PROBE);
+        ok
+    }
+
     #[test]
     fn reproduction_test_sync_keyring_anchor_does_not_regress_concurrently_advanced_anchor() {
+        if !keyring_is_available() {
+            eprintln!("skipping: no OS keyring in this environment");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("audit.log");
 

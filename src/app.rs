@@ -151,7 +151,10 @@ pub struct App {
     /// exactly the kind of place they hide until someone types a non-ASCII character.
     pub cursor: usize,
     pub transcript: Vec<Line>,
-    /// Lines scrolled off the top of the history pane.
+    /// How far the history pane is scrolled *back from the bottom*, in lines.
+    /// Zero pins the view to the newest output; `scroll_up` raises it. The
+    /// renderer subtracts this from the bottom-anchored offset (see `ui::draw`),
+    /// so the sign convention here is the opposite of a top-anchored offset.
     pub scroll: u16,
     /// True while the orchestrator is working on a turn.
     pub busy: bool,

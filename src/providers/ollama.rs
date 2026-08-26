@@ -111,7 +111,12 @@ impl Provider for OllamaProvider {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
         {
-            return Err(anyhow!("Ollama returned error: {err}"));
+            // Bounded exactly like the HTTP-status path above: this string is
+            // daemon-controlled text of arbitrary size, not something to embed whole.
+            return Err(anyhow!(
+                "Ollama returned error: {}",
+                truncate_error_detail(err.trim())
+            ));
         }
 
         let text = parsed
@@ -363,6 +368,39 @@ mod tests {
             models,
             vec!["mistral:latest".to_string()],
             "should extract model name from 'model' field when 'name' is omitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_giant_daemon_error_string_is_truncated_before_it_reaches_the_user() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = format!(r#"{{"error":"{}"}}"#, "E".repeat(50_000));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let p = OllamaProvider::new(format!("http://{addr}"), "llama3", reqwest::Client::new());
+        let err = p.send(None, "hi").await.unwrap_err().to_string();
+        assert!(
+            err.len() < 2_000,
+            "daemon-controlled error text reached the user unbounded: {} bytes",
+            err.len()
+        );
+        assert!(
+            err.contains("EEE"),
+            "the truncated error must still carry the daemon's message: {err}"
         );
     }
 }

@@ -473,6 +473,12 @@ impl LocalBinaryProvider {
 
         loop {
             line_bytes.clear();
+            // `read_until` is NOT cancellation-safe (unlike the `lines().next_line()`
+            // this replaced): if another `select!` branch wins, whatever it had already
+            // read into `line_bytes` is lost. That is sound only because every other
+            // branch below returns immediately instead of looping again. Anyone adding
+            // a branch that *continues* the loop has to move the read out of `select!`
+            // first, or it will silently drop a partially-read line of model output.
             tokio::select! {
                 biased;
                 _ = &mut total_deadline => {

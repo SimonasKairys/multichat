@@ -535,10 +535,10 @@ impl AuditLogger {
         };
 
         if should_write {
-            if let Some(existing) = &live_keyring
-                && existing.count == candidate.count
-                && existing.last_mac == candidate.last_mac
-            {
+            // A keyring write costs ~30.7 ms (see the module docs). When the stored
+            // anchor already *is* what we would write, skip it — the write would be
+            // a no-op that only slows down every open() and Drop.
+            if anchor_is_unchanged(live_keyring.as_ref(), &candidate) {
                 self.keyring_anchor = Some(candidate);
                 return;
             }
@@ -952,6 +952,19 @@ fn read_keyring_anchor(log_path: &Path) -> Option<Anchor> {
         .ok()
         .flatten()?;
     serde_json::from_str(secret.expose_secret()).ok()
+}
+
+/// True when `live` already holds exactly what `candidate` would write, making the
+/// keyring write a no-op worth skipping. Split out of `sync_keyring_anchor` so the
+/// comparison is reachable from a test: inside the caller its only effect is whether
+/// a ~30.7 ms keyring write happens, which no test can observe.
+fn anchor_is_unchanged(live: Option<&Anchor>, candidate: &Anchor) -> bool {
+    match live {
+        Some(existing) => {
+            existing.count == candidate.count && existing.last_mac == candidate.last_mac
+        }
+        None => false,
+    }
 }
 
 /// Derives a keyring service name scoped to a specific log file, so multiple data
@@ -2034,5 +2047,32 @@ mod tests {
         );
 
         let _ = Credentials::delete(&keyring_anchor_service(&log_path));
+    }
+
+    #[test]
+    fn anchor_is_unchanged_only_when_both_count_and_mac_match() {
+        let a = |count, mac: &str| Anchor {
+            count,
+            last_mac: mac.to_string(),
+            mac: "irrelevant".to_string(),
+        };
+        let candidate = a(3, "aa");
+
+        assert!(
+            anchor_is_unchanged(Some(&a(3, "aa")), &candidate),
+            "identical count and mac means the keyring write would be a no-op"
+        );
+        assert!(
+            !anchor_is_unchanged(Some(&a(4, "aa")), &candidate),
+            "a differing count must not be skipped as unchanged"
+        );
+        assert!(
+            !anchor_is_unchanged(Some(&a(3, "bb")), &candidate),
+            "a differing mac must not be skipped as unchanged"
+        );
+        assert!(
+            !anchor_is_unchanged(None, &candidate),
+            "with no stored anchor there is nothing to match, so the write must happen"
+        );
     }
 }

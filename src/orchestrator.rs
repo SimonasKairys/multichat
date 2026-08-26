@@ -1852,7 +1852,7 @@ impl Orchestrator {
                     self.emit(Event::DelegationFinished {
                         to: target_label.clone(),
                         ok: true,
-                        chars: sub_text.len(),
+                        chars: sub_text.chars().count(),
                         millis,
                     })
                     .await;
@@ -1940,7 +1940,7 @@ impl Orchestrator {
                     );
                     self.emit(Event::SkillLoaded {
                         name: name.clone(),
-                        chars: content.len(),
+                        chars: content.chars().count(),
                     })
                     .await;
                 }
@@ -2118,7 +2118,7 @@ impl Orchestrator {
                     );
                     self.emit(Event::FileRead {
                         path: path.clone(),
-                        chars: content.len(),
+                        chars: content.chars().count(),
                     })
                     .await;
                 }
@@ -4689,6 +4689,148 @@ mod tests {
         assert!(
             retry_line.contains("detail=withheld"),
             "expected the safe_error_detail marker in the retry line: {retry_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_read_event_reports_character_count_not_byte_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let fixture = "ąčęėįšųūž"; // 9 chars, 18 bytes
+        std::fs::write(project_dir.path().join("utf8.txt"), fixture).unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_file_reads("ollama:llama3", "ACTION: read_file(utf8.txt)")
+            .await;
+
+        let mut read_chars = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::FileRead { chars, .. } = event {
+                read_chars = Some(chars);
+            }
+        }
+        assert_eq!(
+            read_chars,
+            Some(9),
+            "Event::FileRead chars should be character count (9), not byte count (18)"
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_loaded_event_reports_character_count_not_byte_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let fixture = "ąčęėįšųūž"; // 9 chars, 18 bytes
+        std::fs::write(paths.skills_dir.join("utf8.md"), fixture).unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(utf8.md)")
+            .await;
+
+        let mut loaded_chars = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::SkillLoaded { chars, .. } = event {
+                loaded_chars = Some(chars);
+            }
+        }
+        assert_eq!(
+            loaded_chars,
+            Some(9),
+            "Event::SkillLoaded chars should be character count (9), not byte count (18)"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_finished_event_reports_character_count_not_byte_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let fixture = "ąčęėįšųūž"; // 9 chars, 18 bytes
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "ollama:llama3".into(),
+            Arc::new(StubProvider {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                remote: false,
+            }),
+        );
+        providers.insert(
+            "ollama:helper".into(),
+            Arc::new(ScriptedProvider {
+                provider: "ollama".into(),
+                model: "helper".into(),
+                reply: fixture.into(),
+            }),
+        );
+        let reg = Registry {
+            providers,
+            primary: "ollama:llama3".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:helper, do task)",
+        )
+        .await;
+
+        let mut delegation_chars = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let Event::DelegationFinished { chars, .. } = event {
+                delegation_chars = Some(chars);
+            }
+        }
+        assert_eq!(
+            delegation_chars,
+            Some(9),
+            "Event::DelegationFinished chars should be character count (9), not byte count (18)"
         );
     }
 }

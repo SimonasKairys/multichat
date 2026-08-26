@@ -522,7 +522,15 @@ pub fn trim_transcript_to_cap(transcript: &mut Vec<Line>, cap: usize) -> u64 {
     );
     let previously_dropped = take_leading_marker(transcript);
 
-    if transcript.len() <= cap {
+    // If an existing marker was present, it must be put back and will occupy one slot
+    // of `cap`, so at most `cap - 1` content lines may be kept without dropping new lines.
+    let keep_without_dropping = if previously_dropped > 0 {
+        cap.saturating_sub(1)
+    } else {
+        cap
+    };
+
+    if transcript.len() <= keep_without_dropping {
         // Nothing new to drop. Put back an unchanged marker if one was already
         // there — its count is still true, it just isn't growing this time.
         if previously_dropped > 0 {
@@ -1406,5 +1414,45 @@ mod tests {
             2,
             "the unrelated system line must survive"
         );
+    }
+    #[test]
+    fn reproduction_test_trim_transcript_to_cap_off_by_one_with_existing_marker() {
+        let cap = 10;
+        let mut transcript = lines(15);
+        let first_dropped = trim_transcript_to_cap(&mut transcript, cap);
+        assert_eq!(first_dropped, 6);
+        assert_eq!(transcript.len(), cap);
+
+        // Append exactly 1 new line to the already-trimmed transcript.
+        // Total lines before trim: 1 marker + 9 content lines + 1 new content line = 11 lines.
+        transcript.push(Line {
+            speaker: Speaker::You,
+            text: "line 15".into(),
+        });
+        assert_eq!(transcript.len(), 11);
+
+        // Trimming must keep the transcript bounded to `cap` (10 lines total: 1 marker + 9 content lines).
+        // It must drop 1 content line ("line 6") and update the cumulative marker count to 6 + 1 = 7.
+        let second_dropped = trim_transcript_to_cap(&mut transcript, cap);
+
+        assert_eq!(
+            second_dropped, 1,
+            "expected 1 line to be dropped to keep transcript within cap"
+        );
+        assert_eq!(
+            transcript.len(),
+            cap,
+            "transcript length must be exactly cap, but got exceeding length"
+        );
+        assert_eq!(
+            transcript[0].text,
+            drop_marker(first_dropped + second_dropped, cap).text,
+            "the marker must report the updated total"
+        );
+        assert_eq!(
+            transcript[1].text, "line 7",
+            "oldest surviving content line"
+        );
+        assert_eq!(transcript[9].text, "line 15", "newest content line");
     }
 }

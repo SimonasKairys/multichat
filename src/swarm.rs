@@ -743,7 +743,7 @@ impl SwarmLedger {
                 &mut out,
                 note_budget,
                 &format!(
-                    "(...{budget_dropped} more recent task(s) omitted from this prompt — system-prompt character budget exhausted...)\n"
+                    "(...{budget_dropped} earlier task(s) omitted from this prompt — system-prompt character budget exhausted...)\n"
                 ),
             );
         }
@@ -1284,7 +1284,11 @@ impl SwarmLedger {
         let mut open: Option<(String, Vec<&str>)> = None;
 
         for line in reply.lines() {
-            let trimmed = line.trim().trim_start_matches('`').trim_end_matches('`');
+            let trimmed = line
+                .trim()
+                .trim_start_matches('`')
+                .trim_end_matches('`')
+                .trim();
 
             if let Some((_, content_lines)) = open.as_mut() {
                 if trimmed == "ACTION: end_file" || trimmed == "ACTION: end_file()" {
@@ -1317,7 +1321,10 @@ impl SwarmLedger {
                 stripped_lines.push(line);
                 continue;
             };
-            let path = rest[..close].trim().trim_matches(['"', '\'']).to_string();
+            let path = rest[..close]
+                .trim()
+                .trim_matches(['"', '\'', '`'])
+                .to_string();
             open = Some((path, Vec::new()));
         }
 
@@ -2254,5 +2261,36 @@ mod tests {
         assert!(text.contains("Task #1: summarise the diff"));
         assert!(!text.contains("the diff adds a timeout"));
         assert!(!text.contains("be terse and cite sources"));
+    }
+
+    #[test]
+    fn parse_file_writes_unwraps_backticked_path() {
+        let reply = "ACTION: write_file(`src/lib.rs`)\npub fn hello() {}\nACTION: end_file";
+        let (writes, stripped) = SwarmLedger::parse_file_writes(reply);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].path, "src/lib.rs",
+            "backticks must be stripped from path"
+        );
+        assert_eq!(writes[0].content, "pub fn hello() {}");
+        assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn tasks_section_elision_note_reports_earlier_tasks_omitted_when_budget_exhausted() {
+        let mut ledger = SwarmLedger::new();
+        for i in 1..=10 {
+            let id = ledger.add_task(&format!("task {i}"));
+            ledger.record_result(id, &"x".repeat(2000));
+        }
+        let prompt = ledger.system_prompt();
+        assert!(
+            !prompt.contains("more recent task(s) omitted"),
+            "elision note must not claim more recent tasks were omitted when older ones were dropped"
+        );
+        assert!(
+            prompt.contains("earlier task(s) omitted"),
+            "elision note should announce earlier tasks were omitted"
+        );
     }
 }

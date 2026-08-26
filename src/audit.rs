@@ -885,6 +885,7 @@ fn mac_at_position(path: &Path, n: u64) -> Result<Option<String>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).context("failed to read audit log"),
     };
+    lock_shared_with_timeout(&file, path)?;
     let mut seen = 0u64;
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -1942,5 +1943,31 @@ mod tests {
         );
         assert_eq!(report.entries, n_per_worker * 2);
         assert_eq!(report.anchor, AnchorStatus::Current);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reproduction_test_mac_at_position_waits_for_exclusive_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(&path, b"").unwrap();
+
+        let holder = File::open(&path).unwrap();
+        holder.lock().unwrap();
+
+        let started = std::time::Instant::now();
+        let err = mac_at_position(&path, 1)
+            .expect_err("mac_at_position must wait for exclusive lock holder and time out");
+        assert!(
+            started.elapsed() >= APPEND_LOCK_TIMEOUT,
+            "mac_at_position returned without waiting out the lock timeout"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+
+        drop(holder);
+        assert_eq!(mac_at_position(&path, 1).unwrap(), None);
     }
 }

@@ -23,6 +23,7 @@
 - `03`–`04`: early implementation notes and error log.
 - `05`–`14`: architecture and security decisions (aspirational; see the note above).
 - `15`–`21`: per-step implementation records, corrected after the audit.
+- `23_mutation_debt.md`: what mutation testing has and has not measured.
 - `22_status.md`: **authoritative** implemented / not-implemented status.
 - `../AUDIT-2026-07-30.md` and `../AUDIT-2026-07-31.md`: both current, splitting the
   tree between them — the first covers delegation, skills, and the vault; the second

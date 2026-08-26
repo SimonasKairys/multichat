@@ -443,9 +443,15 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(frame.area());
 
-    let history = Paragraph::new(app.body())
+    let history_body = app.body();
+    let total_lines = history_body.lines().count();
+    let history_interior_height = chunks[0].height.saturating_sub(2) as usize;
+    let base_scroll = total_lines.saturating_sub(history_interior_height);
+    let effective_scroll = base_scroll.saturating_sub(app.scroll as usize) as u16;
+
+    let history = Paragraph::new(history_body)
         .wrap(Wrap { trim: false })
-        .scroll((app.scroll, 0))
+        .scroll((effective_scroll, 0))
         .block(Block::default().title(" simon ").borders(Borders::ALL));
     frame.render_widget(history, chunks[0]);
 
@@ -518,15 +524,25 @@ fn draw_picker(frame: &mut ratatui::Frame, picker: Option<&PickerState>) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(frame.area());
 
-    let body = match picker {
-        None => "Discovering connections…".to_string(),
-        Some(picker) => render_picker_body(picker),
+    let (body, cursor_line) = match picker {
+        None => ("Discovering connections…".to_string(), 0),
+        Some(picker) => render_picker_body_with_cursor(picker),
     };
-    let list = Paragraph::new(body).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .title(" simon — choose connections ")
-            .borders(Borders::ALL),
-    );
+    let interior_height = chunks[0].height.saturating_sub(2) as usize;
+    let scroll_offset = if interior_height > 0 && cursor_line >= interior_height {
+        (cursor_line - interior_height + 1) as u16
+    } else {
+        0
+    };
+
+    let list = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset, 0))
+        .block(
+            Block::default()
+                .title(" simon — choose connections ")
+                .borders(Borders::ALL),
+        );
     frame.render_widget(list, chunks[0]);
 
     // Key entry takes over the hint/flash line with a masked prompt — never the
@@ -546,18 +562,22 @@ fn draw_picker(frame: &mut ratatui::Frame, picker: Option<&PickerState>) {
     frame.render_widget(Paragraph::new(hint), chunks[1]);
 }
 
-fn render_picker_body(picker: &PickerState) -> String {
+fn render_picker_body_with_cursor(picker: &PickerState) -> (String, usize) {
     let mut out = String::new();
     let mut last_group: Option<&str> = None;
+    let mut current_line = 0;
+    let mut cursor_line = 0;
 
     for (line_idx, row) in picker.rows().iter().enumerate() {
         let candidate = &picker.candidates()[row.candidate];
         if last_group != Some(candidate.group.as_str()) {
             if last_group.is_some() {
                 out.push('\n');
+                current_line += 1;
             }
             out.push_str(&candidate.group);
             out.push('\n');
+            current_line += 1;
             last_group = Some(candidate.group.as_str());
         }
 
@@ -567,7 +587,9 @@ fn render_picker_body(picker: &PickerState) -> String {
         } else {
             "[ ]"
         };
-        let cursor = if picker.cursor() == line_idx {
+        let is_current = picker.cursor() == line_idx;
+        let cursor = if is_current {
+            cursor_line = current_line;
             ">"
         } else {
             " "
@@ -591,12 +613,13 @@ fn render_picker_body(picker: &PickerState) -> String {
             "{cursor}{checkbox} {}{label}   {}{commander}{reason}\n",
             candidate.model, option.detail
         ));
+        current_line += 1;
     }
 
     if out.is_empty() {
         out.push_str("No candidate connections were found.\n");
     }
-    out
+    (out, cursor_line)
 }
 
 #[cfg(test)]
@@ -656,6 +679,90 @@ mod tests {
     /// code was wrong for both, just in slightly different ways (see the table this
     /// was derived from: `Layout::split` gives the input chunk height 0 at h=1 and
     /// height 1 at h=2, neither of which has room for a content row).
+    #[test]
+    fn draw_shows_the_latest_transcript_lines_at_scroll_zero() {
+        let mut app = App::new(
+            "ollama:llama3",
+            &["ollama:llama3".to_string()],
+            "/tmp".to_string(),
+        );
+        for i in 0..20 {
+            app.transcript.push(crate::app::Line {
+                speaker: crate::app::Speaker::You,
+                text: format!("message_{i}"),
+            });
+        }
+        assert_eq!(app.scroll, 0);
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 1..9 {
+            for x in 1..79 {
+                rendered.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(
+            rendered.contains("message_19"),
+            "the latest transcript line (message_19) must be visible at scroll 0, but rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn draw_picker_scrolls_to_keep_cursor_visible_when_navigating_down() {
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+        let candidates: Vec<Candidate> = (0..15)
+            .map(|i| Candidate {
+                id: format!("model_{i}"),
+                group: format!("GROUP_{i}"),
+                model: format!("model_{i}"),
+                transports: vec![TransportOption {
+                    transport: None,
+                    label: String::new(),
+                    detail: String::new(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                }],
+            })
+            .collect();
+        let mut picker =
+            PickerState::new(candidates, &std::collections::BTreeMap::new(), None, false);
+        for _ in 0..12 {
+            picker.move_down();
+        }
+        assert_eq!(picker.cursor(), 12);
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_picker(frame, Some(&picker)))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 1..9 {
+            for x in 1..79 {
+                rendered.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(
+            rendered.contains(">"),
+            "the cursor indicator `>` must be visible in the viewport when scrolled down, but rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("model_12"),
+            "the selected model_12 row must be visible in the viewport, but rendered:\n{rendered}"
+        );
+    }
+
     #[test]
     fn draw_keeps_the_caret_inside_the_frame_on_a_short_terminal() {
         for height in [1u16, 2] {

@@ -49,6 +49,8 @@ impl RateLimit {
                 headers
                     .get(*n)
                     .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
             })
         };
@@ -289,5 +291,17 @@ mod tests {
     #[test]
     fn error_detail_under_the_cap_passes_through_verbatim() {
         assert_eq!(truncate_error_detail("bad api key"), "bad api key");
+    }
+
+    #[test]
+    fn parses_headers_ignoring_empty_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_static("   "),
+        );
+        let rl = RateLimit::from_headers(&headers);
+        assert!(rl.requests_remaining.is_none());
+        assert!(rl.summary().is_none());
     }
 }

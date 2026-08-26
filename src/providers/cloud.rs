@@ -126,11 +126,34 @@ impl CloudProvider {
                 Ok(text)
             }
             Api::OpenAiCompatible => {
-                let text = body
-                    .pointer("/choices/0/message/content")
+                if body
+                    .pointer("/choices/0/finish_reason")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                    == Some("refusal")
+                    || body.pointer("/choices/0/message/refusal").is_some()
+                {
+                    let reason = body
+                        .pointer("/choices/0/message/refusal")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unspecified");
+                    return Err(anyhow!("{} declined this request: {reason}", self.model));
+                }
+                let text = match body.pointer("/choices/0/message/content") {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| {
+                            if p.get("type").and_then(Value::as_str) == Some("text") {
+                                p.get("text").and_then(Value::as_str)
+                            } else {
+                                p.as_str()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => String::new(),
+                };
+                let text = text.trim().to_string();
                 if text.is_empty() {
                     return Err(anyhow!(
                         "{} returned no message content (response: {})",
@@ -281,6 +304,44 @@ mod tests {
     fn empty_response_is_an_error_rather_than_a_silent_blank() {
         let body = json!({"choices": []});
         assert!(provider("openai").extract_text(&body).is_err());
+    }
+
+    #[test]
+    fn extracts_openai_content_array() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "hello "},
+                        {"type": "text", "text": "world"}
+                    ]
+                }
+            }]
+        });
+        assert_eq!(
+            provider("openai").extract_text(&body).unwrap(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn openai_refusal_becomes_an_error_not_empty_content_error() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "refusal": "safety policy violation"
+                },
+                "finish_reason": "refusal"
+            }]
+        });
+        let err = provider("openai")
+            .extract_text(&body)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("declined"), "unexpected error: {err}");
+        assert!(err.contains("safety policy violation"));
     }
 
     #[test]

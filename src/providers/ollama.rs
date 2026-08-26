@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::providers::{Provider, RateLimit, Reply, truncate_error_detail};
+use crate::providers::{Provider, ProviderFailure, RateLimit, Reply, truncate_error_detail};
 
 pub struct OllamaProvider {
     host: String,
@@ -36,7 +36,11 @@ impl OllamaProvider {
             .with_context(|| format!("could not reach the Ollama daemon at {url}"))?;
 
         if !response.status().is_success() {
-            return Err(anyhow!("Ollama returned {} for {url}", response.status()));
+            let status = response.status();
+            return Err(
+                anyhow::Error::new(ProviderFailure::HttpStatus(status.as_u16()))
+                    .context(format!("Ollama returned {status} for {url}")),
+            );
         }
 
         let body: Value = response
@@ -83,10 +87,12 @@ impl Provider for OllamaProvider {
             // Bounded like the cloud transport's error path: the body is
             // daemon-controlled text of arbitrary size, not something to embed whole.
             let detail = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "Ollama returned {status}: {}",
-                truncate_error_detail(detail.trim())
-            ));
+            return Err(
+                anyhow::Error::new(ProviderFailure::HttpStatus(status.as_u16())).context(format!(
+                    "Ollama returned {status}: {}",
+                    truncate_error_detail(detail.trim())
+                )),
+            );
         }
 
         let parsed: Value = response
@@ -192,5 +198,34 @@ mod tests {
         // Garbage config must never read as "local" and slip past --classified.
         assert!(!is_loopback_host("not a url at all"));
         assert!(!is_loopback_host(""));
+    }
+
+    #[tokio::test]
+    async fn ollama_http_error_carries_typed_http_status_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 19\r\nConnection: close\r\n\r\nmodel 'foo' not found";
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let p = OllamaProvider::new(format!("http://{addr}"), "foo", reqwest::Client::new());
+        let err = p.send(None, "hi").await.unwrap_err();
+        let status = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::providers::ProviderFailure>());
+        assert!(
+            matches!(
+                status,
+                Some(crate::providers::ProviderFailure::HttpStatus(404))
+            ),
+            "expected HttpStatus(404), got {status:?}"
+        );
     }
 }

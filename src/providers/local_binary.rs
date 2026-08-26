@@ -281,6 +281,7 @@ impl LocalBinaryProvider {
         }
         command.arg(effective_prompt);
         command.kill_on_drop(true);
+        command.stdin(Stdio::null());
         // `command.output()` used to do this call in one shot: spawn, then buffer
         // BOTH streams to completion, and only afterwards was `MAX_OUTPUT_BYTES`
         // applied to what came back. A child that emits a gigabyte put a gigabyte in
@@ -392,6 +393,26 @@ impl LocalBinaryProvider {
         prompt: &str,
         progress: &ProgressSink,
     ) -> Result<Reply> {
+        self.send_streaming_with_timeouts(
+            dialect,
+            system,
+            prompt,
+            progress,
+            CLI_IDLE_TIMEOUT,
+            CLI_TOTAL_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn send_streaming_with_timeouts(
+        &self,
+        dialect: StreamDialect,
+        system: Option<&str>,
+        prompt: &str,
+        progress: &ProgressSink,
+        idle_timeout: Duration,
+        total_timeout: Duration,
+    ) -> Result<Reply> {
         let (system_flag, effective_prompt) =
             compose_call(self.system_arg.as_deref(), system, prompt);
 
@@ -412,9 +433,7 @@ impl LocalBinaryProvider {
         command.kill_on_drop(true);
         // The prompt is passed as an argv entry (above), not over stdin, so the child
         // needs none — and must not inherit simon's own stdin, which in the TUI is the
-        // terminal in raw mode. `send_with_timeout`'s non-streaming path leaves stdin
-        // inherited (unchanged, pre-existing behaviour); this only affects the new
-        // streaming path.
+        // terminal in raw mode.
         command.stdin(Stdio::null());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
@@ -427,46 +446,13 @@ impl LocalBinaryProvider {
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
-        // Drained concurrently with stdout so a chatty stderr can never fill its pipe
-        // buffer and deadlock the child against a `send_streaming` that is only
-        // reading stdout. Best-effort: a read error here just yields an empty
-        // summary, which is no worse than today's non-streaming stderr handling on a
-        // process that dies mid-write.
-        //
-        // `.take(MAX_OUTPUT_BYTES as u64)` bounds this the same way `MAX_OUTPUT_BYTES`
-        // already bounds stdout below (see `accumulated_bytes`): without it, a child
-        // that floods stderr — a misbehaving CLI dumping a stack trace in a loop, or
-        // one deliberately hostile — grows this buffer without limit, since a read
-        // loop otherwise continues until EOF. Once the cap is hit, this task stops
-        // reading, so a child that keeps writing past `MAX_OUTPUT_BYTES` of stderr
-        // can still fill its pipe buffer and block on a further write — but that is
-        // no longer an unbounded hang: `CLI_IDLE_TIMEOUT`/`CLI_TOTAL_TIMEOUT` above
-        // already backstop a child that stalls for any reason, stdout included, and
-        // will kill it. The cap's job is only to keep memory bounded; the timeouts
-        // already own liveness.
         let stderr_task: tokio::task::JoinHandle<String> = tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
-            // Bytes, not `String` via `read_to_string`: a child's stderr is not
-            // guaranteed to be valid UTF-8, and `read_to_string` rejects the *whole*
-            // buffer on a single invalid byte sequence, leaving an empty string. That
-            // discards the one thing the user needed — the diagnostic explaining why
-            // the child failed — precisely when a failure is what's being reported.
-            // `from_utf8_lossy` below mirrors how stdout already handles this same
-            // class of failure elsewhere in this file (see `send_with_timeout`'s
-            // comment on `923b934`).
             let mut buf = Vec::new();
             let _ = (&mut reader)
                 .take(MAX_OUTPUT_BYTES as u64)
                 .read_to_end(&mut buf)
                 .await;
-            // Keep draining past the cap, discarding the excess. Stopping at the cap
-            // would drop `ChildStderr`, closing the pipe under a child that is still
-            // writing — it takes SIGPIPE and dies, and simon then reports
-            // "exited with signal: 13 (SIGPIPE)" instead of whatever the child was
-            // actually going to exit with. Measured exactly that way: a stub whose
-            // last statement was `exit 1` never reached it. Memory stays bounded
-            // because only the first `MAX_OUTPUT_BYTES` are kept; the time this can
-            // take is bounded by the same idle and total timeouts as everything else.
             let _ = tokio::io::copy(&mut reader, &mut tokio::io::sink()).await;
             String::from_utf8_lossy(&buf).into_owned()
         });
@@ -475,24 +461,13 @@ impl LocalBinaryProvider {
         let mut result_text: Option<String> = None;
         let mut stream_error: Option<String> = None;
         let mut assistant_text = String::new();
-        let mut accumulated_bytes = 0usize;
-        // Set once `accumulated_bytes` passes `MAX_OUTPUT_BYTES` and further
-        // `AssistantText` events stop being appended (see the loop below). Needed
-        // because `assistant_text.len()` alone can't tell truncation happened: the
-        // counter that trips the cap is `accumulated_bytes`, which includes every
-        // line's raw JSON (tool-call events, envelope fields, …), not just the text
-        // actually pushed onto `assistant_text` — so the accumulated string can sit
-        // well under `MAX_OUTPUT_BYTES` even though real reply content was dropped.
-        // Without this flag, `send_streaming`'s later `text.len() > MAX_OUTPUT_BYTES`
-        // check would miss exactly that case and hand back a silently shortened
-        // fallback reply with no truncation marker.
         let mut assistant_text_truncated = false;
 
-        // Not reset on each loop iteration — deliberately: `CLI_TOTAL_TIMEOUT` is a
+        // Not reset on each loop iteration — deliberately: `total_timeout` is a
         // single absolute backstop across the whole call, unlike the idle timeout
         // below, which is a fresh `tokio::time::timeout` every iteration so it
         // resets on every line received.
-        let total_deadline = tokio::time::sleep(CLI_TOTAL_TIMEOUT);
+        let total_deadline = tokio::time::sleep(total_timeout);
         tokio::pin!(total_deadline);
 
         loop {
@@ -507,10 +482,10 @@ impl LocalBinaryProvider {
                     return Err(anyhow::Error::new(ProviderFailure::Timeout).context(format!(
                         "{} timed out after {}s (total time limit for a streaming call)",
                         self.binary_path,
-                        CLI_TOTAL_TIMEOUT.as_secs()
+                        total_timeout.as_secs()
                     )));
                 }
-                next = tokio::time::timeout(CLI_IDLE_TIMEOUT, lines.next_line()) => {
+                next = tokio::time::timeout(idle_timeout, lines.next_line()) => {
                     match next {
                         Err(_) => {
                             drop(child);
@@ -518,7 +493,7 @@ impl LocalBinaryProvider {
                                 format!(
                                     "{} timed out after {}s of no output",
                                     self.binary_path,
-                                    CLI_IDLE_TIMEOUT.as_secs()
+                                    idle_timeout.as_secs()
                                 ),
                             ));
                         }
@@ -529,13 +504,18 @@ impl LocalBinaryProvider {
                         }
                         Ok(Ok(None)) => break, // stdout closed: child is finishing up
                         Ok(Ok(Some(line))) => {
-                            accumulated_bytes += line.len();
                             match parse_stream_line(dialect, &line) {
                                 StreamLineEffect::Progress(detail) => progress.send(detail),
                                 StreamLineEffect::AssistantText(text) => {
-                                    if accumulated_bytes <= MAX_OUTPUT_BYTES {
+                                    if assistant_text.len() + text.len() <= MAX_OUTPUT_BYTES {
                                         assistant_text.push_str(&text);
                                     } else {
+                                        let remaining = MAX_OUTPUT_BYTES.saturating_sub(assistant_text.len());
+                                        if remaining > 0 {
+                                            let mut bytes = text.into_bytes();
+                                            bytes.truncate(remaining);
+                                            assistant_text.push_str(&String::from_utf8_lossy(&bytes));
+                                        }
                                         assistant_text_truncated = true;
                                     }
                                 }
@@ -562,11 +542,11 @@ impl LocalBinaryProvider {
             biased;
             _ = &mut total_deadline => {
                 drop(child);
-                return Err(anyhow!(
+                return Err(anyhow::Error::new(ProviderFailure::Timeout).context(format!(
                     "{} timed out after {}s (total time limit for a streaming call)",
                     self.binary_path,
-                    CLI_TOTAL_TIMEOUT.as_secs()
-                ));
+                    total_timeout.as_secs()
+                )));
             }
             status = child.wait() => {
                 status.with_context(|| format!("failed to run {}", self.binary_path))?
@@ -710,7 +690,24 @@ fn parse_claude_line(line: &str) -> StreamLineEffect {
             // field the reply text normally occupies, so the flag is the only thing
             // distinguishing "here is your answer" from "here is why there isn't one".
             if value.get("is_error").and_then(Value::as_bool) == Some(true) {
-                return StreamLineEffect::Failure(text);
+                let reason = if !text.trim().is_empty() {
+                    text
+                } else if let Some(err) = value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    err.to_string()
+                } else if let Some(subtype) = value
+                    .get("subtype")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    subtype.to_string()
+                } else {
+                    "error".to_string()
+                };
+                return StreamLineEffect::Failure(reason);
             }
             StreamLineEffect::Result(text)
         }
@@ -732,19 +729,25 @@ fn claude_assistant_effect(value: &Value) -> StreamLineEffect {
             let detail = item
                 .pointer("/input/description")
                 .and_then(Value::as_str)
-                .or_else(|| item.pointer("/input/command").and_then(Value::as_str));
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    item.pointer("/input/command")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                });
             return StreamLineEffect::Progress(match detail {
                 Some(d) => format!("{tool_name}: {d}"),
                 None => tool_name.to_string(),
             });
         }
     }
-    for item in content {
-        if item.get("type").and_then(Value::as_str) == Some("text")
-            && let Some(text) = item.get("text").and_then(Value::as_str)
-        {
-            return StreamLineEffect::AssistantText(text.to_string());
-        }
+    let texts: Vec<&str> = content
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect();
+    if !texts.is_empty() {
+        return StreamLineEffect::AssistantText(texts.join(""));
     }
     StreamLineEffect::Ignore
 }
@@ -770,6 +773,7 @@ fn parse_agy_line(line: &str) -> StreamLineEffect {
                 let reason = value
                     .pointer("/result/error")
                     .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
                     .unwrap_or(status);
                 return StreamLineEffect::Failure(reason.to_string());
             }
@@ -792,8 +796,13 @@ fn agy_step_update_effect(value: &Value) -> StreamLineEffect {
     let step_type = step
         .get("step_type")
         .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
         .unwrap_or("step");
-    let detail = match step.get("tool_name").and_then(Value::as_str) {
+    let detail = match step
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+    {
         Some(tool_name) => format!("{step_type}: {tool_name}"),
         None => step_type.to_string(),
     };
@@ -1747,6 +1756,144 @@ mod tests {
         assert!(
             err.contains("explanation of the failure"),
             "diagnostic text after the bad byte was lost: {err}"
+        );
+    }
+
+    #[test]
+    fn claude_dialect_concatenates_multiple_text_blocks_in_assistant_message() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Part 1. "},{"type":"text","text":"Part 2."}]}}"#;
+        assert_eq!(
+            parse_claude_line(line),
+            StreamLineEffect::AssistantText("Part 1. Part 2.".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_dialect_falls_back_to_command_when_description_is_empty_string() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"cat README.md","description":""}}]}}"#;
+        assert_eq!(
+            parse_claude_line(line),
+            StreamLineEffect::Progress("Bash: cat README.md".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_dialect_error_result_falls_back_when_result_field_is_empty() {
+        let line =
+            r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":""}"#;
+        match parse_claude_line(line) {
+            StreamLineEffect::Failure(reason) => {
+                assert!(!reason.is_empty(), "reason must not be empty");
+                assert_eq!(reason, "error_during_execution");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agy_dialect_falls_back_to_status_when_error_field_is_empty_string() {
+        let line = r#"{"event":"result","result":{"status":"PERMISSION_DENIED","error":""}}"#;
+        match parse_agy_line(line) {
+            StreamLineEffect::Failure(reason) => assert_eq!(reason, "PERMISSION_DENIED"),
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agy_dialect_omits_colon_when_tool_name_is_empty_string() {
+        let line =
+            r#"{"event":"step_update","step_update":{"step_type":"thinking","tool_name":""}}"#;
+        assert_eq!(
+            parse_agy_line(line),
+            StreamLineEffect::Progress("thinking".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_progress_flood_does_not_starve_subsequent_assistant_text() {
+        let chunk = "x".repeat(1024);
+        let script = format!(
+            r#"i=0; while [ $i -lt 1100 ]; do printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"command":"{chunk}"}}}}]}}}}'; i=$((i+1)); done; printf '%s\n' '{{"type":"assistant","message":{{"content":[{{"type":"text","text":"final valid reply"}}]}}}}'; exit 0"#
+        );
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec!["-c".into(), script],
+                system_arg: None,
+                dialect: Some(StreamDialect::ClaudeJson),
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+
+        let reply = p
+            .send_with_progress(None, "ignored", &ProgressSink::disconnected())
+            .await
+            .expect("should not fail with produced no output");
+        assert_eq!(reply.text, "final valid reply");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonstreaming_child_does_not_inherit_stdin_and_blocks() {
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec!["-c".into(), "cat; echo done".into()],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+        let reply = p
+            .send_with_timeout(None, "ignored", Duration::from_millis(200))
+            .await
+            .expect("cat on null stdin should exit immediately");
+        assert_eq!(reply.text, "done");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_post_stream_wait_timeout_carries_typed_timeout_failure() {
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec!["-c".into(), "exec 1>&-; sleep 5".into()],
+                system_arg: None,
+                dialect: Some(StreamDialect::ClaudeJson),
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+
+        let err = p
+            .send_streaming_with_timeouts(
+                StreamDialect::ClaudeJson,
+                None,
+                "ignored",
+                &ProgressSink::disconnected(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        let timeout = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::providers::ProviderFailure>());
+        assert!(
+            matches!(timeout, Some(crate::providers::ProviderFailure::Timeout)),
+            "expected Timeout, got {timeout:?}"
         );
     }
 }

@@ -1132,6 +1132,42 @@ mod tests {
     }
 
     #[test]
+    fn custom_endpoints_are_found_by_settings_endpoint_case_insensitively() {
+        let mut settings = Settings::default();
+        settings.custom_endpoints.insert(
+            "my-gateway".to_string(),
+            crate::config::CloudEndpoint {
+                api: crate::config::Api::OpenAiCompatible,
+                base_url: "https://example.invalid/v1".into(),
+                default_model: "some-model".into(),
+            },
+        );
+        assert!(
+            settings.endpoint("MY-GATEWAY").is_some(),
+            "settings.endpoint must resolve custom endpoints case-insensitively"
+        );
+    }
+
+    #[test]
+    fn auth_resolves_custom_endpoints_with_case_variations() {
+        let mut settings = Settings::default();
+        settings.custom_endpoints.insert(
+            "my-gateway".to_string(),
+            crate::config::CloudEndpoint {
+                api: crate::config::Api::OpenAiCompatible,
+                base_url: "https://example.invalid/v1".into(),
+                default_model: "some-model".into(),
+            },
+        );
+        let resolved = resolve_canonical_service("MY-GATEWAY", &settings);
+        assert_eq!(
+            resolved, "my-gateway",
+            "must resolve case-insensitively to custom endpoint key"
+        );
+        assert!(settings.endpoint(&resolved).is_some());
+    }
+
+    #[test]
     fn auth_preserves_a_custom_endpoints_exact_name_case_and_all() {
         // The other half of the same function: a custom endpoint the user named
         // explicitly in config.json must keep that exact spelling, never routed

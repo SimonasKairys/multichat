@@ -290,7 +290,7 @@ impl Workspace {
         // on the way redirects that ancestor outside `self.root`, refuse here,
         // before `create_dir_all` ever runs, instead of after.
         let mut anchor = parent;
-        while !anchor.exists() {
+        while fs::symlink_metadata(anchor).is_err() {
             let Some(next) = anchor.parent() else {
                 // Unreachable in practice: `self.root` itself always exists (`new`
                 // checked that), and `parent` is `self.root` joined with more
@@ -304,8 +304,34 @@ impl Workspace {
             };
             anchor = next;
         }
-        let resolved_anchor = fs::canonicalize(anchor)
-            .with_context(|| format!("failed to resolve {}", anchor.display()))?;
+        let resolved_anchor = if fs::symlink_metadata(anchor)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            if let Ok(resolved) = fs::canonicalize(anchor) {
+                resolved
+            } else {
+                let target = fs::read_link(anchor)
+                    .with_context(|| format!("failed to read link {}", anchor.display()))?;
+                let target_path = if target.is_relative() {
+                    anchor.parent().unwrap_or(Path::new("")).join(&target)
+                } else {
+                    target
+                };
+                let mut t_anchor = target_path.as_path();
+                while !t_anchor.exists() {
+                    let Some(next) = t_anchor.parent() else {
+                        break;
+                    };
+                    t_anchor = next;
+                }
+                fs::canonicalize(t_anchor)
+                    .with_context(|| format!("failed to resolve {}", t_anchor.display()))?
+            }
+        } else {
+            fs::canonicalize(anchor)
+                .with_context(|| format!("failed to resolve {}", anchor.display()))?
+        };
         if !resolved_anchor.starts_with(&self.root) {
             return Err(anyhow!(
                 "project path `{requested}` resolves outside the project folder"
@@ -691,5 +717,34 @@ mod tests {
         // file itself was never written.
         assert!(!real_git.join("sub").exists());
         assert!(!real_git.join("sub").join("file.sh").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reproduction_test_write_through_dangling_symlink_escapes_sandbox_and_creates_outside_dir() {
+        let (guard, w) = workspace();
+        let outside_dir = guard.path().join("outside");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let non_existent_target = outside_dir.join("nonexistent_subdir");
+        assert!(!non_existent_target.exists());
+
+        std::os::unix::fs::symlink(&non_existent_target, w.root().join("broken_link")).unwrap();
+
+        let err = w
+            .write("broken_link/sub/file.txt", "payload")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("outside") || err.contains("symlink") || err.contains("ancestor"),
+            "unexpected error: {err}"
+        );
+
+        // The critical security invariant: create_dir_all must NEVER have run against the outside target,
+        // so outside_dir/nonexistent_subdir must NOT exist!
+        assert!(
+            !non_existent_target.exists(),
+            "VULNERABILITY: create_dir_all created directories outside the project root through a dangling symlink!"
+        );
+        assert!(!non_existent_target.join("sub").exists());
     }
 }

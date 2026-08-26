@@ -50,18 +50,18 @@ fn parse_description(head: &str) -> Option<String> {
     if lines.next()?.trim() != "---" {
         return None;
     }
+    let mut description = None;
     for line in lines {
         let trimmed = line.trim();
         if trimmed == "---" {
-            // Closing fence reached with no description line found.
-            return None;
+            // Closing fence reached.
+            return description;
         }
         if let Some(value) = trimmed.strip_prefix("description:") {
             let value = value.trim();
-            if value.is_empty() {
-                return None;
+            if !value.is_empty() && description.is_none() {
+                description = Some(value.to_string());
             }
-            return Some(value.to_string());
         }
     }
     // Ran off the end of the head (or the file) without a closing fence. Since we
@@ -424,5 +424,22 @@ mod tests {
         let metas = s.list_with_descriptions().unwrap();
         let alias = metas.iter().find(|m| m.name == "alias.md").unwrap();
         assert_eq!(alias.description.as_deref(), Some("a real in-root skill"));
+    }
+
+    #[test]
+    fn unclosed_frontmatter_containing_description_yields_no_description() {
+        let (_guard, s) = skills();
+        fs::write(
+            s.root().join("unclosed_with_desc.md"),
+            "---\nname: unclosed\ndescription: should not be leaked without closing fence\nbody without fence\n",
+        )
+        .unwrap();
+        let metas = s.list_with_descriptions().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].name, "unclosed_with_desc.md");
+        assert_eq!(
+            metas[0].description, None,
+            "unclosed frontmatter must not leak description"
+        );
     }
 }

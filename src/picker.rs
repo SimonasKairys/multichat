@@ -287,7 +287,7 @@ impl PickerState {
     /// to attempt storing.
     pub fn submit_key_entry(&mut self) -> Option<(String, String)> {
         let (candidate, is_empty) = match &self.mode {
-            Mode::EnteringKey { candidate, buffer } => (*candidate, buffer.is_empty()),
+            Mode::EnteringKey { candidate, buffer } => (*candidate, buffer.trim().is_empty()),
             Mode::Browsing => return None,
         };
 
@@ -672,6 +672,25 @@ mod tests {
         assert!(picker.key_entry().is_none());
         // Cancelling leaves the row exactly as it was: unavailable and un-ticked.
         assert!(!picker.is_checked(0, 1));
+    }
+
+    #[test]
+    fn submitting_a_whitespace_only_key_stores_nothing_and_flashes() {
+        let candidates = vec![candidate_dual("anthropic", true)];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down();
+        picker.toggle();
+        picker.push_key_char(' ');
+        picker.push_key_char(' ');
+
+        let result = picker.submit_key_entry();
+
+        assert!(
+            result.is_none(),
+            "whitespace-only key must not be submitted"
+        );
+        assert!(picker.key_entry().is_none());
+        assert_eq!(picker.flash.as_deref(), Some("empty key — nothing stored"));
     }
 
     #[test]

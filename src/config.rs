@@ -1,6 +1,6 @@
 //! Application paths, persisted settings, and credential storage.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
 use keyring::Entry;
 use secrecy::SecretString;
@@ -35,6 +35,9 @@ impl Paths {
     /// Builds paths rooted at an explicit directory. Used by tests and by
     /// `SIMON_DATA_DIR` overrides.
     pub fn from_data_dir(data_dir: PathBuf) -> Result<Self> {
+        if data_dir.as_os_str().is_empty() {
+            bail!("cannot construct paths from an empty data directory path");
+        }
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("failed to create data directory {}", data_dir.display()))?;
         let skills_dir = data_dir.join("skills");
@@ -60,10 +63,11 @@ impl Paths {
     }
 
     /// Honours `SIMON_DATA_DIR` when set, otherwise the platform default.
+    /// Honours `SIMON_DATA_DIR` when set and non-empty, otherwise the platform default.
     pub fn resolve_with_env() -> Result<Self> {
         match std::env::var_os("SIMON_DATA_DIR") {
-            Some(dir) => Self::from_data_dir(PathBuf::from(dir)),
-            None => Self::resolve(),
+            Some(dir) if !dir.is_empty() => Self::from_data_dir(PathBuf::from(dir)),
+            _ => Self::resolve(),
         }
     }
 }
@@ -272,8 +276,9 @@ impl Settings {
     /// Resolves a provider name to an endpoint, preferring user overrides.
     pub fn endpoint(&self, provider: &str) -> Option<CloudEndpoint> {
         self.custom_endpoints
-            .get(provider)
-            .cloned()
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(provider))
+            .map(|(_, v)| v.clone())
             .or_else(|| builtin_endpoint(provider))
     }
 }
@@ -668,6 +673,16 @@ mod tests {
             err.to_string()
                 .contains("refusing to store an empty credential"),
             "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_data_dir_path_is_rejected() {
+        let err = Paths::from_data_dir(PathBuf::from(""))
+            .expect_err("an empty data directory path must be rejected with a clear error");
+        assert!(
+            err.to_string().contains("empty data directory"),
+            "expected error context for empty data dir, got: {err:#}"
         );
     }
 

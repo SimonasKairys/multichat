@@ -2006,6 +2006,33 @@ mod tests {
     }
 
     #[test]
+    fn test_claude_dialect_top_level_whitespace_only_message_falls_through_to_default_reason() {
+        // No `error` field, and `message` is whitespace-only -- the `or_else` fallback
+        // must reject it (not accept it as the failure reason), so this falls all the
+        // way through to the generic "error" default.
+        let line = r#"{"type":"error","message":"   "}"#;
+        match parse_claude_line(line) {
+            StreamLineEffect::Failure(reason) => {
+                assert_eq!(reason, "error");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_claude_dialect_top_level_message_is_used_as_failure_reason() {
+        // No `error` field, but `message` carries real text -- the `or_else` fallback
+        // must accept and surface it verbatim.
+        let line = r#"{"type":"error","message":"real text"}"#;
+        match parse_claude_line(line) {
+            StreamLineEffect::Failure(reason) => {
+                assert_eq!(reason, "real text");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_reproduction_claude_dialect_extracts_error_object_message_on_result() {
         let line = r#"{"type":"result","is_error":true,"result":"","error":{"message":"Credit balance is too low"}}"#;
         match parse_claude_line(line) {

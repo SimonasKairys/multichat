@@ -234,6 +234,17 @@ async fn reopen_picker(
 
 /// Runs the picker to completion inside an already-entered terminal. Discovery runs
 /// on a background task so the draw loop never blocks on it.
+///
+/// This loop itself is not unit-tested: it drives a live `crossterm::EventStream`,
+/// and there is no injectable event source to feed it a scripted key sequence from a
+/// test. That is not a coverage gap in disguise, though — every decision this loop
+/// makes about a keypress (which mode routes it, what it does, whether to submit or
+/// cancel) has already been factored out into `handle_picker_key`, which is a pure
+/// function and is exercised directly by the `handle_picker_key_*` tests below. What
+/// stays untested here is strictly the glue: reading the next terminal event, the
+/// `select!` between that and the discovery channel, and threading a submitted key
+/// through to `Credentials::set`.
+#[cfg_attr(test, mutants::skip)]
 async fn run_picker(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     input: &mut EventStream,
@@ -1104,6 +1115,321 @@ mod tests {
         assert!(
             picker.key_entry().is_none(),
             "Ctrl+C must cancel key entry mode"
+        );
+    }
+
+    // --- handle_picker_key: browsing mode ---------------------------------------
+
+    /// `n` single-transport, always-available candidates, one row each — enough to
+    /// exercise cursor movement, toggling, and commander selection without any
+    /// transport-cycling or key-entry complications.
+    fn browsing_picker(ids: &[&str]) -> PickerState {
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+        let candidates: Vec<Candidate> = ids
+            .iter()
+            .map(|id| Candidate {
+                id: (*id).to_string(),
+                group: "GROUP".into(),
+                model: (*id).to_string(),
+                transports: vec![TransportOption {
+                    transport: None,
+                    label: String::new(),
+                    detail: String::new(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                }],
+            })
+            .collect();
+        PickerState::new(candidates, &std::collections::BTreeMap::new(), None, false)
+    }
+
+    /// A candidate with two always-available transport rows, for exercising Tab's
+    /// cycle without hitting the "nothing else to switch to" refusal path.
+    fn dual_available_picker(id: &str) -> PickerState {
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+        let candidate = Candidate {
+            id: id.into(),
+            group: "GROUP".into(),
+            model: id.into(),
+            transports: vec![
+                TransportOption {
+                    transport: None,
+                    label: "first".into(),
+                    detail: String::new(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                },
+                TransportOption {
+                    transport: None,
+                    label: "second".into(),
+                    detail: String::new(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                },
+            ],
+        };
+        PickerState::new(
+            vec![candidate],
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn handle_picker_key_down_moves_cursor_to_the_next_row() {
+        let mut picker = browsing_picker(&["a", "b"]);
+        assert_eq!(picker.cursor(), 0);
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Down, KeyModifiers::NONE);
+
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert_eq!(
+            picker.cursor(),
+            1,
+            "Down must move the cursor to the next row"
+        );
+    }
+
+    #[test]
+    fn handle_picker_key_up_moves_cursor_to_the_previous_row() {
+        let mut picker = browsing_picker(&["a", "b"]);
+        picker.move_down();
+        assert_eq!(picker.cursor(), 1);
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Up, KeyModifiers::NONE);
+
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert_eq!(
+            picker.cursor(),
+            0,
+            "Up must move the cursor to the previous row"
+        );
+    }
+
+    #[test]
+    fn handle_picker_key_space_toggles_only_without_control() {
+        let mut picker = browsing_picker(&["a"]);
+        assert!(!picker.is_checked(0, 0));
+
+        // Ctrl+Space must be a no-op for the checkbox — it must not toggle.
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char(' '), KeyModifiers::CONTROL);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert!(
+            !picker.is_checked(0, 0),
+            "Ctrl+Space must not toggle the highlighted row"
+        );
+
+        // Plain space must toggle it on.
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert!(
+            picker.is_checked(0, 0),
+            "plain space must toggle the highlighted row"
+        );
+    }
+
+    #[test]
+    fn handle_picker_key_tab_cycles_the_transport() {
+        let mut picker = dual_available_picker("dual");
+        // Enable the row on its first transport so the cycle is observable through
+        // `is_checked` (an un-enabled row reports not-checked for every transport
+        // regardless of which one is "chosen").
+        handle_picker_key(&mut picker, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(picker.is_checked(0, 0));
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Tab, KeyModifiers::NONE);
+
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert!(
+            picker.is_checked(0, 1),
+            "Tab must cycle the enabled row onto the second transport"
+        );
+        assert!(
+            !picker.is_checked(0, 0),
+            "the first transport must no longer be the chosen one after Tab"
+        );
+    }
+
+    #[test]
+    fn handle_picker_key_plain_c_sets_commander_and_does_not_cancel() {
+        let mut picker = browsing_picker(&["a"]);
+        // `set_commander` refuses a row that isn't ticked, so tick it first.
+        picker.toggle();
+        assert!(!picker.is_commander(0, 0));
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('c'), KeyModifiers::NONE);
+
+        assert_eq!(
+            outcome,
+            PickerKeyOutcome::Continue,
+            "plain 'c' must not cancel the picker"
+        );
+        assert!(
+            picker.is_commander(0, 0),
+            "plain 'c' must set the highlighted row as commander"
+        );
+    }
+
+    #[test]
+    fn handle_picker_key_enter_submits_in_browsing_mode() {
+        let mut picker = browsing_picker(&["a"]);
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(outcome, PickerKeyOutcome::Submit);
+    }
+
+    #[test]
+    fn handle_picker_key_esc_cancels_in_browsing_mode() {
+        let mut picker = browsing_picker(&["a"]);
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(outcome, PickerKeyOutcome::Cancel);
+    }
+
+    #[test]
+    fn handle_picker_key_q_cancels_only_without_control() {
+        let mut picker = browsing_picker(&["a"]);
+
+        // Ctrl+Q must not cancel — it must fall through as a no-op.
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert_eq!(
+            outcome,
+            PickerKeyOutcome::Continue,
+            "Ctrl+Q must not cancel the picker"
+        );
+
+        // Plain 'q' must cancel.
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(
+            outcome,
+            PickerKeyOutcome::Cancel,
+            "plain 'q' must cancel the picker"
+        );
+    }
+
+    // --- handle_picker_key: key-entry mode ---------------------------------------
+
+    /// A single candidate whose only transport needs a key, already ticked into key
+    /// entry — everything below routes keys through `handle_picker_key` while
+    /// `state.key_entry().is_some()`.
+    fn key_entry_picker() -> PickerState {
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+        let candidate = Candidate {
+            id: "needs-key".into(),
+            group: "GROUP".into(),
+            model: "needs-key".into(),
+            transports: vec![TransportOption {
+                transport: None,
+                label: String::new(),
+                detail: String::new(),
+                availability: Availability::Unavailable("no key".into()),
+                cli: None,
+                needs_key: true,
+            }],
+        };
+        let mut picker = PickerState::new(
+            vec![candidate],
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+        );
+        picker.toggle(); // opens key entry
+        assert!(picker.key_entry().is_some());
+        picker
+    }
+
+    #[test]
+    fn handle_picker_key_esc_cancels_key_entry() {
+        let mut picker = key_entry_picker();
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert!(
+            picker.key_entry().is_none(),
+            "Esc must cancel key entry and return to browsing"
+        );
+    }
+
+    #[test]
+    fn handle_picker_key_ctrl_c_cancels_key_entry_but_plain_c_types() {
+        let mut picker = key_entry_picker();
+
+        // Plain 'c' (no modifiers) must be typed into the key buffer, not treated as
+        // a cancel chord.
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('c'), KeyModifiers::NONE);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert_eq!(
+            picker.key_entry().unwrap().1,
+            1,
+            "plain 'c' must be appended to the key buffer, not cancel key entry"
+        );
+
+        // Ctrl+C must cancel key entry.
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert!(picker.key_entry().is_none(), "Ctrl+C must cancel key entry");
+    }
+
+    #[test]
+    fn handle_picker_key_backspace_deletes_the_last_typed_character() {
+        let mut picker = key_entry_picker();
+        handle_picker_key(&mut picker, KeyCode::Char('x'), KeyModifiers::NONE);
+        handle_picker_key(&mut picker, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(picker.key_entry().unwrap().1, 2);
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Backspace, KeyModifiers::NONE);
+
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert_eq!(
+            picker.key_entry().unwrap().1,
+            1,
+            "Backspace must delete exactly one character from the key buffer"
+        );
+    }
+
+    #[test]
+    fn handle_picker_key_enter_submits_key_entry() {
+        let mut picker = key_entry_picker();
+        handle_picker_key(&mut picker, KeyCode::Char('s'), KeyModifiers::NONE);
+        handle_picker_key(&mut picker, KeyCode::Char('k'), KeyModifiers::NONE);
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(outcome, PickerKeyOutcome::Submit);
+    }
+
+    #[test]
+    fn handle_picker_key_plain_characters_type_but_control_chords_do_not() {
+        let mut picker = key_entry_picker();
+        assert_eq!(picker.key_entry().unwrap().1, 0);
+
+        // A plain character must be appended.
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert_eq!(
+            picker.key_entry().unwrap().1,
+            1,
+            "a plain character must be appended to the key buffer"
+        );
+
+        // A non-'c' Ctrl chord must not be appended (and must not cancel either).
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert_eq!(
+            picker.key_entry().unwrap().1,
+            1,
+            "Ctrl+A must not be appended to the key buffer"
+        );
+        assert!(
+            picker.key_entry().is_some(),
+            "Ctrl+A must not cancel key entry"
         );
     }
 }

@@ -850,6 +850,65 @@ mod tests {
         );
     }
 
+    /// Builds a chain of `hops` symlinks under `root`, named `chain_link_0` through
+    /// `chain_link_{hops-1}`, where each links to the next and the last links to a
+    /// freshly created real directory `chain_target` (which is left empty, so the
+    /// anchor walk in `write` backs off to `chain_link_0` — see the comment on
+    /// `resolved_anchor` in `write`). Returns the real target directory.
+    #[cfg(unix)]
+    fn build_symlink_chain(root: &Path, hops: usize) -> PathBuf {
+        assert!(hops > 0, "a chain needs at least one hop");
+        let target = root.join("chain_target");
+        fs::create_dir_all(&target).unwrap();
+        for i in (0..hops).rev() {
+            let link_path = root.join(format!("chain_link_{i}"));
+            if i == hops - 1 {
+                std::os::unix::fs::symlink("chain_target", &link_path).unwrap();
+            } else {
+                std::os::unix::fs::symlink(format!("chain_link_{}", i + 1), &link_path).unwrap();
+            }
+        }
+        target
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_chain_of_exactly_forty_hops_is_not_refused_for_exceeding_the_limit() {
+        let (_guard, w) = workspace();
+        build_symlink_chain(w.root(), 40);
+
+        let result = w.write("chain_link_0/sub/file.txt", "payload");
+
+        // The chain resolves to a real directory inside the project root, so this
+        // must not be refused at all -- and in particular the hop-limit message
+        // (which fires only when depth exceeds 40) must never appear.
+        match result {
+            Ok(path) => {
+                assert_eq!(fs::read_to_string(&path).unwrap(), "payload");
+            }
+            Err(e) => {
+                panic!("a chain of exactly 40 hops must resolve successfully, got error: {e}")
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_chain_of_forty_one_hops_is_refused_as_too_many_levels() {
+        let (_guard, w) = workspace();
+        build_symlink_chain(w.root(), 41);
+
+        let err = w
+            .write("chain_link_0/sub/file.txt", "payload")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("too many levels of symbolic links"),
+            "expected the hop-limit error for a 41-hop chain, got: {err}"
+        );
+    }
+
     #[test]
     fn reproduction_test_workspace_under_dot_git_parent_allows_writes() {
         let dir = tempfile::tempdir().unwrap();

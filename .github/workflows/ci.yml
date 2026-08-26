@@ -32,7 +32,25 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --all-targets
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --all-targets 2>&1 | tee test-output.txt
+
+      # Job logs need admin rights to download through the API; annotations do not, and
+      # they show up in the run's summary either way. Without this, a platform-specific
+      # failure is visible only to someone who can open the log in a browser — which is
+      # how a Windows-only break here turned into a round of guessing.
+      - name: Surface the failure as an annotation
+        if: failure()
+        shell: bash
+        run: |
+          detail=$(grep -E "^test .*FAILED|panicked at|^assertion|^  left:|^ right:|^failures:" test-output.txt | head -40)
+          if [ -z "$detail" ]; then
+            detail=$(tail -40 test-output.txt)
+          fi
+          # Annotations are single-line; %0A is how a newline is encoded in one.
+          echo "::error title=${{ matrix.os }} tests::$(echo "$detail" | sed 's/%/%25/g; s/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
 
       - name: Build release
         run: cargo build --release

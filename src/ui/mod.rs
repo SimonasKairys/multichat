@@ -266,11 +266,8 @@ async fn run_picker(
                                 // and letting `q`/`Esc` fall through would make
                                 // "cancel the prompt" indistinguishable from "quit
                                 // the picker".
-                                match key.code {
-                                    KeyCode::Char(c) => state.push_key_char(c),
-                                    KeyCode::Backspace => state.backspace_key(),
-                                    KeyCode::Esc => state.cancel_key_entry(),
-                                    KeyCode::Enter => {
+                                match handle_picker_key(state, key.code, key.modifiers) {
+                                    PickerKeyOutcome::Submit => {
                                         if let Some((id, mut key_text)) =
                                             state.submit_key_entry()
                                         {
@@ -292,25 +289,35 @@ async fn run_picker(
                                             key_text.zeroize();
                                         }
                                     }
-                                    _ => {}
+                                    PickerKeyOutcome::Cancel | PickerKeyOutcome::Continue => {}
                                 }
                             } else {
-                                match key.code {
-                                    KeyCode::Up => state.move_up(),
-                                    KeyCode::Down => state.move_down(),
-                                    KeyCode::Char(' ') => state.toggle(),
-                                    KeyCode::Tab => state.cycle_transport(),
-                                    KeyCode::Char('c') => state.set_commander(),
-                                    KeyCode::Enter => {
+                                match handle_picker_key(state, key.code, key.modifiers) {
+                                    PickerKeyOutcome::Submit => {
                                         if let Some((connections, commander)) = state.submit() {
                                             settings.connections = connections;
                                             settings.commander = commander;
                                             return Ok(true);
                                         }
                                     }
-                                    KeyCode::Esc | KeyCode::Char('q') => return Ok(false),
-                                    _ => {}
+                                    PickerKeyOutcome::Cancel => return Ok(false),
+                                    PickerKeyOutcome::Continue => {}
                                 }
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Esc => return Ok(false),
+                                KeyCode::Char('q')
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    return Ok(false);
+                                }
+                                KeyCode::Char('c') | KeyCode::Char('C')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    return Ok(false);
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -330,6 +337,78 @@ async fn run_picker(
                     ));
                 }
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerKeyOutcome {
+    Continue,
+    Submit,
+    Cancel,
+}
+
+pub(crate) fn handle_picker_key(
+    state: &mut PickerState,
+    code: KeyCode,
+    modifiers: KeyModifiers,
+) -> PickerKeyOutcome {
+    if state.key_entry().is_some() {
+        match code {
+            KeyCode::Esc => {
+                state.cancel_key_entry();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                state.cancel_key_entry();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Backspace => {
+                state.backspace_key();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Enter => PickerKeyOutcome::Submit,
+            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                state.push_key_char(c);
+                PickerKeyOutcome::Continue
+            }
+            _ => PickerKeyOutcome::Continue,
+        }
+    } else {
+        match code {
+            KeyCode::Up => {
+                state.move_up();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Down => {
+                state.move_down();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Char(' ') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                state.toggle();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Tab => {
+                state.cycle_transport();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                PickerKeyOutcome::Cancel
+            }
+            KeyCode::Char('c') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                state.set_commander();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Enter => PickerKeyOutcome::Submit,
+            KeyCode::Esc => PickerKeyOutcome::Cancel,
+            KeyCode::Char('q') if !modifiers.contains(KeyModifiers::CONTROL) => {
+                PickerKeyOutcome::Cancel
+            }
+            _ => PickerKeyOutcome::Continue,
         }
     }
 }
@@ -946,5 +1025,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn reproduction_test_picker_ctrl_c_in_browsing_mode_cancels_instead_of_setting_commander() {
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+        let candidate = Candidate {
+            id: "ollama:llama3".into(),
+            group: "OLLAMA".into(),
+            model: "ollama:llama3".into(),
+            transports: vec![TransportOption {
+                transport: None,
+                label: String::new(),
+                detail: String::new(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        };
+        let mut picker = PickerState::new(
+            vec![candidate],
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+        );
+        assert!(!picker.is_commander(0, 0));
+
+        // When user presses Ctrl+C in browsing mode, it must cancel the picker rather than setting commander
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            outcome,
+            PickerKeyOutcome::Cancel,
+            "Ctrl+C in browsing mode must cancel the picker"
+        );
+        assert!(
+            !picker.is_commander(0, 0),
+            "Ctrl+C must not mark the highlighted candidate as commander"
+        );
+    }
+
+    #[test]
+    fn reproduction_test_picker_ctrl_chords_in_key_entry_do_not_type_characters() {
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+        let candidate = Candidate {
+            id: "anthropic".into(),
+            group: "ANTHROPIC".into(),
+            model: "claude".into(),
+            transports: vec![TransportOption {
+                transport: None,
+                label: String::new(),
+                detail: String::new(),
+                availability: Availability::Unavailable("no key".into()),
+                cli: None,
+                needs_key: true,
+            }],
+        };
+        let mut picker = PickerState::new(
+            vec![candidate],
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+        );
+        picker.toggle(); // opens key entry
+        assert!(picker.key_entry().is_some());
+
+        // Pressing Ctrl+V or Ctrl+A should not append 'v' or 'a' to the secret key buffer
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert_eq!(
+            picker.key_entry().unwrap().1,
+            0,
+            "Ctrl+V must not insert 'v' into the key buffer"
+        );
+
+        // Pressing Ctrl+C in key entry mode should cancel key entry
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert!(
+            picker.key_entry().is_none(),
+            "Ctrl+C must cancel key entry mode"
+        );
     }
 }

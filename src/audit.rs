@@ -516,7 +516,10 @@ impl AuditLogger {
             return; // Never let anchor bookkeeping fail an open() or a Drop.
         };
 
-        let should_write = match &self.keyring_anchor {
+        // Query the live keyring anchor to ensure we never regress an anchor that was
+        // advanced concurrently by another process while this logger was open.
+        let live_keyring = read_keyring_anchor(&self.path);
+        let should_write = match &live_keyring {
             None => true,
             // Existing anchor doesn't even authenticate itself — it was tampered with.
             // Leave it in place as evidence rather than overwriting it.
@@ -532,6 +535,14 @@ impl AuditLogger {
         };
 
         if should_write {
+            if let Some(existing) = &live_keyring
+                && existing.count == candidate.count
+                && existing.last_mac == candidate.last_mac
+            {
+                self.keyring_anchor = Some(candidate);
+                return;
+            }
+
             let json = match serde_json::to_string(&candidate) {
                 Ok(j) => j,
                 Err(_) => return,
@@ -954,7 +965,10 @@ fn read_keyring_anchor(log_path: &Path) -> Option<Anchor> {
 /// find a previous anchor filed under the canonical form, which `verify()` treats as
 /// "no anchor yet" (see `AnchorStatus::Missing`), not as tampering.
 fn keyring_anchor_service(log_path: &Path) -> String {
-    let parent = log_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = match log_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
     let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
     let file_name = log_path
         .file_name()
@@ -1969,5 +1983,56 @@ mod tests {
 
         drop(holder);
         assert_eq!(mac_at_position(&path, 1).unwrap(), None);
+    }
+
+    #[test]
+    fn reproduction_test_keyring_anchor_service_bare_filename_resolves_to_same_identity_as_dot_slash()
+     {
+        let bare = Path::new("audit.log");
+        let dot_slash = Path::new("./audit.log");
+        let full = std::env::current_dir().unwrap().join("audit.log");
+
+        assert_eq!(
+            keyring_anchor_service(bare),
+            keyring_anchor_service(dot_slash),
+            "bare filename and ./ relative path must resolve to the same keyring service name"
+        );
+        assert_eq!(
+            keyring_anchor_service(bare),
+            keyring_anchor_service(&full),
+            "bare filename and absolute path in current dir must resolve to the same keyring service name"
+        );
+    }
+
+    #[test]
+    fn reproduction_test_sync_keyring_anchor_does_not_regress_concurrently_advanced_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.log");
+
+        let _ = Credentials::delete(&keyring_anchor_service(&log_path));
+
+        let logger1 = AuditLogger::open(log_path.clone()).unwrap();
+
+        {
+            let mut logger2 = AuditLogger::open(log_path.clone()).unwrap();
+            logger2.log("a", "one").unwrap();
+            logger2.log("b", "two").unwrap();
+            logger2.log("c", "three").unwrap();
+        }
+
+        let anchor_after_logger2 =
+            read_keyring_anchor(&log_path).expect("keyring should have anchor");
+        assert_eq!(anchor_after_logger2.count, 3);
+
+        drop(logger1);
+
+        let anchor_after_logger1_drop =
+            read_keyring_anchor(&log_path).expect("keyring anchor must still exist");
+        assert_eq!(
+            anchor_after_logger1_drop.count, 3,
+            "stale logger drop regressed keyring anchor from 3 to 0!"
+        );
+
+        let _ = Credentials::delete(&keyring_anchor_service(&log_path));
     }
 }

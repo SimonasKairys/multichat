@@ -63,10 +63,14 @@ impl RateLimit {
             tokens_remaining: get(&[
                 "anthropic-ratelimit-tokens-remaining",
                 "x-ratelimit-remaining-tokens",
+                "x-ratelimit-tokens-remaining",
             ]),
             reset_after: get(&[
                 "anthropic-ratelimit-requests-reset",
+                "anthropic-ratelimit-tokens-reset",
+                "anthropic-ratelimit-reset",
                 "x-ratelimit-reset-requests",
+                "x-ratelimit-reset-tokens",
                 "x-ratelimit-reset",
                 "retry-after",
             ]),
@@ -303,5 +307,23 @@ mod tests {
         let rl = RateLimit::from_headers(&headers);
         assert!(rl.requests_remaining.is_none());
         assert!(rl.summary().is_none());
+    }
+
+    #[test]
+    fn test_reproduction_ratelimit_parses_token_reset_and_tokens_remaining_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-tokens-reset",
+            HeaderValue::from_static("45"),
+        );
+        headers.insert(
+            "x-ratelimit-tokens-remaining",
+            HeaderValue::from_static("999"),
+        );
+        let rl = RateLimit::from_headers(&headers);
+        assert_eq!(rl.reset_after.as_deref(), Some("45"));
+        assert_eq!(rl.tokens_remaining.as_deref(), Some("999"));
+        assert!(rl.summary().unwrap().contains("999 tokens left"));
+        assert!(rl.summary().unwrap().contains("resets in 45"));
     }
 }

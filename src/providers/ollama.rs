@@ -53,7 +53,13 @@ impl OllamaProvider {
             .map(|models| {
                 models
                     .iter()
-                    .filter_map(|m| m.get("name").and_then(Value::as_str))
+                    .filter_map(|m| {
+                        m.get("name")
+                            .and_then(Value::as_str)
+                            .or_else(|| m.get("model").and_then(Value::as_str))
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    })
                     .map(str::to_string)
                     .collect()
             })
@@ -99,10 +105,20 @@ impl Provider for OllamaProvider {
             .json()
             .await
             .context("Ollama sent a non-JSON reply")?;
+
+        if let Some(err) = parsed
+            .get("error")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+        {
+            return Err(anyhow!("Ollama returned error: {err}"));
+        }
+
         let text = parsed
             .get("response")
             .and_then(Value::as_str)
             .unwrap_or_default()
+            .trim()
             .to_string();
 
         if text.is_empty() {
@@ -259,6 +275,94 @@ mod tests {
                 Some(crate::providers::ProviderFailure::HttpStatus(404))
             ),
             "expected HttpStatus(404), got {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reproduction_ollama_send_surfaces_daemon_error_in_json_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body =
+                    r#"{"error":"model 'llama3' requires 16GB VRAM but only 8GB available"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let p = OllamaProvider::new(format!("http://{addr}"), "llama3", reqwest::Client::new());
+        let err = p.send(None, "hi").await.unwrap_err().to_string();
+        assert!(
+            err.contains("requires 16GB VRAM"),
+            "expected daemon error message to be surfaced, but got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reproduction_ollama_send_rejects_whitespace_only_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"response":"   \n\t  "}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let p = OllamaProvider::new(format!("http://{addr}"), "llama3", reqwest::Client::new());
+        let result = p.send(None, "hi").await;
+        assert!(
+            result.is_err(),
+            "whitespace-only response must be treated as empty response error, but got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reproduction_ollama_list_models_extracts_model_field_when_name_is_missing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"models":[{"model":"mistral:latest"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let models =
+            OllamaProvider::list_models(&format!("http://{addr}"), &reqwest::Client::new())
+                .await
+                .unwrap();
+        assert_eq!(
+            models,
+            vec!["mistral:latest".to_string()],
+            "should extract model name from 'model' field when 'name' is omitted"
         );
     }
 }

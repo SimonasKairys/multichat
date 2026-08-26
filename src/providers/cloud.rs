@@ -126,16 +126,16 @@ impl CloudProvider {
                 Ok(text)
             }
             Api::OpenAiCompatible => {
+                let refusal_field = body
+                    .pointer("/choices/0/message/refusal")
+                    .and_then(Value::as_str);
                 if body
                     .pointer("/choices/0/finish_reason")
                     .and_then(Value::as_str)
                     == Some("refusal")
-                    || body.pointer("/choices/0/message/refusal").is_some()
+                    || refusal_field.is_some()
                 {
-                    let reason = body
-                        .pointer("/choices/0/message/refusal")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unspecified");
+                    let reason = refusal_field.unwrap_or("unspecified");
                     return Err(anyhow!("{} declined this request: {reason}", self.model));
                 }
                 let text = match body.pointer("/choices/0/message/content") {
@@ -388,5 +388,23 @@ mod tests {
     fn cloud_providers_are_always_remote() {
         assert!(provider("anthropic").is_remote());
         assert_eq!(provider("anthropic").label(), "anthropic:claude-opus-5");
+    }
+
+    #[test]
+    fn test_reproduction_openai_null_refusal_is_not_treated_as_decline() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "hello world",
+                    "refusal": null
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(
+            provider("openai").extract_text(&body).unwrap(),
+            "hello world"
+        );
     }
 }

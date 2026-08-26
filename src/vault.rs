@@ -594,6 +594,15 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 
     let tmp = tmp_path_for(path);
+    if let Ok(meta) = fs::symlink_metadata(&tmp)
+        && meta.file_type().is_symlink()
+    {
+        return Err(anyhow!(
+            "refusing to write {} through a symlink",
+            tmp.display()
+        ));
+    }
+
     // A failed write leaves only the temp file behind, never a touched `path`, so
     // nothing to clean up on this branch.
     fs::write(&tmp, bytes).map_err(|e| anyhow!("failed to write {}: {e}", tmp.display()))?;
@@ -1454,5 +1463,33 @@ mod tests {
             "oldest surviving content line"
         );
         assert_eq!(transcript[9].text, "line 15", "newest content line");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reproduction_test_write_atomically_refuses_symlinked_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("vault.enc");
+        let tmp = dir.path().join("vault.enc.tmp");
+        let victim = dir.path().join("victim.txt");
+
+        fs::write(&victim, b"victim data: do not overwrite").unwrap();
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let res = write_atomically(&target, b"secret payload");
+        assert!(
+            res.is_err(),
+            "write_atomically must refuse to write when tmp is a symlink"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("symlink"),
+            "unexpected error message: {err_msg}"
+        );
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"victim data: do not overwrite",
+            "victim file must not be overwritten through symlink tmp"
+        );
     }
 }

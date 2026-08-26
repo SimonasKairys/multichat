@@ -1313,18 +1313,11 @@ impl SwarmLedger {
             // `<path>`. The sibling parsers now hold the same line: this comment used
             // to excuse their permissiveness as costing "one ignored request", which
             // was wrong — see `action_argument` for what a mid-line match really did.
-            let Some(rest) = trimmed.strip_prefix(OPEN_MARKER) else {
+            let Some(inner) = Self::action_argument(line, OPEN_MARKER) else {
                 stripped_lines.push(line);
                 continue;
             };
-            let Some(close) = rest.find(')') else {
-                stripped_lines.push(line);
-                continue;
-            };
-            let path = rest[..close]
-                .trim()
-                .trim_matches(['"', '\'', '`'])
-                .to_string();
+            let path = inner.trim().trim_matches(['"', '\'', '`']).to_string();
             open = Some((path, Vec::new()));
         }
 
@@ -2292,5 +2285,18 @@ mod tests {
             prompt.contains("earlier task(s) omitted"),
             "elision note should announce earlier tasks were omitted"
         );
+    }
+
+    #[test]
+    fn test_reproduction_parse_file_writes_with_parentheses_in_path() {
+        let reply = "ACTION: write_file(data/report_(2026).csv)\ncol1,col2\nACTION: end_file";
+        let (writes, stripped) = SwarmLedger::parse_file_writes(reply);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].path, "data/report_(2026).csv",
+            "parentheses within path must not prematurely terminate path parsing"
+        );
+        assert_eq!(writes[0].content, "col1,col2");
+        assert!(stripped.is_empty());
     }
 }

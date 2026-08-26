@@ -436,8 +436,10 @@ impl PickerState {
             if !sel.enabled {
                 continue;
             }
-            if let Availability::Unavailable(reason) =
-                &candidate.transports[sel.chosen].availability
+            if let Some(Availability::Unavailable(reason)) = candidate
+                .transports
+                .get(sel.chosen)
+                .map(|opt| &opt.availability)
             {
                 self.flash = Some(format!("{}: {reason}", candidate.id));
                 return None;
@@ -447,13 +449,13 @@ impl PickerState {
         let mut connections = BTreeMap::new();
         for (i, candidate) in self.candidates.iter().enumerate() {
             let sel = &self.selections[i];
-            let option = &candidate.transports[sel.chosen];
+            let option = candidate.transports.get(sel.chosen);
             connections.insert(
                 candidate.id.clone(),
                 ConnectionSpec {
                     enabled: sel.enabled,
-                    transport: option.transport,
-                    path: option.cli.as_ref().map(|cli| cli.path.clone()),
+                    transport: option.and_then(|opt| opt.transport),
+                    path: option.and_then(|opt| opt.cli.as_ref().map(|cli| cli.path.clone())),
                     model: None,
                 },
             );
@@ -1169,5 +1171,30 @@ mod tests {
             smuggled.flash.as_deref(),
             Some("anthropic: cloud APIs are refused under --classified")
         );
+    }
+
+    #[test]
+    fn reproduction_test_submit_candidate_with_empty_transports_panics() {
+        let candidates = vec![
+            candidate_single("ollama:llama3"),
+            Candidate {
+                id: "empty_provider".into(),
+                group: "EMPTY".into(),
+                model: "empty".into(),
+                transports: vec![],
+            },
+        ];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        // Select and promote ollama:llama3 (row 0)
+        picker.toggle();
+        picker.set_commander();
+        assert!(picker.is_commander(0, 0));
+
+        // Submitting should succeed and produce connections without panicking on empty_provider
+        let (connections, commander) = picker.submit().expect("submit should succeed");
+        assert_eq!(commander.as_deref(), Some("ollama:llama3"));
+        assert!(connections.contains_key("empty_provider"));
+        assert!(!connections["empty_provider"].enabled);
+        assert_eq!(connections["empty_provider"].transport, None);
     }
 }

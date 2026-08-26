@@ -214,7 +214,7 @@ impl Workspace {
                 "project file `{requested}` is {content_len} bytes, over the {MAX_FILE_BYTES}-byte limit"
             ));
         }
-        Self::reject_git_writes(requested, Path::new(requested))
+        self.reject_git_writes(requested, Path::new(requested))
     }
 
     /// Refuses any write whose path passes through a `.git` component.
@@ -230,8 +230,9 @@ impl Workspace {
     /// Applied on every platform, Linux included. A case-insensitive mount (CIFS,
     /// exFAT, NTFS) can sit under a Linux root, and a guard whose behaviour depends on
     /// the host is one people reason about wrongly.
-    fn reject_git_writes(requested: &str, candidate: &Path) -> Result<()> {
-        if candidate.components().any(|c| {
+    fn reject_git_writes(&self, requested: &str, candidate: &Path) -> Result<()> {
+        let relative_candidate = candidate.strip_prefix(&self.root).unwrap_or(candidate);
+        if relative_candidate.components().any(|c| {
             matches!(c, Component::Normal(name) if name.to_string_lossy().eq_ignore_ascii_case(".git"))
         }) {
             return Err(anyhow!(
@@ -268,7 +269,7 @@ impl Workspace {
         // of a `.git` tree and only then refuse. A guard that fires after its own side
         // effect is not a guard. The resolved-path check below stays for the case this
         // lexical one cannot see: a symlink whose target lands inside `.git`.
-        Self::reject_git_writes(requested, candidate)?;
+        self.reject_git_writes(requested, candidate)?;
 
         let joined = self.root.join(candidate);
 
@@ -308,17 +309,28 @@ impl Workspace {
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
         {
-            if let Ok(resolved) = fs::canonicalize(anchor) {
-                resolved
-            } else {
-                let target = fs::read_link(anchor)
-                    .with_context(|| format!("failed to read link {}", anchor.display()))?;
-                let target_path = if target.is_relative() {
-                    anchor.parent().unwrap_or(Path::new("")).join(&target)
+            let mut curr = anchor.to_path_buf();
+            let mut depth = 0;
+            while fs::symlink_metadata(&curr)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                depth += 1;
+                if depth > 40 {
+                    return Err(anyhow!("too many levels of symbolic links"));
+                }
+                let target = fs::read_link(&curr)
+                    .with_context(|| format!("failed to read link {}", curr.display()))?;
+                curr = if target.is_relative() {
+                    curr.parent().unwrap_or(Path::new("")).join(&target)
                 } else {
                     target
                 };
-                let mut t_anchor = target_path.as_path();
+            }
+            if let Ok(resolved) = fs::canonicalize(&curr) {
+                resolved
+            } else {
+                let mut t_anchor = curr.as_path();
                 while !t_anchor.exists() {
                     let Some(next) = t_anchor.parent() else {
                         break;
@@ -349,7 +361,7 @@ impl Workspace {
         // runs — the resolved-path `reject_git_writes` call after `create_dir_all`
         // below catches the same thing, but only after that call has already
         // created a real directory inside the repository's `.git` tree.
-        Self::reject_git_writes(requested, &resolved_anchor)?;
+        self.reject_git_writes(requested, &resolved_anchor)?;
 
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -382,7 +394,7 @@ impl Workspace {
         // the one that catches what neither of the lexical checks can: a symlink
         // whose target lands inside `.git` even though `requested` never spells
         // `.git` out itself.
-        Self::reject_git_writes(requested, &resolved)?;
+        self.reject_git_writes(requested, &resolved)?;
 
         // A symlink at the final path — even one whose parent is legitimately inside
         // the root — could redirect the write outside it. `symlink_metadata` never
@@ -785,5 +797,70 @@ mod tests {
             "VULNERABILITY: create_dir_all created directories outside the project root through a dangling symlink!"
         );
         assert!(!non_existent_target.join("sub").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reproduction_test_chained_dangling_symlink_escapes_sandbox_and_creates_outside_dir() {
+        let (guard, w) = workspace();
+        let outside_dir = guard.path().join("outside_chained");
+        fs::create_dir_all(&outside_dir).unwrap();
+        let non_existent_target = outside_dir.join("nonexistent_target");
+        assert!(!non_existent_target.exists());
+
+        // link2 is a dangling symlink pointing outside the workspace root
+        std::os::unix::fs::symlink(&non_existent_target, w.root().join("link2")).unwrap();
+        // link1 points to link2 (chained symlink)
+        std::os::unix::fs::symlink("link2", w.root().join("link1")).unwrap();
+
+        let err = w
+            .write("link1/sub/file.txt", "payload")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("outside") || err.contains("symlink") || err.contains("ancestor"),
+            "unexpected error: {err}"
+        );
+
+        // create_dir_all must NEVER have created outside directories through chained symlink
+        assert!(
+            !non_existent_target.exists(),
+            "VULNERABILITY: create_dir_all created directories outside the project root through a chained dangling symlink!"
+        );
+        assert!(!non_existent_target.join("sub").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reproduction_test_chained_symlink_into_dot_git_creates_directories_inside_git() {
+        let (_guard, w) = workspace();
+        let real_git = w.root().join(".git");
+        fs::create_dir_all(&real_git).unwrap();
+        let non_existent_git_target = real_git.join("nonexistent_git_dir");
+        assert!(!non_existent_git_target.exists());
+
+        std::os::unix::fs::symlink(&non_existent_git_target, w.root().join("git_link2")).unwrap();
+        std::os::unix::fs::symlink("git_link2", w.root().join("git_link1")).unwrap();
+
+        let _ = w.write("git_link1/sub/file.sh", "malicious");
+
+        assert!(
+            !non_existent_git_target.exists(),
+            "VULNERABILITY: create_dir_all created directory inside .git through chained symlink!"
+        );
+    }
+
+    #[test]
+    fn reproduction_test_workspace_under_dot_git_parent_allows_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create a root path that has .git in its parent path hierarchy (e.g. worktree or test setup)
+        let root = dir.path().join(".git").join("worktree_project");
+        fs::create_dir_all(&root).unwrap();
+        let w = Workspace::new(root).unwrap();
+
+        let path = w
+            .write("normal_file.txt", "content")
+            .expect("BUG: Workspace under .git parent directory refused normal writes");
+        assert_eq!(fs::read_to_string(path).unwrap(), "content");
     }
 }

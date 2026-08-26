@@ -457,7 +457,8 @@ impl LocalBinaryProvider {
             String::from_utf8_lossy(&buf).into_owned()
         });
 
-        let mut lines = BufReader::new(stdout).lines();
+        let mut stdout_reader = BufReader::new(stdout);
+        let mut line_bytes = Vec::new();
         let mut result_text: Option<String> = None;
         let mut stream_error: Option<String> = None;
         let mut assistant_text = String::new();
@@ -471,6 +472,7 @@ impl LocalBinaryProvider {
         tokio::pin!(total_deadline);
 
         loop {
+            line_bytes.clear();
             tokio::select! {
                 biased;
                 _ = &mut total_deadline => {
@@ -485,7 +487,7 @@ impl LocalBinaryProvider {
                         total_timeout.as_secs()
                     )));
                 }
-                next = tokio::time::timeout(idle_timeout, lines.next_line()) => {
+                next = tokio::time::timeout(idle_timeout, stdout_reader.read_until(b'\n', &mut line_bytes)) => {
                     match next {
                         Err(_) => {
                             drop(child);
@@ -502,9 +504,11 @@ impl LocalBinaryProvider {
                                 format!("failed reading {} output", self.binary_path)
                             });
                         }
-                        Ok(Ok(None)) => break, // stdout closed: child is finishing up
-                        Ok(Ok(Some(line))) => {
-                            match parse_stream_line(dialect, &line) {
+                        Ok(Ok(0)) => break, // stdout closed: child is finishing up
+                        Ok(Ok(_)) => {
+                            let line = String::from_utf8_lossy(&line_bytes);
+                            let line = line.trim_end_matches(['\r', '\n']);
+                            match parse_stream_line(dialect, line) {
                                 StreamLineEffect::Progress(detail) => progress.send(detail),
                                 StreamLineEffect::AssistantText(text) => {
                                     if assistant_text.len() + text.len() <= MAX_OUTPUT_BYTES {
@@ -674,12 +678,46 @@ fn parse_stream_line(dialect: StreamDialect, line: &str) -> StreamLineEffect {
 /// either a `tool_use` (progress) or `text` (fallback reply) content item; `result` is
 /// the terminal event; `system`/`rate_limit_event`/`user` (tool results) and anything
 /// unrecognised are ignored.
+fn extract_error_message(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Value::Object(_) => v
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| v.get("error").and_then(Value::as_str))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string()),
+        _ => None,
+    }
+}
+
 fn parse_claude_line(line: &str) -> StreamLineEffect {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return StreamLineEffect::Ignore;
     };
     match value.get("type").and_then(Value::as_str) {
         Some("assistant") => claude_assistant_effect(&value),
+        Some("error") => {
+            let reason = value
+                .get("error")
+                .and_then(extract_error_message)
+                .or_else(|| {
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "error".to_string());
+            StreamLineEffect::Failure(reason)
+        }
         Some("result") => {
             let text = value
                 .get("result")
@@ -689,15 +727,17 @@ fn parse_claude_line(line: &str) -> StreamLineEffect {
             // On a failed run this dialect puts the reason in the same `result`
             // field the reply text normally occupies, so the flag is the only thing
             // distinguishing "here is your answer" from "here is why there isn't one".
-            if value.get("is_error").and_then(Value::as_bool) == Some(true) {
+            let is_error = value.get("is_error").and_then(Value::as_bool) == Some(true)
+                || value
+                    .get("subtype")
+                    .and_then(Value::as_str)
+                    .map(|s| s.starts_with("error"))
+                    == Some(true);
+            if is_error {
                 let reason = if !text.trim().is_empty() {
                     text
-                } else if let Some(err) = value
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                {
-                    err.to_string()
+                } else if let Some(err) = value.get("error").and_then(extract_error_message) {
+                    err
                 } else if let Some(subtype) = value
                     .get("subtype")
                     .and_then(Value::as_str)
@@ -761,21 +801,27 @@ fn parse_agy_line(line: &str) -> StreamLineEffect {
     };
     match value.get("event").and_then(Value::as_str) {
         Some("step_update") => agy_step_update_effect(&value),
+        Some("error") => {
+            let reason = value
+                .get("error")
+                .and_then(extract_error_message)
+                .unwrap_or_else(|| "error".to_string());
+            StreamLineEffect::Failure(reason)
+        }
         Some("result") => {
             let status = value
                 .pointer("/result/status")
                 .and_then(Value::as_str)
                 .unwrap_or("SUCCESS");
-            if status != "SUCCESS" {
+            if !status.eq_ignore_ascii_case("success") && !status.eq_ignore_ascii_case("ok") {
                 // The `error` field is the actionable half — a denied tool
                 // permission, a quota refusal — so prefer it, falling back to the
                 // bare status when the CLI gave no detail.
                 let reason = value
                     .pointer("/result/error")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or(status);
-                return StreamLineEffect::Failure(reason.to_string());
+                    .and_then(extract_error_message)
+                    .unwrap_or_else(|| status.to_string());
+                return StreamLineEffect::Failure(reason);
             }
             StreamLineEffect::Result(
                 value
@@ -1908,5 +1954,99 @@ mod tests {
             matches!(timeout, Some(crate::providers::ProviderFailure::Timeout)),
             "expected Timeout, got {timeout:?}"
         );
+    }
+
+    #[test]
+    fn test_reproduction_agy_dialect_accepts_lowercase_success_status() {
+        let line = r#"{"event":"result","result":{"status":"success","response":"All good.\n"}}"#;
+        assert_eq!(
+            parse_agy_line(line),
+            StreamLineEffect::Result("All good.\n".to_string()),
+            "lowercase 'success' status must be treated as successful Result, not Failure"
+        );
+    }
+
+    #[test]
+    fn test_reproduction_agy_dialect_extracts_error_object_message() {
+        let line = r#"{"event":"result","result":{"status":"ERROR","error":{"message":"Permission check failed"}}}"#;
+        match parse_agy_line(line) {
+            StreamLineEffect::Failure(reason) => {
+                assert_eq!(reason, "Permission check failed");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reproduction_agy_dialect_handles_top_level_error_event() {
+        let line = r#"{"event":"error","error":"Authentication failed"}"#;
+        match parse_agy_line(line) {
+            StreamLineEffect::Failure(reason) => {
+                assert_eq!(reason, "Authentication failed");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reproduction_claude_dialect_handles_top_level_error_event() {
+        let line = r#"{"type":"error","error":{"message":"Invalid API key"}}"#;
+        match parse_claude_line(line) {
+            StreamLineEffect::Failure(reason) => {
+                assert_eq!(reason, "Invalid API key");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reproduction_claude_dialect_extracts_error_object_message_on_result() {
+        let line = r#"{"type":"result","is_error":true,"result":"","error":{"message":"Credit balance is too low"}}"#;
+        match parse_claude_line(line) {
+            StreamLineEffect::Failure(reason) => {
+                assert_eq!(reason, "Credit balance is too low");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_reproduction_claude_dialect_detects_error_subtype_when_is_error_omitted() {
+        let line = r#"{"type":"result","subtype":"error_during_execution","result":"Credit balance is too low"}"#;
+        match parse_claude_line(line) {
+            StreamLineEffect::Failure(reason) => {
+                assert_eq!(reason, "Credit balance is too low");
+            }
+            other => panic!("expected Failure, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_reproduction_streaming_stdout_survives_invalid_utf8_in_progress_event() {
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec![
+                    "-c".into(),
+                    "printf '{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"input\":{\"description\":\"bad \\301 byte\"}}]}}\n{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"final answer\"}\n'".into(),
+                ],
+                system_arg: None,
+                dialect: Some(StreamDialect::ClaudeJson),
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+
+        let reply = p
+            .send_with_progress(None, "ignored", &ProgressSink::disconnected())
+            .await
+            .expect(
+                "streaming stdout with non-utf8 progress bytes must decode lossily and succeed",
+            );
+        assert_eq!(reply.text, "final answer");
     }
 }

@@ -516,6 +516,9 @@ fn classify_error(err: &anyhow::Error) -> ErrorKind {
                 std::io::ErrorKind::PermissionDenied => return ErrorKind::PermissionDenied,
                 std::io::ErrorKind::TimedOut => return ErrorKind::Timeout,
                 std::io::ErrorKind::ConnectionRefused => return ErrorKind::ConnectionRefused,
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted => {
+                    return ErrorKind::ConnectionFailed;
+                }
                 _ => {}
             }
         }
@@ -525,6 +528,9 @@ fn classify_error(err: &anyhow::Error) -> ErrorKind {
             }
             if req_err.is_connect() {
                 return ErrorKind::ConnectionFailed;
+            }
+            if req_err.is_status() {
+                return ErrorKind::HttpStatus;
             }
             if req_err.is_decode() || req_err.is_body() {
                 return ErrorKind::InvalidResponse;
@@ -1338,7 +1344,10 @@ impl Registry {
         providers: &BTreeMap<String, Arc<dyn Provider>>,
     ) -> Option<String> {
         let id = settings.commander.as_deref()?;
-        let candidate = candidates.iter().find(|c| c.id == id)?;
+        let candidate = match candidates.iter().find(|c| c.id == id) {
+            Some(c) => c,
+            None => return Self::match_label(providers, id),
+        };
         let saved_transport = settings.connections.get(id).and_then(|c| c.transport);
 
         // Stable sort, so ties (including "no saved transport at all") keep the
@@ -1351,6 +1360,7 @@ impl Registry {
             .into_iter()
             .map(|option| candidate_label(candidate, option, settings))
             .find_map(|label| Self::match_label(providers, &label))
+            .or_else(|| Self::match_label(providers, id))
     }
 
     /// Accepts an exact label, a bare model name, or a provider name.
@@ -1738,10 +1748,23 @@ impl Orchestrator {
 
         for delegation in delegations.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
             let Some(target) = self.registry.get(&delegation.target) else {
-                self.emit(Event::Error(format!(
-                    "cannot delegate to unknown model `{}`",
-                    delegation.target
-                )))
+                let err_msg = format!("cannot delegate to unknown model `{}`", delegation.target);
+                let task_id = self.ledger.add_task(&delegation.prompt);
+                self.ledger.assign_task(task_id, &delegation.target);
+                self.ledger.record_result(task_id, &err_msg);
+                self.ledger
+                    .update_status(task_id, crate::swarm::TaskStatus::Failed);
+                let _ = self.audit.log(
+                    "task.failed",
+                    &format!("task={task_id} kind=not_found detail=withheld"),
+                );
+                self.emit(Event::Error(err_msg)).await;
+                self.emit(Event::DelegationFinished {
+                    to: delegation.target.clone(),
+                    ok: false,
+                    chars: 0,
+                    millis: 0,
+                })
                 .await;
                 continue;
             };
@@ -2215,6 +2238,21 @@ mod tests {
             "the retry classifier's substring must stay in Display"
         );
         assert_eq!(safe_error_detail(&err), "kind=timeout detail=withheld");
+    }
+
+    #[test]
+    fn test_reproduction_classify_io_connection_reset_and_aborted_as_connection_failed() {
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let err = anyhow::Error::new(std::io::Error::from(kind));
+            let detail = safe_error_detail(&err);
+            assert!(
+                detail.contains("connection_failed"),
+                "expected connection_failed for {kind:?}, got {detail}"
+            );
+        }
     }
 
     #[test]
@@ -2724,6 +2762,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_reproduction_saved_commander_with_full_provider_label() {
+        let candidate = Candidate {
+            id: "anthropic".to_string(),
+            group: "ANTHROPIC".to_string(),
+            model: "claude-opus-5".to_string(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".to_string(),
+                detail: "https://api.anthropic.com".to_string(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        };
+
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "anthropic".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Api),
+                path: None,
+                model: Some("claude-opus-5".to_string()),
+            },
+        );
+        let settings = Settings {
+            connections,
+            commander: Some("anthropic:claude-opus-5".to_string()),
+            ..Default::default()
+        };
+
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "anthropic:claude-opus-5".to_string(),
+            Arc::new(StubProvider {
+                provider: "anthropic".to_string(),
+                model: "claude-opus-5".to_string(),
+                remote: true,
+            }),
+        );
+
+        let resolved =
+            Registry::resolve_commander(&settings, std::slice::from_ref(&candidate), &providers);
+        assert_eq!(
+            resolved,
+            Some("anthropic:claude-opus-5".to_string()),
+            "must resolve saved commander configured as full provider label"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_saved_commander_that_resolves_nowhere_fails_loudly_instead_of_substituting() {
@@ -3053,6 +3142,50 @@ mod tests {
         assert_eq!(finished.0, "ollama:mistral");
         assert!(finished.1, "the stub provider always succeeds");
         assert!(finished.2 > 0, "a successful reply must report its size");
+    }
+
+    #[tokio::test]
+    async fn test_reproduction_unknown_delegation_target_records_failure_in_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ghost:model, summarize codebase)",
+        )
+        .await;
+
+        let tasks = orch.ledger.tasks();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "failed delegation to unknown model must be recorded in ledger"
+        );
+        assert_eq!(tasks[0].status, crate::swarm::TaskStatus::Failed);
+        assert!(
+            tasks[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .contains("cannot delegate to unknown model"),
+            "task result must explain that the target model was unknown"
+        );
     }
 
     #[tokio::test]

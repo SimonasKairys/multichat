@@ -59,8 +59,14 @@ fn parse_description(head: &str) -> Option<String> {
         }
         if let Some(value) = trimmed.strip_prefix("description:") {
             let value = value.trim();
-            if !value.is_empty() && description.is_none() {
-                description = Some(value.to_string());
+            let unquoted = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+                .unwrap_or(value)
+                .trim();
+            if !unquoted.is_empty() && description.is_none() {
+                description = Some(unquoted.to_string());
             }
         }
     }
@@ -270,6 +276,43 @@ mod tests {
         fs::write(s.root().join("big.md"), big).unwrap();
         let err = s.read("big.md").unwrap_err().to_string();
         assert!(err.contains("limit"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_reproduction_empty_quoted_description_yields_no_description() {
+        let (_guard, s) = skills();
+        fs::write(
+            s.root().join("empty_double.md"),
+            "---\ndescription: \"\"\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            s.root().join("empty_single.md"),
+            "---\ndescription: ''\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            s.root().join("quoted.md"),
+            "---\ndescription: \"Quoted skill description\"\n---\nbody\n",
+        )
+        .unwrap();
+        let metas = s.list_with_descriptions().unwrap();
+        let empty_double = metas.iter().find(|m| m.name == "empty_double.md").unwrap();
+        assert_eq!(
+            empty_double.description, None,
+            "empty double-quoted description must be None, not Some(\"\")"
+        );
+        let empty_single = metas.iter().find(|m| m.name == "empty_single.md").unwrap();
+        assert_eq!(
+            empty_single.description, None,
+            "empty single-quoted description must be None, not Some(\"\")"
+        );
+        let quoted = metas.iter().find(|m| m.name == "quoted.md").unwrap();
+        assert_eq!(
+            quoted.description.as_deref(),
+            Some("Quoted skill description"),
+            "quotes should be stripped from skill description"
+        );
     }
 
     #[test]

@@ -272,13 +272,17 @@ fn apply_hardening(classified: bool) -> Result<Hardening> {
 /// change does not touch — fixes it without touching the alias arms, which already
 /// returned a correctly-cased id.
 fn resolve_canonical_service(service: &str, settings: &Settings) -> String {
-    if settings.custom_endpoints.contains_key(service) {
+    if let Some((custom_name, _)) = settings
+        .custom_endpoints
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(service))
+    {
         // A custom endpoint literally named `gemini` or `claude` must keep that
         // exact name — only fall back to the builtin alias mapping (and the
         // lowercasing below) when no custom endpoint claims the raw name, or a
         // deliberately-named custom entry would be misfiled under an alias the
         // user's own `config.json` never used.
-        service.to_string()
+        custom_name.clone()
     } else {
         crate::config::canonical_provider(service).to_ascii_lowercase()
     }
@@ -1343,6 +1347,43 @@ mod tests {
         assert!(
             err.to_string().contains("--keep must be at least 1"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reproduction_test_resolve_canonical_service_case_mismatch_for_custom_endpoints() {
+        let mut settings = Settings::default();
+        settings.custom_endpoints.insert(
+            "MyGateway".to_string(),
+            crate::config::CloudEndpoint {
+                api: crate::config::Api::OpenAiCompatible,
+                base_url: "https://example.invalid/v1".into(),
+                default_model: "some-model".into(),
+            },
+        );
+        settings.custom_endpoints.insert(
+            "Claude".to_string(),
+            crate::config::CloudEndpoint {
+                api: crate::config::Api::Anthropic,
+                base_url: "https://proxy.example.invalid".into(),
+                default_model: "claude-custom".into(),
+            },
+        );
+
+        assert_eq!(
+            resolve_canonical_service("mygateway", &settings),
+            "MyGateway",
+            "lowercase input must resolve to the exact custom endpoint key MyGateway"
+        );
+        assert_eq!(
+            resolve_canonical_service("MYGATEWAY", &settings),
+            "MyGateway",
+            "uppercase input must resolve to the exact custom endpoint key MyGateway"
+        );
+        assert_eq!(
+            resolve_canonical_service("claude", &settings),
+            "Claude",
+            "custom endpoint Claude must not be redirected to builtin anthropic"
         );
     }
 }

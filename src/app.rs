@@ -539,11 +539,11 @@ impl App {
     }
 
     pub fn scroll_up(&mut self) {
-        self.scroll = self.scroll.saturating_sub(1);
+        self.scroll = self.scroll.saturating_add(1);
     }
 
     pub fn scroll_down(&mut self) {
-        self.scroll = self.scroll.saturating_add(1);
+        self.scroll = self.scroll.saturating_sub(1);
     }
 
     pub fn body(&self) -> String {
@@ -1190,12 +1190,37 @@ mod tests {
     }
 
     #[test]
+    fn test_reproduction_scrolling_direction_scrolls_up_and_down_correctly() {
+        let mut app = app();
+        // At the bottom (scroll = 0), scrolling up (PageUp) must increase scroll offset to view earlier lines.
+        assert_eq!(app.scroll, 0);
+        app.scroll_up();
+        assert_eq!(
+            app.scroll, 1,
+            "scrolling up must increase scroll offset from bottom"
+        );
+
+        // Scrolling down (PageDown) must decrease scroll offset back towards bottom (0).
+        app.scroll_down();
+        assert_eq!(
+            app.scroll, 0,
+            "scrolling down must decrease scroll offset towards bottom"
+        );
+
+        // Scrolling down when already at bottom must saturate at 0.
+        app.scroll_down();
+        assert_eq!(app.scroll, 0, "scrolling down at bottom must saturate at 0");
+    }
+
+    #[test]
     fn scrolling_saturates_instead_of_wrapping() {
         let mut app = app();
-        app.scroll_up();
-        assert_eq!(app.scroll, 0);
         app.scroll_down();
+        assert_eq!(app.scroll, 0);
+        app.scroll_up();
         assert_eq!(app.scroll, 1);
+        app.scroll_down();
+        assert_eq!(app.scroll, 0);
     }
 
     #[test]

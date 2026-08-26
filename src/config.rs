@@ -62,12 +62,25 @@ impl Paths {
         })
     }
 
-    /// Honours `SIMON_DATA_DIR` when set, otherwise the platform default.
     /// Honours `SIMON_DATA_DIR` when set and non-empty, otherwise the platform default.
     pub fn resolve_with_env() -> Result<Self> {
-        match std::env::var_os("SIMON_DATA_DIR") {
-            Some(dir) if !dir.is_empty() => Self::from_data_dir(PathBuf::from(dir)),
-            _ => Self::resolve(),
+        match Self::data_dir_override(std::env::var_os("SIMON_DATA_DIR")) {
+            Some(dir) => Self::from_data_dir(dir),
+            None => Self::resolve(),
+        }
+    }
+
+    /// The `SIMON_DATA_DIR` guard on its own, split out of `resolve_with_env` so it
+    /// can be pinned directly: unset and set-to-empty both mean "no override" and
+    /// must fall back to the platform default the same way. Reading the real
+    /// variable can't be exercised as a plain function call, and this crate denies
+    /// `unsafe_code` crate-wide, which is what `std::env::set_var` requires to
+    /// simulate one process's env from within a test — so the guard's *decision*
+    /// lives here, independent of where the value came from.
+    fn data_dir_override(env_value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+        match env_value {
+            Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+            _ => None,
         }
     }
 }
@@ -350,6 +363,32 @@ impl Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_dir_override_uses_the_value_when_set_and_non_empty() {
+        assert_eq!(
+            Paths::data_dir_override(Some(std::ffi::OsString::from("/custom/data"))),
+            Some(PathBuf::from("/custom/data"))
+        );
+    }
+
+    #[test]
+    fn data_dir_override_falls_back_when_the_value_is_set_but_empty() {
+        // The guard this pins: `!dir.is_empty()`. Deleting the `!`, or replacing the
+        // whole guard with `true`, would treat an explicitly empty `SIMON_DATA_DIR`
+        // as an override and try to build paths rooted at `""`.
+        assert_eq!(
+            Paths::data_dir_override(Some(std::ffi::OsString::from(""))),
+            None
+        );
+    }
+
+    #[test]
+    fn data_dir_override_falls_back_when_unset() {
+        // Replacing the guard with `false` would make even a non-empty value fall
+        // back, which this pins independently of the empty-string case above.
+        assert_eq!(Paths::data_dir_override(None), None);
+    }
 
     #[test]
     fn unknown_provider_has_no_builtin_endpoint() {

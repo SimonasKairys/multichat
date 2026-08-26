@@ -325,6 +325,46 @@ mod tests {
     }
 
     #[test]
+    fn openai_finish_reason_alone_triggers_the_decline_error() {
+        // `finish_reason == "refusal"` must be enough on its own — `||` swapped for
+        // `&&` would additionally require the `refusal` field, which is absent here,
+        // and fall through to the "no message content" error instead.
+        let body = json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": null },
+                "finish_reason": "refusal"
+            }]
+        });
+        let err = provider("openai")
+            .extract_text(&body)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("declined"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn openai_refusal_field_alone_triggers_the_decline_error() {
+        // The `refusal` field must be enough on its own too — `&&` would additionally
+        // require `finish_reason == "refusal"`, which isn't the case here.
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "refusal": "blocked by policy"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let err = provider("openai")
+            .extract_text(&body)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("declined"), "unexpected error: {err}");
+        assert!(err.contains("blocked by policy"));
+    }
+
+    #[test]
     fn openai_refusal_becomes_an_error_not_empty_content_error() {
         let body = json!({
             "choices": [{

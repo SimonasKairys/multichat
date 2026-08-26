@@ -201,6 +201,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_models_returns_the_installed_model_names() {
+        // Pins the actual parse against a stub daemon rather than an unconditional
+        // `Ok(vec![])` — a stub that always reports zero models would make discovery
+        // silently look empty even when models are installed.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"models":[{"name":"llama3:latest"},{"name":"mistral:7b"}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let models =
+            OllamaProvider::list_models(&format!("http://{addr}"), &reqwest::Client::new())
+                .await
+                .unwrap();
+        assert_eq!(
+            models,
+            vec!["llama3:latest".to_string(), "mistral:7b".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn ollama_http_error_carries_typed_http_status_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

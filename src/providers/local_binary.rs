@@ -1778,6 +1778,19 @@ mod tests {
     }
 
     #[test]
+    fn claude_dialect_error_result_uses_the_error_field_when_result_is_empty() {
+        // Pins the `.filter(|s| !s.trim().is_empty())` guard on the `error` field:
+        // with the `!` dropped, the filter would keep only a blank `error` value and
+        // discard a genuine one, falling through past it to the `subtype`/default
+        // fallback instead of surfacing the real message.
+        let line = r#"{"type":"result","is_error":true,"result":"","error":"rate limited"}"#;
+        match parse_claude_line(line) {
+            StreamLineEffect::Failure(reason) => assert_eq!(reason, "rate limited"),
+            other => panic!("expected a Failure, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn claude_dialect_error_result_falls_back_when_result_field_is_empty() {
         let line =
             r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":""}"#;

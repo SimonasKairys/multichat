@@ -529,11 +529,7 @@ fn draw_picker(frame: &mut ratatui::Frame, picker: Option<&PickerState>) {
         Some(picker) => render_picker_body_with_cursor(picker),
     };
     let interior_height = chunks[0].height.saturating_sub(2) as usize;
-    let scroll_offset = if interior_height > 0 && cursor_line >= interior_height {
-        (cursor_line - interior_height + 1) as u16
-    } else {
-        0
-    };
+    let scroll_offset = picker_scroll_offset(interior_height, cursor_line);
 
     let list = Paragraph::new(body)
         .wrap(Wrap { trim: false })
@@ -560,6 +556,22 @@ fn draw_picker(frame: &mut ratatui::Frame, picker: Option<&PickerState>) {
             }),
     };
     frame.render_widget(Paragraph::new(hint), chunks[1]);
+}
+
+/// Rows the picker body must scroll down so the cursor's line stays inside the
+/// visible interior. Split out of `draw_picker` so its two boundary conditions can be
+/// pinned directly: with a zero-height interior (a terminal too short to show any
+/// content row) there is nothing to scroll into view, and while the cursor is
+/// already within the viewport no scroll is needed either. Both of those collapse to
+/// the same on-screen result — nothing visible changes — when driven only through a
+/// rendered frame, since a zero-height interior shows no rows to compare regardless
+/// of the scroll value passed to it.
+fn picker_scroll_offset(interior_height: usize, cursor_line: usize) -> u16 {
+    if interior_height > 0 && cursor_line >= interior_height {
+        (cursor_line - interior_height + 1) as u16
+    } else {
+        0
+    }
 }
 
 fn render_picker_body_with_cursor(picker: &PickerState) -> (String, usize) {
@@ -711,6 +723,71 @@ mod tests {
             rendered.contains("message_19"),
             "the latest transcript line (message_19) must be visible at scroll 0, but rendered:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn picker_scroll_offset_never_scrolls_when_the_interior_has_no_rows() {
+        // Pins `interior_height > 0`: with zero interior rows there is nothing to
+        // scroll into view, so the offset must stay 0 no matter how far down the
+        // cursor sits. `interior_height >= 0` is trivially true for a `usize` and
+        // would compute a nonzero offset here instead (`cursor_line + 1`).
+        assert_eq!(picker_scroll_offset(0, 50), 0);
+    }
+
+    #[test]
+    fn picker_scroll_offset_stays_zero_while_the_cursor_is_already_in_view() {
+        // Pins `&&`: swapped for `||`, `interior_height > 0` alone would already
+        // satisfy the condition here (5 > 0), and the arithmetic below would then
+        // underflow subtracting a larger `interior_height` from a smaller
+        // `cursor_line` — panicking rather than just returning 0.
+        assert_eq!(picker_scroll_offset(5, 4), 0);
+    }
+
+    #[test]
+    fn picker_scroll_offset_scrolls_exactly_enough_to_reveal_the_cursor_line() {
+        assert_eq!(picker_scroll_offset(5, 5), 1);
+        assert_eq!(picker_scroll_offset(5, 8), 4);
+    }
+
+    #[test]
+    fn render_picker_body_marks_only_the_cursor_row() {
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+        let candidates: Vec<Candidate> = (0..3)
+            .map(|i| Candidate {
+                id: format!("model_{i}"),
+                group: "GROUP".to_string(),
+                model: format!("model_{i}"),
+                transports: vec![TransportOption {
+                    transport: None,
+                    label: String::new(),
+                    detail: String::new(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                }],
+            })
+            .collect();
+        let mut picker =
+            PickerState::new(candidates, &std::collections::BTreeMap::new(), None, false);
+        picker.move_down(); // cursor now on the model_1 row
+
+        let (body, cursor_line) = render_picker_body_with_cursor(&picker);
+        let lines: Vec<&str> = body.lines().collect();
+
+        // Exactly one row carries the `>` marker — the one under the cursor. `==`
+        // swapped for `!=` would flip this: every row EXCEPT the current one would
+        // get the marker instead of the one row that should.
+        let marked: Vec<&&str> = lines.iter().filter(|l| l.starts_with('>')).collect();
+        assert_eq!(
+            marked.len(),
+            1,
+            "expected exactly one cursor row: {lines:?}"
+        );
+        assert!(
+            marked[0].contains("model_1"),
+            "wrong row marked as current: {marked:?}"
+        );
+        assert_eq!(lines[cursor_line], *marked[0]);
     }
 
     #[test]

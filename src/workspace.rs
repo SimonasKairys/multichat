@@ -719,6 +719,45 @@ mod tests {
         assert!(!real_git.join("sub").join("file.sh").exists());
     }
 
+    // Regression/mutation guard for the ancestor walk in the dangling-symlink branch
+    // of `write`'s `resolved_anchor` computation (`while !t_anchor.exists()`): that
+    // loop climbs from a nonexistent symlink target to its nearest existing ancestor
+    // before the containment check runs. If the `!` were dropped (or the loop
+    // otherwise never ran), the walk would stop at the nonexistent leaf instead, and
+    // `fs::canonicalize` on a path that doesn't exist fails outright — producing a
+    // generic "failed to resolve" error instead of the specific "resolves outside the
+    // project folder" refusal below.
+    //
+    // Deliberately does NOT reuse `reproduction_test_write_through_dangling_symlink_
+    // escapes_sandbox_and_creates_outside_dir`'s directory name ("outside"): that
+    // test's `err.contains("outside")` assertion passes even under the broken
+    // ancestor walk, because the *directory* happens to be named "outside" — the
+    // substring shows up in the "failed to resolve <path>" message too, so the
+    // assertion doesn't actually distinguish the two behaviours. This test asserts
+    // the exact refusal phrase instead, and names its directories so neither could
+    // accidentally satisfy it.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_whose_target_climbs_to_an_existing_ancestor_still_resolves_and_refuses() {
+        let (guard, w) = workspace();
+        let elsewhere = guard.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let missing_target = elsewhere.join("not_here");
+        assert!(!missing_target.exists());
+
+        std::os::unix::fs::symlink(&missing_target, w.root().join("link")).unwrap();
+
+        let err = w.write("link/file.txt", "payload").unwrap_err().to_string();
+        assert_eq!(
+            err, "project path `link/file.txt` resolves outside the project folder",
+            "unexpected error: {err}"
+        );
+        assert!(
+            !missing_target.exists(),
+            "nothing should have been created through the dangling symlink"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn reproduction_test_write_through_dangling_symlink_escapes_sandbox_and_creates_outside_dir() {

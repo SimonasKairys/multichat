@@ -81,6 +81,14 @@ jobs:
   mutants:
     name: mutation coverage of changed code
     runs-on: ubuntu-latest
+    env:
+      # Undo the workflow-wide `RUSTFLAGS: -D warnings` for this job only. Stubbing a
+      # function to `Ok(())` leaves its parameters unused, so with warnings as errors
+      # the mutant fails to compile and cargo-mutants files it under "unviable" rather
+      # than "missed" — silently discarding the most valuable class of mutant while the
+      # job still reports success. Measured: the same diff yields 45 mutants with 41
+      # caught here, and 13 mutants all "unviable" with `-D warnings` set.
+      RUSTFLAGS: ""
     # A missed mutant is code a test executes without checking. This project has shipped
     # two of them: a stderr flood sent through a `dd | tr` pipeline so the shell survived
     # and the test proved nothing, and a Ctrl-modifier guard whose test passed with the

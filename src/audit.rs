@@ -138,7 +138,7 @@ use blake2::digest::{Digest, Mac};
 use blake2::{Blake2s256, Blake2sMac256};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -412,6 +412,7 @@ impl AuditLogger {
 
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.path)
             .with_context(|| format!("failed to open audit log {}", self.path.display()))?;
@@ -425,7 +426,10 @@ impl AuditLogger {
         // trusting `self.last_mac`/`self.count`: those can be stale the instant
         // another process (or another `AuditLogger` on this same path) has appended
         // since this logger last read the file.
-        let (count, last_mac) = read_chain_tail(&self.path)?;
+        let (count, last_mac) = read_chain_tail_from(
+            file.try_clone()
+                .context("failed to duplicate the audit log handle to read its tail")?,
+        )?;
         let last_mac = last_mac.unwrap_or_else(|| GENESIS.to_string());
 
         let mac = self.mac(&last_mac, ts, action, details)?;
@@ -768,6 +772,26 @@ fn read_chain_tail(path: &Path) -> Result<(u64, Option<String>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, None)),
         Err(e) => return Err(e).context("failed to read audit log"),
     };
+    read_chain_tail_from(file)
+}
+
+/// Reads the tail from an already-open handle.
+///
+/// `log` must use this rather than [`read_chain_tail`], and the distinction is a
+/// platform one that cost a red Windows build. `flock` on Unix is advisory and attaches
+/// to the open file description, so a second handle on the same path reads straight
+/// through a lock this process holds. Windows' `LockFileEx`, which `File::lock` maps to,
+/// is **mandatory** and locks a byte range against every other handle — including
+/// another handle in the same process. Opening the file again to read the tail while
+/// holding the append lock therefore worked on Linux and macOS and failed on Windows
+/// with a lock violation. Reading through the locking handle itself is correct
+/// everywhere: a handle may always read the range it owns.
+fn read_chain_tail_from(mut file: File) -> Result<(u64, Option<String>)> {
+    // The handle is opened for append, so the write position is pinned to the end
+    // regardless of where reading leaves the cursor — seeking back to the start to read
+    // cannot misplace the append that follows.
+    file.seek(SeekFrom::Start(0))
+        .context("failed to rewind the audit log before reading its tail")?;
     let mut count = 0u64;
     let mut last = None;
     for line in BufReader::new(file).lines() {

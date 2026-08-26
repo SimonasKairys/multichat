@@ -623,6 +623,10 @@ impl AuditLogger {
 
         match File::open(&self.path) {
             Ok(file) => {
+                // Same shared lock the tail read takes, for the same Windows reason:
+                // `simon audit` must not fail merely because a chat session is
+                // appending at that moment.
+                lock_shared_with_timeout(&file, &self.path)?;
                 for (idx, line) in BufReader::new(file).lines().enumerate() {
                     let line = line?;
                     if line.trim().is_empty() {
@@ -760,6 +764,43 @@ impl Drop for AuditLogger {
 /// or an extra dependency. On success the lock is held by `file` until it is dropped or
 /// explicitly unlocked; on timeout, nothing has been written and the caller gets an
 /// `Err` instead of `log()` either hanging forever or silently no-oping.
+/// Waits for a **shared** lock before reading the log.
+///
+/// Readers need this and Unix hid the fact. `flock` is advisory: a reader that takes no
+/// lock reads happily beside an exclusive writer, so `read_chain_tail` and `verify`
+/// never asked for one. Windows' `LockFileEx` is mandatory — reading a range another
+/// handle holds exclusively fails outright with "another process has locked a portion of
+/// the file", so on Windows a second `AuditLogger` could not even be *constructed* while
+/// the first was mid-append, and `simon audit` could not run beside a live session.
+///
+/// A shared lock is the right shape rather than a retry loop around the error: several
+/// readers may hold it at once, and it conflicts only with the appender's exclusive
+/// lock, which is exactly the exclusion wanted.
+fn lock_shared_with_timeout(file: &File, path: &Path) -> Result<()> {
+    let start = std::time::Instant::now();
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| {
+                    format!("failed to lock audit log {} for reading", path.display())
+                });
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if start.elapsed() >= APPEND_LOCK_TIMEOUT {
+                    return Err(anyhow!(
+                        "timed out after {:?} waiting to read the audit log {} — \
+                         another simon process is appending to it.",
+                        APPEND_LOCK_TIMEOUT,
+                        path.display()
+                    ));
+                }
+                std::thread::sleep(APPEND_LOCK_POLL_INTERVAL);
+            }
+        }
+    }
+}
+
 fn lock_exclusive_with_timeout(file: &File, path: &Path) -> Result<()> {
     let start = std::time::Instant::now();
     loop {
@@ -795,6 +836,7 @@ fn read_chain_tail(path: &Path) -> Result<(u64, Option<String>)> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, None)),
         Err(e) => return Err(e).context("failed to read audit log"),
     };
+    lock_shared_with_timeout(&file, path)?;
     read_chain_tail_from(&file)
 }
 
@@ -1111,6 +1153,43 @@ mod tests {
             log_mutex_for(&a).try_lock().is_err(),
             "the shared mutex did not exclude a second holder"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_shared_lock_waits_for_an_exclusive_holder_and_gives_up_visibly() {
+        // Mutation testing caught this one: stubbing `lock_shared_with_timeout` to
+        // `Ok(())` changed nothing any test could see, because on Unix the lock is
+        // advisory and its whole purpose — not being refused outright by Windows'
+        // mandatory locking — is invisible here. So exercise the helper directly
+        // rather than through a behaviour only one platform exhibits.
+        //
+        // Unix-only for the reason this function exists: `flock` conflicts between open
+        // file descriptions, so a second handle in this process really is blocked;
+        // `LockFileEx` grants the locking process's threads access, so it would not be.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(&path, b"").unwrap();
+
+        let holder = File::open(&path).unwrap();
+        holder.lock().unwrap();
+
+        let reader = File::open(&path).unwrap();
+        let started = std::time::Instant::now();
+        let err = lock_shared_with_timeout(&reader, &path)
+            .expect_err("a shared lock must not be granted while an exclusive one is held");
+        assert!(
+            started.elapsed() >= APPEND_LOCK_TIMEOUT,
+            "it gave up before waiting out the timeout"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+
+        drop(holder);
+        lock_shared_with_timeout(&reader, &path)
+            .expect("the shared lock must be available once the exclusive holder is gone");
     }
 
     #[test]
@@ -1732,9 +1811,12 @@ mod tests {
             .truncate(false)
             .open(&path)
             .unwrap();
-        holder.lock().unwrap();
-
+        // Built *before* the holder takes the lock. Constructing a logger reads the
+        // chain tail, and readers now take a shared lock, so doing it afterwards would
+        // block in the constructor and this test would be measuring the wrong wait.
         let mut logger = AuditLogger::with_key(path.clone(), vec![7u8; 32]).unwrap();
+
+        holder.lock().unwrap();
         let err = logger.log("a", "one").unwrap_err().to_string();
         assert!(err.contains("timed out"), "unexpected error: {err}");
 

@@ -103,9 +103,18 @@ impl LockedBuffer {
 
 impl Drop for LockedBuffer {
     fn drop(&mut self) {
+        // `len` must be captured before `zeroize()`: `Vec::zeroize` (see the
+        // `zeroize` crate) clears the vec's length to 0 as part of wiping it, not
+        // just its contents. Reading `self.bytes.len()` after that call — as this
+        // used to — hands `unlock_region` a length of 0, which hits its `len == 0`
+        // early return and silently skips `munlock`/`VirtualUnlock` on every drop,
+        // leaking the page lock (and eating into `RLIMIT_MEMLOCK`) for the rest of
+        // the process's life. The pointer is unaffected either way — `Vec::clear`
+        // doesn't move or deallocate the buffer — only the length changes.
+        let len = self.bytes.len();
         self.bytes.zeroize();
         if self.locked {
-            unlock_region(self.bytes.as_ptr(), self.bytes.len());
+            unlock_region(self.bytes.as_ptr(), len);
         }
     }
 }
@@ -156,6 +165,13 @@ fn unlock_region(ptr: *const u8, len: usize) {
 mod tests {
     use super::*;
 
+    /// Serializes tests that observe process-wide locked-memory state (`VmLck` in
+    /// `/proc/self/status`) so `enforce_memory_protection`'s `mlockall` — which locks
+    /// the *entire* process's pages, not just one buffer — can't be measured by
+    /// `dropping_a_locked_buffer_releases_the_lock_it_took` as if it were noise from
+    /// this buffer.
+    static MEMLOCK_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn locked_buffer_exposes_contents() {
         let buf = LockedBuffer::new(vec![1, 2, 3, 4]);
@@ -169,7 +185,55 @@ mod tests {
 
     #[test]
     fn non_strict_memory_protection_never_fails_startup() {
+        let _guard = MEMLOCK_TEST_GUARD.lock().unwrap();
         // The whole point of the fail-soft path: an unprivileged process must still boot.
         assert!(enforce_memory_protection(false).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dropping_a_locked_buffer_releases_the_lock_it_took() {
+        // `mlock`ed pages are process-wide state, visible via `/proc/self/status`'s
+        // `VmLck` field (kB). A several-MB buffer makes the effect dwarf any few-KB
+        // noise from other tests locking their own small key buffers concurrently.
+        fn vm_locked_kb() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|l| l.strip_prefix("VmLck:"))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse().ok())
+                .expect("VmLck present in /proc/self/status")
+        }
+
+        let _guard = MEMLOCK_TEST_GUARD.lock().unwrap();
+
+        let before = vm_locked_kb();
+        // Deliberately small (64 KiB, well under glibc's mmap threshold) so the
+        // allocator frees it back into its own arena rather than `munmap`ping it —
+        // matching the real key-material sizes `LockedBuffer` actually holds (a
+        // 32-byte MAC key, a derived password key). A `munmap` on a locked region
+        // would drop the kernel's lock accounting on its own, which would mask this
+        // bug: the point here is that nothing *but* an explicit `munlock` releases a
+        // page that is still mapped.
+        let buf = LockedBuffer::new(vec![0xAAu8; 64 * 1024]);
+        if !buf.locked {
+            // mlock is best-effort; an environment with a tiny RLIMIT_MEMLOCK can't
+            // exercise this at all, so there is nothing to assert.
+            return;
+        }
+        let during = vm_locked_kb();
+        assert!(
+            during >= before + 32,
+            "mlock should have pinned tens of KB: before={before}kB during={during}kB"
+        );
+
+        drop(buf);
+        let after = vm_locked_kb();
+        assert!(
+            after < during,
+            "dropping the buffer must release its lock (munlock), but VmLck stayed at \
+             {after}kB (was {during}kB before drop)"
+        );
     }
 }

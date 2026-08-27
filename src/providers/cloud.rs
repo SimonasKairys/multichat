@@ -116,7 +116,12 @@ impl CloudProvider {
                             .join("")
                     })
                     .unwrap_or_default();
-                if text.is_empty() {
+                // `trim` before the check, not just `is_empty`: a content block of
+                // nothing but whitespace is the same nothing as an absent one, and
+                // returning it as a reply hands the orchestrator a blank delegation
+                // result that looks successful. The OpenAI arm below has always
+                // trimmed first; this arm only looked untrimmed-empty.
+                if text.trim().is_empty() {
                     return Err(anyhow!(
                         "{} returned no text content (response: {})",
                         self.model,
@@ -388,6 +393,23 @@ mod tests {
     fn cloud_providers_are_always_remote() {
         assert!(provider("anthropic").is_remote());
         assert_eq!(provider("anthropic").label(), "anthropic:claude-opus-5");
+    }
+
+    #[test]
+    fn an_anthropic_reply_of_nothing_but_whitespace_is_an_error_not_a_blank_success() {
+        // The Anthropic arm promises, four lines above its own `is_empty` check, to
+        // "surface that rather than returning \"\"". It only checks `is_empty`, so a
+        // content block of nothing but whitespace slips through as a successful reply.
+        // The OpenAI arm right below it trims first and does reject this.
+        let body = json!({
+            "content": [{"type": "text", "text": "   \n  "}],
+            "stop_reason": "end_turn"
+        });
+        let err = provider("anthropic")
+            .extract_text(&body)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no text content"), "unexpected error: {err}");
     }
 
     #[test]

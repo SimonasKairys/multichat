@@ -351,18 +351,26 @@ const WRITE_PREVIEW_CHARS: usize = 1200;
 fn write_preview(content: &str) -> String {
     let mut out = String::new();
     let total_lines = content.lines().count();
+    let mut lines_shown = 0;
     for line in content.lines().take(WRITE_PREVIEW_LINES) {
         out.push_str(line);
         out.push('\n');
+        lines_shown += 1;
     }
     if let Some((cut, _)) = out.char_indices().nth(WRITE_PREVIEW_CHARS) {
+        // The char cap can bite mid-way through the lines just counted — a long
+        // enough line 12 of 20 means lines 12 through 20 never actually reached
+        // `out`. `lines_shown` has to reflect what is really there, not what the
+        // loop above attempted, or the "more line(s)" count below understates how
+        // much of the file the user has not seen before approving it.
+        lines_shown = out[..cut].matches('\n').count();
         out.truncate(cut);
         out.push_str("…\n");
     }
-    if total_lines > WRITE_PREVIEW_LINES {
+    if total_lines > lines_shown {
         out.push_str(&format!(
             "… {} more line(s) not shown\n",
-            total_lines - WRITE_PREVIEW_LINES
+            total_lines - lines_shown
         ));
     }
     out
@@ -908,19 +916,25 @@ async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate
 fn discover_vendors(settings: &Settings, classified: bool) -> Vec<Candidate> {
     let cli_tools = detect_cli_tools(settings);
 
-    let mut ids: Vec<String> = ["anthropic", "openai", "google", "openrouter", "groq"]
-        .iter()
-        .map(|s| s.to_string())
-        .chain(settings.custom_endpoints.keys().cloned())
-        .collect();
+    let mut ids: Vec<String> = Vec::new();
+    for custom in settings.custom_endpoints.keys() {
+        if !ids.iter().any(|id| id.eq_ignore_ascii_case(custom)) {
+            ids.push(custom.clone());
+        }
+    }
+    for builtin in ["anthropic", "openai", "google", "openrouter", "groq"] {
+        if !ids.iter().any(|id| id.eq_ignore_ascii_case(builtin)) {
+            ids.push(builtin.to_string());
+        }
+    }
     for cli in &cli_tools {
         let vid = cli_vendor_id(&cli.binary_name);
-        if !ids.contains(&vid) {
+        if !ids.iter().any(|id| id.eq_ignore_ascii_case(&vid)) {
             ids.push(vid);
         }
     }
-    ids.sort();
-    ids.dedup();
+    ids.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    ids.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
 
     ids.iter()
         .filter_map(|id| build_vendor_candidate(id, settings, classified, &cli_tools))
@@ -974,7 +988,7 @@ fn build_vendor_candidate(
 
     let cli = cli_tools
         .iter()
-        .find(|c| cli_vendor_id(&c.binary_name) == id);
+        .find(|c| cli_vendor_id(&c.binary_name).eq_ignore_ascii_case(id));
     if let Some(cli) = cli {
         // `local_binary` is already `is_remote() -> true`, so under --classified this
         // must render unavailable with a reason rather than being silently dropped
@@ -1365,15 +1379,16 @@ impl Registry {
 
     /// Accepts an exact label, a bare model name, or a provider name.
     fn match_label(providers: &BTreeMap<String, Arc<dyn Provider>>, want: &str) -> Option<String> {
-        if providers.contains_key(want) {
-            return Some(want.to_string());
+        if let Some(exact) = providers.keys().find(|k| k.eq_ignore_ascii_case(want)) {
+            return Some(exact.clone());
         }
+        let want_prefix = format!("{}:", want.to_ascii_lowercase());
         providers
             .iter()
             .find(|(label, p)| {
-                p.model_name() == want
-                    || p.provider_name() == want
-                    || label.starts_with(&format!("{want}:"))
+                p.model_name().eq_ignore_ascii_case(want)
+                    || p.provider_name().eq_ignore_ascii_case(want)
+                    || label.to_ascii_lowercase().starts_with(&want_prefix)
             })
             .map(|(label, _)| label.clone())
     }
@@ -4074,6 +4089,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_write_preview_does_not_undercount_hidden_lines_when_both_limits_bind() {
+        // 25 lines of 100 chars each: the line cap (20) says "up to 20 lines", but
+        // the char cap (1200) hits first, inside line 12 — so the preview's own
+        // content actually shows only 11 complete lines. The "N more line(s) not
+        // shown" tail is computed from `total_lines - WRITE_PREVIEW_LINES`, which
+        // silently assumes every one of the first `WRITE_PREVIEW_LINES` lines made it
+        // into the char-truncated output. It did not: this is the user's ONLY signal
+        // for how much of a pending write they have not reviewed before approving it.
+        let content: String = (0..25).map(|_| format!("{}\n", "a".repeat(100))).collect();
+        let preview = write_preview(&content);
+
+        let shown_lines = preview
+            .lines()
+            .filter(|l| l.chars().all(|c| c == 'a'))
+            .count();
+        let claimed_hidden: usize = preview
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("… ")?
+                    .strip_suffix(" more line(s) not shown")
+            })
+            .and_then(|n| n.parse().ok())
+            .expect("expected a '… N more line(s) not shown' line");
+
+        // Only 11 full lines actually reached the preview (1200 / 101), so the other
+        // 14 of the 25 total lines are hidden — not the 5 the current arithmetic
+        // reports (25 - WRITE_PREVIEW_LINES).
+        assert_eq!(
+            shown_lines, 11,
+            "sanity check on how much content actually shows"
+        );
+        assert_eq!(
+            claimed_hidden,
+            25 - shown_lines,
+            "the preview claimed only {claimed_hidden} line(s) were hidden, but {} were \
+             — a user approving from this preview is not seeing what they think they are",
+            25 - shown_lines
+        );
+    }
+
     #[tokio::test]
     async fn a_sub_agent_can_write_files_but_still_cannot_delegate_or_read() {
         // The asymmetry that makes a swarm able to build a project without becoming
@@ -4966,4 +5022,123 @@ mod tests {
             "Event::DelegationFinished chars should be character count (9), not byte count (18)"
         );
     }
+
+    #[test]
+    fn reproduction_test_registry_match_label_case_insensitive() {
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "ollama:llama3".to_string(),
+            Arc::new(StubProvider {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+                remote: false,
+            }),
+        );
+
+        assert_eq!(
+            Registry::match_label(&providers, "OLLAMA"),
+            Some("ollama:llama3".to_string())
+        );
+        assert_eq!(
+            Registry::match_label(&providers, "Ollama"),
+            Some("ollama:llama3".to_string())
+        );
+    }
+
+    // The fallback search in `match_label` is three arms joined by `||`: bare model
+    // name, provider name, and label prefix. A test that leaves two arms true at once
+    // can't tell a real `||` from a mutant `&&`, because both read the same result off
+    // an already-true expression. The three tests below each disagree on two of the
+    // three arms, so exactly one arm can produce the match — that is what makes an
+    // `&&` in either position (the model/provider join or the provider/label join)
+    // fail to find a provider that the real `||` finds.
+
+    #[test]
+    fn match_label_resolves_by_bare_model_name_when_provider_name_and_label_prefix_disagree() {
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "vendor-a:zeta".to_string(),
+            Arc::new(StubProvider {
+                provider: "vendor-a".to_string(),
+                model: "gpteta".to_string(),
+                remote: false,
+            }),
+        );
+
+        assert_eq!(
+            Registry::match_label(&providers, "gpteta"),
+            Some("vendor-a:zeta".to_string()),
+            "want matches only the model name, not the provider name or the label prefix"
+        );
+    }
+
+    #[test]
+    fn match_label_resolves_by_provider_name_when_model_name_and_label_prefix_disagree() {
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "vendor-b:model-b".to_string(),
+            Arc::new(StubProvider {
+                provider: "orbit".to_string(),
+                model: "model-b".to_string(),
+                remote: false,
+            }),
+        );
+
+        assert_eq!(
+            Registry::match_label(&providers, "orbit"),
+            Some("vendor-b:model-b".to_string()),
+            "want matches only the provider name, not the model name or the label prefix"
+        );
+    }
+
+    #[test]
+    fn match_label_resolves_by_label_prefix_when_model_name_and_provider_name_disagree() {
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "orbit:model-c".to_string(),
+            Arc::new(StubProvider {
+                provider: "vendor-c".to_string(),
+                model: "model-c".to_string(),
+                remote: false,
+            }),
+        );
+
+        assert_eq!(
+            Registry::match_label(&providers, "orbit"),
+            Some("orbit:model-c".to_string()),
+            "want matches only the `label:` prefix, not the model name or the provider name"
+        );
+    }
+
+    #[test]
+    fn reproduction_test_discover_vendors_deduplicates_case_insensitively() {
+        use crate::config::{Api, CloudEndpoint, Settings};
+
+        let mut settings = Settings::default();
+        settings.custom_endpoints.insert(
+            "Anthropic".to_string(),
+            CloudEndpoint {
+                api: Api::Anthropic,
+                base_url: "https://custom.api".into(),
+                default_model: "claude-3-7".into(),
+            },
+        );
+
+        let candidates = discover_vendors(&settings, false);
+        let anthropic_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|c| c.group == "ANTHROPIC" || c.id.eq_ignore_ascii_case("anthropic"))
+            .collect();
+
+        assert_eq!(
+            anthropic_candidates.len(),
+            1,
+            "expected only 1 Anthropic candidate, found: {:?}",
+            anthropic_candidates
+                .iter()
+                .map(|c| (&c.id, &c.group))
+                .collect::<Vec<_>>()
+        );
+    }
 }
+

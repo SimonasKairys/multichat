@@ -170,7 +170,15 @@ impl PickerState {
         match &self.mode {
             Mode::Browsing => None,
             Mode::EnteringKey { candidate, buffer } => {
-                Some((self.candidates[*candidate].id.as_str(), buffer.len()))
+                // `chars().count()`, not `.len()`: the caller repeats one `•` per
+                // *typed character*, and this codebase's user types Lithuanian —
+                // 'š', 'ą', 'č' and friends are two UTF-8 bytes each. `.len()` would
+                // report byte count, so one keystroke of a non-ASCII character would
+                // render as two bullets.
+                Some((
+                    self.candidates[*candidate].id.as_str(),
+                    buffer.chars().count(),
+                ))
             }
         }
     }
@@ -659,6 +667,28 @@ mod tests {
 
         picker.backspace_key();
         assert_eq!(picker.key_entry().unwrap().1, 2);
+    }
+
+    #[test]
+    fn typing_a_lithuanian_character_reports_one_typed_character_not_two_bytes() {
+        // The masked prompt renders one `•` per *typed character*
+        // (`src/ui/mod.rs::draw_picker`: `"•".repeat(len)`), per `key_entry`'s own
+        // doc comment. This codebase's user types Lithuanian, so ordinary input
+        // includes multi-byte UTF-8 scalars like 'š' (2 bytes). If `key_entry`
+        // reports a byte count instead of a character count, typing one 'š' would
+        // render two bullets for one keystroke.
+        let candidates = vec![candidate_dual("anthropic", true)];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down();
+        picker.toggle();
+
+        picker.push_key_char('š');
+
+        assert_eq!(
+            picker.key_entry().unwrap().1,
+            1,
+            "one typed character must report length 1, not its UTF-8 byte count"
+        );
     }
 
     #[test]

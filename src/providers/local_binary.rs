@@ -811,6 +811,13 @@ fn parse_agy_line(line: &str) -> StreamLineEffect {
             let reason = value
                 .get("error")
                 .and_then(extract_error_message)
+                .or_else(|| {
+                    value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string)
+                })
                 .unwrap_or_else(|| "error".to_string());
             StreamLineEffect::Failure(reason)
         }
@@ -826,6 +833,13 @@ fn parse_agy_line(line: &str) -> StreamLineEffect {
                 let reason = value
                     .pointer("/result/error")
                     .and_then(extract_error_message)
+                    .or_else(|| {
+                        value
+                            .pointer("/result/message")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_string)
+                    })
                     .unwrap_or_else(|| status.to_string());
                 return StreamLineEffect::Failure(reason);
             }
@@ -2081,5 +2095,20 @@ mod tests {
                 "streaming stdout with non-utf8 progress bytes must decode lossily and succeed",
             );
         assert_eq!(reply.text, "final answer");
+    }
+
+    #[test]
+    fn test_reproduction_agy_dialect_extracts_error_from_message_fields() {
+        let line1 = r#"{"event": "error", "message": "Failed to launch subagent"}"#;
+        assert_eq!(
+            parse_agy_line(line1),
+            StreamLineEffect::Failure("Failed to launch subagent".to_string())
+        );
+
+        let line2 = r#"{"event": "result", "result": {"status": "ERROR", "message": "Quota limit reached"}}"#;
+        assert_eq!(
+            parse_agy_line(line2),
+            StreamLineEffect::Failure("Quota limit reached".to_string())
+        );
     }
 }

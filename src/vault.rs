@@ -394,6 +394,25 @@ impl EncryptedVault {
             }
         }
         let _ = fs::remove_file(&self.path);
+
+        // `write_atomically` writes the replacement vault to `<path>.tmp` and only
+        // renames it over `self.path` once the write (and, on Unix, the permission
+        // copy) has fully succeeded. A crash or power loss in that window — between
+        // the temp file landing on disk and the rename — leaves `<path>.tmp` behind
+        // holding a complete, valid, decryptable snapshot of the vault: the exact
+        // secret this function exists to erase. Destroying `self.path` alone would
+        // leave that orphaned snapshot fully recoverable right next to it, so it
+        // gets the same zero-then-unlink treatment (symlink caution included) as
+        // the vault file itself. On the common path there is no such file, so this
+        // is a harmless no-op.
+        let tmp = tmp_path_for(&self.path);
+        match fs::symlink_metadata(&tmp) {
+            Ok(meta) if !meta.file_type().is_symlink() => {
+                let _ = fs::write(&tmp, vec![0u8; meta.len() as usize]);
+            }
+            _ => {}
+        }
+        let _ = fs::remove_file(&tmp);
     }
 
     /// Reads the plaintext header fields without decrypting anything, so `simon vault
@@ -1200,6 +1219,102 @@ mod tests {
             !vault.path().exists(),
             "the symlink itself should still be gone — unlinking it never touches \
              its target, so this is safe even though the target survives"
+        );
+    }
+
+    #[test]
+    fn destroy_leaves_a_crash_orphaned_tmp_file_with_the_secret_still_recoverable() {
+        // `write_atomically` writes the new vault to `vault.enc.tmp` and only then
+        // renames it over `vault.enc`. A crash or power loss between those two steps
+        // leaves `vault.enc.tmp` on disk holding a complete, valid, decryptable
+        // snapshot of the vault — exactly the secret `destroy()` exists to erase.
+        // `destroy()` must not leave that snapshot sitting untouched right next to
+        // the file it just wiped.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"top secret transcript", &pw).unwrap();
+
+        // Simulate the crash window: a fully-written `.tmp` snapshot that never got
+        // renamed into place.
+        let raw = fs::read(vault.path()).unwrap();
+        let tmp = tmp_path_for(vault.path());
+        fs::write(&tmp, &raw).unwrap();
+
+        vault.destroy();
+
+        assert!(
+            !tmp.exists(),
+            "destroy() left a crash-orphaned .tmp file behind with the vault's \
+             secret still fully recoverable from it"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn destroy_refuses_to_zero_a_crash_orphaned_tmps_symlinked_target() {
+        // Same hazard as `destroy_refuses_to_zero_a_symlinks_target`, one file over:
+        // the crash-orphaned `.tmp` cleanup added to `destroy()` uses `symlink_metadata`
+        // + a guarded `fs::write`, mirroring the guard used for `self.path` above it. If
+        // that guard were ever bypassed, a `vault.enc.tmp` that is actually a SYMLINK
+        // would have its target zeroed — some unrelated file that merely happens to
+        // share that directory entry — even though unlinking the symlink afterward
+        // never touches the target.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"payload", &pw).unwrap();
+
+        let victim = dir.path().join("victim.txt");
+        fs::write(&victim, b"do not touch").unwrap();
+        let tmp = tmp_path_for(vault.path());
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        vault.destroy();
+
+        assert_eq!(
+            fs::read(&victim).unwrap(),
+            b"do not touch",
+            "destroy() zeroed the .tmp symlink's target instead of refusing to"
+        );
+        assert!(
+            !tmp.exists(),
+            "the .tmp symlink itself should still be gone — unlinking it never \
+             touches its target, so this is safe even though the target survives"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn destroy_zeroes_a_crash_orphaned_tmp_file_before_unlinking_it() {
+        // The crash-orphaned `.tmp` cleanup in `destroy()` is supposed to zero the
+        // file's contents before unlinking it, the same as it does for `self.path` —
+        // not merely unlink it and leave the secret sitting in the freed disk blocks.
+        // `remove_file` unlinks the `.tmp` path unconditionally either way, so
+        // checking `!tmp.exists()` afterward (as the crash-orphan test above does)
+        // can't tell a zero-then-unlink from a bare unlink. To catch that, hard-link
+        // the `.tmp` file to a second path first: `fs::write` truncates and rewrites
+        // the *same inode* in place, so the hard link keeps observing that inode's
+        // bytes even after the original `.tmp` name is unlinked out from under it.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"top secret transcript", &pw).unwrap();
+
+        let raw = fs::read(vault.path()).unwrap();
+        let tmp = tmp_path_for(vault.path());
+        fs::write(&tmp, &raw).unwrap();
+        let inspector = dir.path().join("tmp.inspector");
+        fs::hard_link(&tmp, &inspector).unwrap();
+
+        vault.destroy();
+
+        assert!(!tmp.exists(), "destroy() must still unlink the .tmp file");
+        assert_eq!(
+            fs::read(&inspector).unwrap(),
+            vec![0u8; raw.len()],
+            "destroy() unlinked the crash-orphaned .tmp file without zeroing it \
+             first — the secret is still fully recoverable from the freed blocks"
         );
     }
 

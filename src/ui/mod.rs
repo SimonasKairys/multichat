@@ -417,13 +417,15 @@ pub(crate) fn handle_picker_key(
             // guard was an unkillable equivalent mutant, which is its way of saying the
             // condition is dead. Keep this arm *below* the Ctrl one; swapping them
             // would make plain `c` and Ctrl+C do the same thing.
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') | KeyCode::Char('C') => {
                 state.set_commander();
                 PickerKeyOutcome::Continue
             }
             KeyCode::Enter => PickerKeyOutcome::Submit,
             KeyCode::Esc => PickerKeyOutcome::Cancel,
-            KeyCode::Char('q') if !modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('q') | KeyCode::Char('Q')
+                if !modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 PickerKeyOutcome::Cancel
             }
             _ => PickerKeyOutcome::Continue,
@@ -481,7 +483,7 @@ async fn handle_key(
 
     match code {
         KeyCode::Esc => app.should_quit = true,
-        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char('c') | KeyCode::Char('C') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
         }
         KeyCode::Enter => {
@@ -1438,5 +1440,56 @@ mod tests {
             picker.key_entry().is_some(),
             "Ctrl+A must not cancel key entry"
         );
+    }
+
+    #[tokio::test]
+    async fn reproduction_test_handle_key_ctrl_c_with_shift_or_caps_exits() {
+        let mut app = App::new(
+            "ollama:llama3",
+            &["ollama:llama3".to_string()],
+            "/tmp".to_string(),
+        );
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let (dec_tx, _dec_rx) = mpsc::channel(1);
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL,
+            &cmd_tx,
+            &dec_tx,
+        )
+        .await;
+
+        assert!(app.should_quit);
+    }
+
+    // Pins the `KeyCode::Esc` arm at the top of the main `match code` block: Esc is
+    // the primary way out of the TUI, and with no pending write to intercept it first
+    // the key has to reach that arm and set `should_quit` directly, not just be
+    // absorbed by the trailing `_ => {}` catch-all as an ordinary unbound key.
+    #[tokio::test]
+    async fn esc_quits_the_app_from_the_main_key_handler() {
+        let mut app = App::new(
+            "ollama:llama3",
+            &["ollama:llama3".to_string()],
+            "/tmp".to_string(),
+        );
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let (dec_tx, _dec_rx) = mpsc::channel(1);
+
+        handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &cmd_tx, &dec_tx).await;
+
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn reproduction_test_picker_uppercase_c_sets_commander() {
+        let mut picker = browsing_picker(&["a"]);
+        assert!(!picker.is_commander(0, 0));
+
+        handle_picker_key(&mut picker, KeyCode::Char('C'), KeyModifiers::NONE);
+
+        assert!(picker.is_commander(0, 0));
     }
 }

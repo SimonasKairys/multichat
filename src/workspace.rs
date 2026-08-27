@@ -209,12 +209,22 @@ impl Workspace {
     /// a replacement.
     pub fn precheck(&self, requested: &str, content_len: usize) -> Result<()> {
         Self::reject_traversal(requested)?;
+        let candidate = Path::new(requested);
+        if candidate.file_name().is_none() {
+            return Err(anyhow!("project path `{requested}` has no file name"));
+        }
         if content_len > MAX_FILE_BYTES {
             return Err(anyhow!(
                 "project file `{requested}` is {content_len} bytes, over the {MAX_FILE_BYTES}-byte limit"
             ));
         }
-        self.reject_git_writes(requested, Path::new(requested))
+        self.reject_git_writes(requested, candidate)?;
+        if let Ok(meta) = fs::symlink_metadata(self.root.join(candidate)) {
+            if meta.is_dir() {
+                return Err(anyhow!("project path `{requested}` is a directory"));
+            }
+        }
+        Ok(())
     }
 
     /// Refuses any write whose path passes through a `.git` component.
@@ -400,12 +410,15 @@ impl Workspace {
         // the root — could redirect the write outside it. `symlink_metadata` never
         // follows the link, unlike `metadata`, so this actually inspects the link
         // itself rather than its target.
-        if let Ok(meta) = fs::symlink_metadata(&resolved)
-            && meta.file_type().is_symlink()
-        {
-            return Err(anyhow!(
-                "project path `{requested}` is a symlink, refusing to write through it"
-            ));
+        if let Ok(meta) = fs::symlink_metadata(&resolved) {
+            if meta.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "project path `{requested}` is a symlink, refusing to write through it"
+                ));
+            }
+            if meta.is_dir() {
+                return Err(anyhow!("project path `{requested}` is a directory"));
+            }
         }
 
         fs::write(&resolved, content)
@@ -925,4 +938,37 @@ mod tests {
             .expect("BUG: Workspace under .git parent directory refused normal writes");
         assert_eq!(fs::read_to_string(path).unwrap(), "content");
     }
+
+    #[test]
+    fn reproduction_test_write_to_existing_directory_fails_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Workspace::new(dir.path().to_path_buf()).unwrap();
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let err = w.write("subdir", "hello").unwrap_err().to_string();
+        assert_eq!(
+            err, "project path `subdir` is a directory",
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reproduction_test_precheck_rejects_paths_without_filename_or_existing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Workspace::new(dir.path().to_path_buf()).unwrap();
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let err = w.precheck(".", 10).unwrap_err().to_string();
+        assert!(
+            err.contains("has no file name"),
+            "expected error containing 'has no file name', got: {err}"
+        );
+
+        let err = w.precheck("subdir", 10).unwrap_err().to_string();
+        assert!(
+            err.contains("is a directory"),
+            "expected error containing 'is a directory', got: {err}"
+        );
+    }
 }
+

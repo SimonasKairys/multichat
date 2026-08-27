@@ -145,6 +145,19 @@ pub struct LoadedRead {
 /// loaded read and the cap can afford to be just as generous as writes.
 const MAX_RECORDED_LISTS: usize = 20;
 
+/// Ceiling on a single listing's outcome, in characters. `MAX_RECORDED_LISTS` bounds
+/// how many listings the ledger keeps; this is the per-item cap that was missing
+/// alongside it — every other content-bearing recorder (`record_result`,
+/// `record_skill`, `record_file_read`) already caps its content the same way, but
+/// `record_file_list` stored `outcome` verbatim. `Workspace::list` allows up to
+/// `workspace::MAX_LIST_ENTRIES` (500) entries in one listing, which for a directory
+/// of long file names is still far too much to inject into every prompt for the rest
+/// of the session — `docs/AUDIT-2026-07-30.md` §3.2 named this section specifically
+/// as the one with no per-item content cap at all. Same size as
+/// `MAX_READ_CONTENT_CHARS`: a listing is metadata rather than file content, but
+/// there is no reason its cap should be any looser than a loaded file's.
+const MAX_LIST_OUTCOME_CHARS: usize = 4000;
+
 /// The recorded outcome of an `ACTION: list_files(...)` request: the path and either
 /// the newline-joined entries or the error text.
 #[derive(Debug, Clone)]
@@ -527,8 +540,21 @@ impl SwarmLedger {
     /// `record_file_write`'s in-place refresh. Otherwise, recording past
     /// `MAX_RECORDED_LISTS` evicts the oldest entry to make room.
     pub fn record_file_list(&mut self, path: &str, outcome: &str) {
+        // Truncate on a char boundary, not a byte index — mirrors `record_file_read`,
+        // for the same reason: `outcome` joins model-controlled file names and may
+        // contain multi-byte UTF-8, and slicing mid-character panics. `outcome` was
+        // previously stored verbatim with only `MAX_RECORDED_LISTS` bounding how many
+        // listings are kept, never how big one is — a listing has no per-item cap
+        // upstream either (`Workspace::list` allows up to `MAX_LIST_ENTRIES` entries),
+        // so a single directory with many long file names could dominate every
+        // subsequent prompt's budget on its own.
+        let truncated = match outcome.char_indices().nth(MAX_LIST_OUTCOME_CHARS) {
+            Some((cut, _)) => format!("{}…", &outcome[..cut]),
+            None => outcome.to_string(),
+        };
+
         if let Some(existing) = self.file_listings.iter_mut().find(|l| l.path == path) {
-            existing.outcome = outcome.to_string();
+            existing.outcome = truncated;
             return;
         }
         if self.file_listings.len() >= MAX_RECORDED_LISTS {
@@ -536,7 +562,7 @@ impl SwarmLedger {
         }
         self.file_listings.push(ListedFiles {
             path: path.to_string(),
-            outcome: outcome.to_string(),
+            outcome: truncated,
         });
     }
 
@@ -1114,8 +1140,29 @@ impl SwarmLedger {
             .trim();
         let rest = trimmed.strip_prefix(marker)?;
         let mut depth = 1usize;
+        let mut in_quote: Option<char> = None;
+        let mut escaped = false;
+
         for (i, c) in rest.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+
+            if c == '\\' {
+                escaped = true;
+                continue;
+            }
+
+            if let Some(quote_char) = in_quote {
+                if c == quote_char {
+                    in_quote = None;
+                }
+                continue;
+            }
+
             match c {
+                '"' | '\'' => in_quote = Some(c),
                 '(' => depth += 1,
                 ')' => {
                     depth -= 1;
@@ -1841,6 +1888,70 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_listing_outcome_is_capped_the_way_every_sibling_recorders_content_is() {
+        // `record_result`, `record_skill`, and `record_file_read` all cap what they
+        // store at a fixed character ceiling before it ever reaches the ledger.
+        // `record_file_list` did not: `ACTION: list_files` on a directory with many
+        // entries puts the whole, uncapped listing into the ledger and straight into
+        // the next system prompt, with nothing bounding it — `docs/AUDIT-2026-07-30.md`
+        // §3.2 named this section specifically as the one content-bearing field with
+        // no per-item cap.
+        let mut ledger = SwarmLedger::new();
+        let huge_outcome = (0..5000)
+            .map(|n| format!("entry_{n}.rs"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ledger.record_file_list("huge-dir", &huge_outcome);
+
+        let stored = &ledger.file_listings()[0].outcome;
+        assert!(stored.ends_with('…'));
+        // MAX_LIST_OUTCOME_CHARS kept chars, plus the ellipsis marker — same shape as
+        // `record_result`'s and `record_file_read`'s own truncation.
+        assert_eq!(stored.chars().count(), MAX_LIST_OUTCOME_CHARS + 1);
+    }
+
+    #[test]
+    fn a_listing_outcomes_truncation_is_on_a_char_boundary_not_a_byte_index() {
+        // Multi-byte UTF-8 near the cap must not panic on a mid-character slice —
+        // directory listings routinely contain non-ASCII file names.
+        let mut ledger = SwarmLedger::new();
+        let long_outcome = "é".repeat(MAX_LIST_OUTCOME_CHARS + 10);
+        ledger.record_file_list("dir", &long_outcome);
+
+        let stored = &ledger.file_listings()[0].outcome;
+        assert!(stored.ends_with('…'));
+        assert_eq!(stored.chars().count(), MAX_LIST_OUTCOME_CHARS + 1);
+    }
+
+    #[test]
+    fn re_recording_one_listing_refreshes_that_path_and_leaves_the_others_alone() {
+        // Pins the in-place-refresh lookup in `record_file_list`: it must match on
+        // `path`, not on some other field, so re-recording "src" only ever touches the
+        // "src" entry. A lookup that matched the wrong way (or the wrong field) could
+        // silently overwrite an unrelated path instead -- invisible with a single
+        // listing in play, so this needs two distinct paths to be observable at all.
+        let mut ledger = SwarmLedger::new();
+        ledger.record_file_list("src", "ok (2 entries)\nmain.rs\nlib.rs");
+        ledger.record_file_list("docs", "ok (1 entries)\nREADME.md");
+
+        ledger.record_file_list("src", "ok (3 entries)\nmain.rs\nlib.rs\nmod.rs");
+
+        assert_eq!(ledger.file_listings().len(), 2);
+        let src = ledger
+            .file_listings()
+            .iter()
+            .find(|l| l.path == "src")
+            .expect("src listing must still be present");
+        assert_eq!(src.outcome, "ok (3 entries)\nmain.rs\nlib.rs\nmod.rs");
+        let docs = ledger
+            .file_listings()
+            .iter()
+            .find(|l| l.path == "docs")
+            .expect("docs listing must be untouched");
+        assert_eq!(docs.outcome, "ok (1 entries)\nREADME.md");
+    }
+
+    #[test]
     fn parses_a_simple_write_file_block() {
         let (writes, stripped) = SwarmLedger::parse_file_writes(
             "Sure, here you go.\nACTION: write_file(notes/todo.md)\nline one\nline two\nACTION: end_file\nDone.",
@@ -2298,5 +2409,20 @@ mod tests {
         );
         assert_eq!(writes[0].content, "col1,col2");
         assert!(stripped.is_empty());
+    }
+
+    #[test]
+    fn reproduction_test_action_argument_with_unmatched_parens_in_quotes() {
+        let reply1 = "ACTION: delegate_task(worker, \"Step 1) check this, step 2) check that\")";
+        let found1 = SwarmLedger::parse_delegations(reply1);
+        assert_eq!(found1.len(), 1, "Case 1 should find 1 delegation");
+        assert_eq!(found1[0].target, "worker");
+        assert_eq!(found1[0].prompt, "Step 1) check this, step 2) check that");
+
+        let reply2 = "ACTION: delegate_task(worker, \"Check smile :(\")";
+        let found2 = SwarmLedger::parse_delegations(reply2);
+        assert_eq!(found2.len(), 1, "Case 2 should find 1 delegation");
+        assert_eq!(found2[0].target, "worker");
+        assert_eq!(found2[0].prompt, "Check smile :(");
     }
 }

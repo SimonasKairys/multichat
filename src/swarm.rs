@@ -1146,15 +1146,21 @@ impl SwarmLedger {
         while let Some((i, c)) = chars.next() {
             if let Some(quote_char) = in_quote {
                 if c == '\\' {
+                    // `\\` before the quote character is ambiguous: it is either an
+                    // escaped quote inside the argument, or a Windows path ending in a
+                    // separator right before the real closing quote. Peeking at the
+                    // next character or two cannot tell those apart — both look the
+                    // same locally — so decide on the only thing that actually
+                    // distinguishes them: whether a closing quote is still to come.
+                    // Skipping the quote only makes sense if the argument can still be
+                    // closed afterwards; when nothing later can close it, this quote is
+                    // the closing one and the backslash is a literal path separator.
                     let mut lookahead = chars.clone();
-                    let next_char = lookahead.next().map(|(_, ch)| ch);
-                    let after_next = lookahead.next().map(|(_, ch)| ch);
-                    if next_char == Some(quote_char) {
-                        let is_delimiter = matches!(after_next, Some(')') | Some(',') | None)
-                            || after_next.is_some_and(char::is_whitespace);
-                        if !is_delimiter {
-                            chars.next();
-                        }
+                    if let Some((qi, next_char)) = lookahead.next()
+                        && next_char == quote_char
+                        && rest[qi + next_char.len_utf8()..].contains(quote_char)
+                    {
+                        chars.next();
                     }
                 } else if c == quote_char {
                     in_quote = None;
@@ -1645,6 +1651,30 @@ mod tests {
         let text = SwarmLedger::new().system_prompt();
         assert!(!text.contains("the result will be returned to you"));
         assert!(text.contains("NEXT turn"));
+    }
+
+    /// The action-argument scanner treats `\` inside a quoted argument as an escape
+    /// only when the character two positions on is not `)`, `,`, whitespace, or the
+    /// end of the line. That lookahead cannot tell an escaped quote apart from a
+    /// Windows path ending in a separator, and it guesses "not an escape" for every
+    /// escaped quote a model writes before a comma — which is where escaped quotes
+    /// normally land in prose. The quote then closes early, a `)` that was inside the
+    /// string is counted as the one closing the call, and the delegation prompt is
+    /// silently truncated at that paren. The model runs with half its instructions and
+    /// nothing reports a problem.
+    #[test]
+    fn an_escaped_quote_before_a_comma_does_not_truncate_the_prompt_at_a_later_paren() {
+        let delegations = SwarmLedger::parse_delegations(
+            r#"ACTION: delegate_task(model, "say \"hi\", then stop) please")"#,
+        );
+
+        assert_eq!(delegations.len(), 1, "the delegation must still be found");
+        assert_eq!(delegations[0].target, "model");
+        assert_eq!(
+            delegations[0].prompt, r#"say \"hi\", then stop) please"#,
+            "the prompt must survive whole: a `)` inside the quoted argument is not the \
+             paren that closes the call"
+        );
     }
 
     #[test]

@@ -23,6 +23,9 @@ pub mod workspace;
 mod cli_discovery_test;
 
 #[cfg(test)]
+mod copilot_stream_error_test;
+
+#[cfg(test)]
 mod action_argument_path_backslash_test;
 
 #[cfg(test)]

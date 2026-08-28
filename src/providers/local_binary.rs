@@ -950,6 +950,16 @@ fn parse_copilot_line(line: &str) -> StreamLineEffect {
                 .unwrap_or("tool");
             StreamLineEffect::Progress(tool.to_string())
         }
+        Some("session.error") => {
+            let reason = value
+                .pointer("/data/message")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_string())
+                .or_else(|| value.pointer("/data/error").and_then(extract_error_message))
+                .unwrap_or_else(|| "Copilot session error".to_string());
+            StreamLineEffect::Failure(reason)
+        }
         _ => StreamLineEffect::Ignore,
     }
 }

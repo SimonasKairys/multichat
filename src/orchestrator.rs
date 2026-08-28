@@ -243,6 +243,7 @@ pub enum Event {
     Reconfigured {
         primary: String,
         roster: Vec<String>,
+        available_models: Vec<String>,
     },
     /// `/commander <name>` resolved and switched the primary. `connection_id` is
     /// `settings.commander`'s key (see `Registry::connection_id`'s doc comment for
@@ -1130,6 +1131,24 @@ pub fn candidate_label(
     }
 }
 
+/// Every currently reachable candidate/transport label, including models that are
+/// available but not enabled in the saved connection set.
+pub fn available_candidate_labels(candidates: &[Candidate], settings: &Settings) -> Vec<String> {
+    let mut labels = candidates
+        .iter()
+        .flat_map(|candidate| {
+            candidate
+                .transports
+                .iter()
+                .filter(|option| option.availability.is_available())
+                .map(|option| candidate_label(candidate, option, settings))
+        })
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels.dedup();
+    labels
+}
+
 fn transport_tag(transport: Option<Transport>) -> &'static str {
     match transport {
         None => "ollama",
@@ -1236,6 +1255,16 @@ impl Registry {
         project_root: &Path,
     ) -> Result<Self> {
         let candidates = discover_candidates(settings, classified).await;
+        Self::build_discovered(settings, requested, classified, project_root, candidates)
+    }
+
+    pub(crate) fn build_discovered(
+        settings: &Settings,
+        requested: Option<&str>,
+        classified: bool,
+        project_root: &Path,
+        candidates: Vec<Candidate>,
+    ) -> Result<Self> {
         let client = http_client(classified)?;
         let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
         let mut applied: BTreeMap<String, ConnectionSpec> = BTreeMap::new();
@@ -1651,7 +1680,15 @@ impl Orchestrator {
     /// reopened mid-chat) and resets the swarm roster so the system prompt matches
     /// reality.
     async fn reconfigure(&mut self, settings: Settings) {
-        match Registry::build(&settings, None, self.classified, &self.project_root).await {
+        let candidates = discover_candidates(&settings, self.classified).await;
+        let available_models = available_candidate_labels(&candidates, &settings);
+        match Registry::build_discovered(
+            &settings,
+            None,
+            self.classified,
+            &self.project_root,
+            candidates,
+        ) {
             Ok(registry) => {
                 self.registry = registry;
                 self.ledger.set_roster(self.registry.labels());
@@ -1666,6 +1703,7 @@ impl Orchestrator {
                 self.emit(Event::Reconfigured {
                     primary: self.registry.primary().to_string(),
                     roster: self.registry.labels(),
+                    available_models,
                 })
                 .await;
             }

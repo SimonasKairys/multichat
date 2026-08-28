@@ -66,11 +66,12 @@ In the TUI: type and press **Enter** to send, **PageUp/PageDown** to scroll, **E
 caret, **Home/End** jump to either edge, **Backspace/Delete** cut on either side of it,
 and modified chords are not typed as text (a stray **Ctrl-A** used to insert a bare
 `a`). `/forget` clears the ledger's accumulated content when a long session has piled
-up more than the commander needs. Type `/commander` on its own to list every connected model with
-the current commander marked, or `/commander <name>` (a full label, a bare model
-name, or a provider name) to switch commanders live, without leaving the
-conversation — the choice persists across restarts, same as the picker's. Neither
-form is ever sent to a model as a prompt.
+up more than the commander needs. Type `/commander` on its own to list every reachable
+model, marking the current commander, connected choices, and models that need to be
+connected through **Ctrl+O** first. `/commander <name>` (a full label, a bare model
+name, or a provider name) switches to any connected choice live, without leaving the
+conversation — the choice persists across restarts, same as the picker's. Neither form
+is ever sent to a model as a prompt.
 
 `--vault` persists the TUI transcript — what you and the models said — to an encrypted
 file so it survives between runs of `simon chat --vault`. It is **not** conversation

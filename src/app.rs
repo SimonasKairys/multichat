@@ -180,6 +180,10 @@ pub struct App {
     /// a round trip to the orchestrator — this is already handed to `App::new` and
     /// refreshed on `Reconfigured`, so retaining it is the only plumbing needed.
     pub roster: Vec<String>,
+    /// Every reachable model, including rows that are available but not connected.
+    /// Bare `/commander` uses this broader list so the user can see every possible
+    /// commander and which choices require opening the connection picker first.
+    pub available_models: Vec<String>,
     /// Per-model token and quota telemetry accumulated for this session.
     usage: BTreeMap<String, ModelUsage>,
     /// Set while a model is waiting for permission to write a file. While this is
@@ -247,10 +251,15 @@ impl App {
             spinner_frame: 0,
             primary,
             roster: roster.to_vec(),
+            available_models: roster.to_vec(),
             usage: BTreeMap::new(),
             pending_write: None,
             should_quit: false,
         }
+    }
+
+    pub fn set_available_models(&mut self, available_models: Vec<String>) {
+        self.available_models = available_models;
     }
 
     /// Advances the spinner by one frame. Called once per UI tick — see `run` in
@@ -483,7 +492,11 @@ impl App {
                 text,
             }),
             Event::TurnComplete => self.busy = false,
-            Event::Reconfigured { primary, roster } => {
+            Event::Reconfigured {
+                primary,
+                roster,
+                available_models,
+            } => {
                 // `Command::Reconfigure` is sent directly from `reopen_picker` in
                 // `ui/mod.rs`, never through `submit()`, so nothing else on this path
                 // ever sets `busy` — but nothing cleared it either if it happened to
@@ -497,6 +510,7 @@ impl App {
                 self.busy = false;
                 self.primary = primary.clone();
                 self.roster = roster.clone();
+                self.available_models = available_models.clone();
                 self.transcript.push(Line {
                     speaker: Speaker::System,
                     text: format!("connections updated — commander: {primary}"),
@@ -533,27 +547,27 @@ impl App {
         }
     }
 
-    /// Renders `/commander`'s bare-form listing into the transcript: every connected
-    /// label, with the current commander marked, in the same `swarm: a, b, c` shape
-    /// `Event::Reconfigured`'s handler already uses so this reads as native system
-    /// output rather than a bolted-on command reply. This never reaches the
-    /// orchestrator, so it must clear `busy` itself — see `finish_local_command`.
+    /// Renders every reachable commander choice. Connected models can be selected
+    /// immediately with `/commander <name>`; available-but-disconnected models point
+    /// to the connection picker, where choosing one as commander also connects it.
     pub fn list_commander(&mut self) {
         let listing = self
-            .roster
+            .available_models
             .iter()
             .map(|label| {
                 if *label == self.primary {
                     format!("{label} (commander)")
+                } else if self.roster.contains(label) {
+                    format!("{label} (connected)")
                 } else {
-                    label.clone()
+                    format!("{label} (available; Ctrl+O to connect)")
                 }
             })
             .collect::<Vec<_>>()
             .join(", ");
         self.transcript.push(Line {
             speaker: Speaker::System,
-            text: format!("swarm: {listing}"),
+            text: format!("commander choices: {listing}"),
         });
         self.finish_local_command();
     }
@@ -1188,6 +1202,7 @@ mod tests {
         app.apply(Event::Reconfigured {
             primary: "anthropic:claude-opus-5".into(),
             roster: vec!["anthropic:claude-opus-5".into(), "ollama:llama3".into()],
+            available_models: vec!["anthropic:claude-opus-5".into(), "ollama:llama3".into()],
         });
         assert_eq!(app.primary, "anthropic:claude-opus-5");
         assert!(app.status_line().contains("anthropic:claude-opus-5"));
@@ -1284,6 +1299,11 @@ mod tests {
             ],
             "/tmp/project".to_string(),
         );
+        app.set_available_models(vec![
+            "anthropic:claude-opus-5".to_string(),
+            "copilot".to_string(),
+            "ollama:llama3".to_string(),
+        ]);
         app.push_char('x');
         app.submit();
         assert!(app.busy);
@@ -1291,9 +1311,11 @@ mod tests {
         app.list_commander();
 
         assert!(!app.busy);
+        assert!(app.body().contains("anthropic:claude-opus-5 (connected)"));
+        assert!(app.body().contains("ollama:llama3 (commander)"));
         assert!(
             app.body()
-                .contains("swarm: ollama:llama3 (commander), anthropic:claude-opus-5")
+                .contains("copilot (available; Ctrl+O to connect)")
         );
     }
 
@@ -1435,6 +1457,7 @@ mod tests {
         app.apply(Event::Reconfigured {
             primary: "anthropic:claude-opus-5".into(),
             roster: vec!["anthropic:claude-opus-5".into()],
+            available_models: vec!["anthropic:claude-opus-5".into()],
         });
 
         // `busy` must not survive a `Reconfigured` event: nothing else on this path

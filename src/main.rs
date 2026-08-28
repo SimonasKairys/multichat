@@ -453,11 +453,15 @@ async fn chat(
         }
     }
 
-    let registry = Registry::build(&settings, model, classified, project_root).await?;
+    let candidates = crate::orchestrator::discover_candidates(&settings, classified).await;
+    let available_models = crate::orchestrator::available_candidate_labels(&candidates, &settings);
+    let registry =
+        Registry::build_discovered(&settings, model, classified, project_root, candidates)?;
     let primary = registry.primary().to_string();
     let roster = registry.labels();
 
     let mut app = App::new(primary, &roster, project_root.display().to_string());
+    app.set_available_models(available_models);
 
     // Password prompting and all vault I/O happen here — before the picker's result
     // is wired to a running orchestrator and, crucially, before `ui::run` ever calls

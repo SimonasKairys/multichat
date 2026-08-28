@@ -15,7 +15,7 @@ use crate::app::ActivityKind;
 use crate::audit::AuditLogger;
 use crate::config::{ConnectionSpec, Credentials, Paths, Settings, Transport};
 use crate::providers::{
-    ProgressSink, Provider,
+    ProgressSink, Provider, RateLimit, TokenUsage,
     cloud::CloudProvider,
     http_client,
     local_binary::{CliInvocation, LocalBinaryProvider, StreamDialect},
@@ -147,6 +147,15 @@ impl std::fmt::Debug for Command {
 pub enum Event {
     /// A model produced a reply.
     Reply { label: String, text: String },
+    /// Usage and quota metadata observed for one completed provider call.
+    ///
+    /// Kept separate from `Reply` so transcript rendering stays concerned only with
+    /// user-visible text while the global status line can accumulate telemetry.
+    UsageUpdated {
+        label: String,
+        usage: TokenUsage,
+        rate_limit: RateLimit,
+    },
     /// A delegation was dispatched. `task` is the sub-agent's prompt, truncated to
     /// `MAX_TASK_DISPLAY_CHARS` for display — the audit log already records the
     /// delegation by size and label only (see `run_delegations`'s `task.delegated`
@@ -1744,6 +1753,12 @@ impl Orchestrator {
         // needs.
         drop(progress);
 
+        self.emit(Event::UsageUpdated {
+            label: primary_label.clone(),
+            usage: reply.usage.clone(),
+            rate_limit: reply.rate_limit.clone(),
+        })
+        .await;
         if let Some(budget) = reply.rate_limit.summary() {
             self.ledger.update_budget(&primary_label, &budget);
         }
@@ -1886,6 +1901,12 @@ impl Orchestrator {
             match outcome {
                 Ok(reply) => {
                     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    self.emit(Event::UsageUpdated {
+                        label: target_label.clone(),
+                        usage: reply.usage.clone(),
+                        rate_limit: reply.rate_limit.clone(),
+                    })
+                    .await;
                     if let Some(budget) = reply.rate_limit.summary() {
                         self.ledger.update_budget(&target_label, &budget);
                     }
@@ -2346,6 +2367,7 @@ mod tests {
             Ok(Reply {
                 text: format!("echo: {prompt}"),
                 rate_limit: RateLimit::default(),
+                usage: TokenUsage::default(),
             })
         }
         fn model_name(&self) -> &str {
@@ -2375,6 +2397,7 @@ mod tests {
             Ok(Reply {
                 text: self.reply.clone(),
                 rate_limit: RateLimit::default(),
+                usage: TokenUsage::default(),
             })
         }
         fn model_name(&self) -> &str {
@@ -2408,6 +2431,7 @@ mod tests {
             Ok(Reply {
                 text: "recovered".into(),
                 rate_limit: RateLimit::default(),
+                usage: TokenUsage::default(),
             })
         }
         fn model_name(&self) -> &str {
@@ -2970,12 +2994,24 @@ mod tests {
 
         // `handle_prompt` now also emits `ActivityStarted` before the provider call;
         // skip past it to the reply, which is what this test is actually about.
+        let mut saw_usage = false;
         let reply = loop {
             match event_rx.recv().await.expect("expected a reply event") {
+                Event::UsageUpdated {
+                    label,
+                    usage,
+                    rate_limit,
+                } => {
+                    assert_eq!(label, "ollama:llama3");
+                    assert!(usage.is_empty());
+                    assert!(rate_limit.is_empty());
+                    saw_usage = true;
+                }
                 Event::Reply { label, text } => break (label, text),
                 _ => continue,
             }
         };
+        assert!(saw_usage, "usage metadata must be emitted before the reply");
         assert_eq!(reply.0, "ollama:llama3");
         assert_eq!(reply.1, "echo: hello there");
 

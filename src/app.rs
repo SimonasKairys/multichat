@@ -1,9 +1,11 @@
 //! TUI state, kept free of I/O so it can be unit-tested.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::orchestrator::Event;
+use crate::providers::{RateLimit, TokenUsage};
 
 /// Who produced a line in the transcript.
 ///
@@ -133,6 +135,13 @@ pub struct Activity {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ModelUsage {
+    total_tokens: u64,
+    last: TokenUsage,
+    rate_limit: RateLimit,
+}
+
 /// Animation frames for the busy status line: a single `●` orbiting a field of `·`,
 /// the two glyphs already used elsewhere in the UI (the commander marker in the
 /// picker, `Line::render`'s system-line prefix). Reusing them rather than adding a
@@ -171,6 +180,8 @@ pub struct App {
     /// a round trip to the orchestrator — this is already handed to `App::new` and
     /// refreshed on `Reconfigured`, so retaining it is the only plumbing needed.
     pub roster: Vec<String>,
+    /// Per-model token and quota telemetry accumulated for this session.
+    usage: BTreeMap<String, ModelUsage>,
     /// Set while a model is waiting for permission to write a file. While this is
     /// `Some` the input line becomes a y/n/a prompt rather than a text box — see
     /// `handle_key` in `ui/mod.rs` — because answering it is the only thing that lets
@@ -236,6 +247,7 @@ impl App {
             spinner_frame: 0,
             primary,
             roster: roster.to_vec(),
+            usage: BTreeMap::new(),
             pending_write: None,
             should_quit: false,
         }
@@ -343,7 +355,9 @@ impl App {
     pub fn apply(&mut self, event: Event) {
         if !matches!(
             event,
-            Event::ActivityStarted { .. } | Event::ActivityProgress { .. }
+            Event::ActivityStarted { .. }
+                | Event::ActivityProgress { .. }
+                | Event::UsageUpdated { .. }
         ) {
             self.activity = None;
         }
@@ -370,6 +384,18 @@ impl App {
                 {
                     activity.detail = Some(detail);
                 }
+            }
+            Event::UsageUpdated {
+                label,
+                usage,
+                rate_limit,
+            } => {
+                let stats = self.usage.entry(label).or_default();
+                if let Some(total) = usage.observed_total() {
+                    stats.total_tokens = stats.total_tokens.saturating_add(total);
+                }
+                stats.last = usage;
+                stats.rate_limit = rate_limit;
             }
             Event::Reply { label, text } => self.transcript.push(Line {
                 speaker: Speaker::Model(label),
@@ -576,24 +602,23 @@ impl App {
         // turn is blocked on this answer, so the status line must ask for it rather
         // than keep spinning as though it were still waiting on a model.
         if let Some(pending) = &self.pending_write {
-            return pending.question();
+            return self.with_usage(&pending.author, pending.question());
         }
         match &self.activity {
             Some(activity) => {
                 let elapsed = now.saturating_duration_since(activity.started).as_secs();
                 let spinner = SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()];
+                let label = self.with_usage(&activity.label, activity.label.clone());
                 // With no detail, this must stay byte-identical to the line rendered
                 // before progress streaming existed — every existing caller and test
                 // depends on that exact shape.
                 match &activity.detail {
                     Some(detail) => format!(
-                        "{} · {} · {detail} · {elapsed}s · {spinner} (Esc to quit)",
-                        activity.label,
+                        "{label} · {} · {detail} · {elapsed}s · {spinner} (Esc to quit)",
                         activity.kind.description()
                     ),
                     None => format!(
-                        "{} · {} · {elapsed}s · {spinner} (Esc to quit)",
-                        activity.label,
+                        "{label} · {} · {elapsed}s · {spinner} (Esc to quit)",
                         activity.kind.description()
                     ),
                 }
@@ -602,12 +627,60 @@ impl App {
             // right after `submit()`), or a locally-handled command set `busy` and
             // will clear it itself without ever producing an `Activity` — either way
             // this is the pre-existing busy line, unchanged.
-            None if self.busy => format!("{} · working… (Esc to quit)", self.primary),
+            None if self.busy => format!(
+                "{} · working… (Esc to quit)",
+                self.with_usage(&self.primary, self.primary.clone())
+            ),
             None => format!(
                 "{} · Enter send · /commander · /forget · Ctrl+O connections · Esc quit",
-                self.primary
+                self.with_usage(&self.primary, self.primary.clone())
             ),
         }
+    }
+
+    fn with_usage(&self, label: &str, base: String) -> String {
+        match self.usage_summary(label) {
+            Some(summary) => format!("{base} · {summary}"),
+            None => base,
+        }
+    }
+
+    fn usage_summary(&self, label: &str) -> Option<String> {
+        let stats = self.usage.get(label)?;
+        let mut parts = Vec::new();
+
+        match (stats.last.input_tokens, stats.last.output_tokens) {
+            (Some(input), Some(output)) => parts.push(format!("last {input} in/{output} out")),
+            (Some(input), None) => parts.push(format!("last {input} in")),
+            (None, Some(output)) => parts.push(format!("last {output} out")),
+            (None, None) => match stats.last.total_tokens {
+                Some(total) => parts.push(format!("last {total} tok")),
+                None => parts.push("tokens unavailable".to_string()),
+            },
+        }
+
+        let session_total = self
+            .usage
+            .values()
+            .map(|usage| usage.total_tokens)
+            .fold(0u64, u64::saturating_add);
+        if stats.total_tokens > 0 {
+            parts.push(format!("used {} tok", stats.total_tokens));
+        }
+        if session_total != stats.total_tokens {
+            parts.push(format!("session {session_total} tok"));
+        }
+        if let Some(tokens) = &stats.rate_limit.tokens_remaining {
+            parts.push(format!("{tokens} tok left"));
+        }
+        if let Some(requests) = &stats.rate_limit.requests_remaining {
+            parts.push(format!("{requests} req left"));
+        }
+        if let Some(reset) = &stats.rate_limit.reset_after {
+            parts.push(format!("reset {reset}"));
+        }
+
+        Some(parts.join(" · "))
     }
 }
 
@@ -666,6 +739,91 @@ mod tests {
             !line.contains("ollama:llama3"),
             "must not fall back to the commander while a delegation is in flight: {line}"
         );
+    }
+
+    #[test]
+    fn usage_is_global_across_idle_busy_and_activity_status_lines() {
+        let mut app = app();
+        app.apply(Event::UsageUpdated {
+            label: "ollama:llama3".into(),
+            usage: TokenUsage {
+                input_tokens: Some(120),
+                output_tokens: Some(30),
+                total_tokens: None,
+            },
+            rate_limit: RateLimit {
+                requests_remaining: Some("9".into()),
+                tokens_remaining: Some("9850".into()),
+                reset_after: Some("60s".into()),
+            },
+        });
+
+        let idle = app.status_line();
+        assert!(idle.contains("ollama:llama3"));
+        assert!(idle.contains("last 120 in/30 out"));
+        assert!(idle.contains("used 150 tok"));
+        assert!(!idle.contains("session 150 tok"));
+        assert!(idle.contains("9850 tok left"));
+        assert!(idle.contains("9 req left"));
+        assert!(idle.contains("reset 60s"));
+
+        app.busy = true;
+        let busy = app.status_line();
+        assert!(busy.contains("used 150 tok"));
+        assert!(busy.contains("working…"));
+        assert!(!busy.contains("Enter send"));
+
+        app.apply(Event::ActivityStarted {
+            label: "ollama:llama3".into(),
+            kind: ActivityKind::Primary,
+        });
+        let started = app.activity.as_ref().unwrap().started;
+        app.apply(Event::UsageUpdated {
+            label: "ollama:llama3".into(),
+            usage: TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                total_tokens: Some(15),
+            },
+            rate_limit: RateLimit::default(),
+        });
+        assert_eq!(
+            app.activity.as_ref().unwrap().started,
+            started,
+            "usage metadata must not clear or restart the active status"
+        );
+        let active = app.status_line();
+        assert!(active.contains("last 10 in/5 out"));
+        assert!(active.contains("used 165 tok"));
+        assert!(!active.contains("session 165 tok"));
+    }
+
+    #[test]
+    fn status_line_shows_cross_model_session_tokens_and_unavailable_telemetry() {
+        let mut app = app();
+        app.apply(Event::UsageUpdated {
+            label: "ollama:llama3".into(),
+            usage: TokenUsage {
+                total_tokens: Some(100),
+                ..TokenUsage::default()
+            },
+            rate_limit: RateLimit::default(),
+        });
+        app.apply(Event::UsageUpdated {
+            label: "claude:claude".into(),
+            usage: TokenUsage::default(),
+            rate_limit: RateLimit::default(),
+        });
+        app.apply(Event::ActivityStarted {
+            label: "claude:claude".into(),
+            kind: ActivityKind::Delegating,
+        });
+
+        let line = app.status_line();
+        assert!(line.contains("claude:claude"));
+        assert!(line.contains("tokens unavailable"));
+        assert!(line.contains("session 100 tok"));
+        assert!(!line.contains("used 0 tok"));
     }
 
     #[test]

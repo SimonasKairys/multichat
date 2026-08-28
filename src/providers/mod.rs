@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde_json::Value;
 
 pub mod cloud;
 pub mod local_binary;
@@ -78,11 +79,63 @@ impl RateLimit {
     }
 }
 
+/// Token counts reported by a provider for one completed call.
+///
+/// Every field is optional because transports expose different subsets: OpenAI
+/// usually reports all three, Anthropic reports input/output, Ollama reports prompt
+/// and generated counts, and a plain-text CLI may expose none.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Total tokens for this call, preferring the provider's own aggregate.
+    pub fn observed_total(&self) -> Option<u64> {
+        self.total_tokens
+            .or_else(|| match (self.input_tokens, self.output_tokens) {
+                (Some(input), Some(output)) => Some(input.saturating_add(output)),
+                (Some(input), None) => Some(input),
+                (None, Some(output)) => Some(output),
+                (None, None) => None,
+            })
+    }
+
+    /// Keeps the newest value for every field a later stream event reports.
+    pub fn merge(&mut self, newer: Self) {
+        if newer.input_tokens.is_some() {
+            self.input_tokens = newer.input_tokens;
+        }
+        if newer.output_tokens.is_some() {
+            self.output_tokens = newer.output_tokens;
+        }
+        if newer.total_tokens.is_some() {
+            self.total_tokens = newer.total_tokens;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens.is_none() && self.output_tokens.is_none() && self.total_tokens.is_none()
+    }
+}
+
+/// Reads a JSON token counter whether the provider encoded it as a number or string.
+pub(crate) fn json_u64(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    })
+}
+
 /// A model's reply plus whatever metadata the transport could observe.
 #[derive(Debug, Clone)]
 pub struct Reply {
     pub text: String,
     pub rate_limit: RateLimit,
+    pub usage: TokenUsage,
 }
 
 /// A one-way channel a streaming provider uses to report short, human-readable
@@ -255,6 +308,76 @@ mod tests {
                 .requests_remaining
                 .as_deref(),
             Some("7")
+        );
+    }
+
+    #[test]
+    fn token_usage_prefers_reported_total_and_derives_it_when_absent() {
+        assert_eq!(
+            TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(25),
+                total_tokens: None,
+            }
+            .observed_total(),
+            Some(125)
+        );
+        assert_eq!(
+            TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(25),
+                total_tokens: Some(140),
+            }
+            .observed_total(),
+            Some(140)
+        );
+    }
+
+    #[test]
+    fn token_usage_merge_only_replaces_fields_the_new_event_reports() {
+        let mut usage = TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            total_tokens: None,
+        };
+        usage.merge(TokenUsage {
+            input_tokens: None,
+            output_tokens: Some(25),
+            total_tokens: Some(125),
+        });
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(25),
+                total_tokens: Some(125),
+            }
+        );
+    }
+
+    #[test]
+    fn token_usage_is_empty_only_when_every_counter_is_absent() {
+        assert!(TokenUsage::default().is_empty());
+        assert!(
+            !TokenUsage {
+                input_tokens: Some(0),
+                ..TokenUsage::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !TokenUsage {
+                output_tokens: Some(0),
+                ..TokenUsage::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            !TokenUsage {
+                total_tokens: Some(0),
+                ..TokenUsage::default()
+            }
+            .is_empty()
         );
     }
 

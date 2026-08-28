@@ -14,7 +14,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::providers::{ProgressSink, Provider, ProviderFailure, RateLimit, Reply};
+use crate::providers::{
+    ProgressSink, Provider, ProviderFailure, RateLimit, Reply, TokenUsage, json_u64,
+};
 
 /// Ceiling on captured output, so a runaway child cannot exhaust memory.
 const MAX_OUTPUT_BYTES: usize = 1 << 20;
@@ -377,6 +379,7 @@ impl LocalBinaryProvider {
         Ok(Reply {
             text,
             rate_limit: RateLimit::default(),
+            usage: TokenUsage::default(),
         })
     }
 
@@ -463,6 +466,7 @@ impl LocalBinaryProvider {
         let mut stream_error: Option<String> = None;
         let mut assistant_text = String::new();
         let mut assistant_text_truncated = false;
+        let mut usage = TokenUsage::default();
 
         // Not reset on each loop iteration — deliberately: `total_timeout` is a
         // single absolute backstop across the whole call, unlike the idle timeout
@@ -514,6 +518,7 @@ impl LocalBinaryProvider {
                         Ok(Ok(_)) => {
                             let line = String::from_utf8_lossy(&line_bytes);
                             let line = line.trim_end_matches(['\r', '\n']);
+                            usage.merge(parse_stream_usage(dialect, line));
                             match parse_stream_line(dialect, line) {
                                 StreamLineEffect::Progress(detail) => progress.send(detail),
                                 StreamLineEffect::AssistantText(text) => {
@@ -612,6 +617,7 @@ impl LocalBinaryProvider {
         Ok(Reply {
             text,
             rate_limit: RateLimit::default(),
+            usage,
         })
     }
 }
@@ -676,6 +682,37 @@ fn parse_stream_line(dialect: StreamDialect, line: &str) -> StreamLineEffect {
     match dialect {
         StreamDialect::ClaudeJson => parse_claude_line(line),
         StreamDialect::AgyJson => parse_agy_line(line),
+    }
+}
+
+fn parse_stream_usage(dialect: StreamDialect, line: &str) -> TokenUsage {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return TokenUsage::default();
+    };
+    let usage = match dialect {
+        StreamDialect::ClaudeJson => value
+            .get("usage")
+            .or_else(|| value.pointer("/message/usage")),
+        StreamDialect::AgyJson => value
+            .pointer("/result/usage")
+            .or_else(|| value.get("usage")),
+    };
+    let Some(usage) = usage else {
+        return TokenUsage::default();
+    };
+
+    TokenUsage {
+        input_tokens: json_u64(
+            usage
+                .get("input_tokens")
+                .or_else(|| usage.get("prompt_tokens")),
+        ),
+        output_tokens: json_u64(
+            usage
+                .get("output_tokens")
+                .or_else(|| usage.get("completion_tokens")),
+        ),
+        total_tokens: json_u64(usage.get("total_tokens")),
     }
 }
 
@@ -1463,6 +1500,32 @@ mod tests {
         assert_eq!(
             parse_claude_line(line),
             StreamLineEffect::Result("OK.".to_string())
+        );
+    }
+
+    #[test]
+    fn streaming_dialects_extract_token_usage() {
+        assert_eq!(
+            parse_stream_usage(
+                StreamDialect::ClaudeJson,
+                r#"{"type":"result","usage":{"input_tokens":120,"output_tokens":30}}"#
+            ),
+            TokenUsage {
+                input_tokens: Some(120),
+                output_tokens: Some(30),
+                total_tokens: None,
+            }
+        );
+        assert_eq!(
+            parse_stream_usage(
+                StreamDialect::AgyJson,
+                r#"{"event":"result","result":{"usage":{"prompt_tokens":"80","completion_tokens":20,"total_tokens":100}}}"#
+            ),
+            TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(20),
+                total_tokens: Some(100),
+            }
         );
     }
 

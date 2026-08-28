@@ -227,9 +227,12 @@ identically forever.
 None of this has to be inferred from timing. The status line names whichever model is
 actually being called — the sub-agent, not the commander — with what it is doing and how
 long it has taken, including the latest progress detail from a streaming CLI (see
-[CLI provider streaming and timeouts](#cli-provider-streaming-and-timeouts)). The
-transcript gets a line when a delegation is dispatched and another when it finishes,
-with outcome and duration.
+[CLI provider streaming and timeouts](#cli-provider-streaming-and-timeouts)). It also
+keeps per-model and whole-session token totals, shows the last call's input/output split,
+and includes token/request quota plus reset information when the provider reports it.
+Providers that expose no usage metadata are labelled `tokens unavailable` rather than
+shown an estimate. The transcript gets a line when a delegation is dispatched and
+another when it finishes, with outcome and duration.
 
 ### Skills
 

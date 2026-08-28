@@ -11,7 +11,9 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 
 use crate::config::{Api, CloudEndpoint};
-use crate::providers::{Provider, ProviderFailure, RateLimit, Reply, truncate_error_detail};
+use crate::providers::{
+    Provider, ProviderFailure, RateLimit, Reply, TokenUsage, json_u64, truncate_error_detail,
+};
 
 /// Anthropic requires this header on every request; it is an API-version pin, not a
 /// model version.
@@ -170,6 +172,21 @@ impl CloudProvider {
             }
         }
     }
+
+    fn extract_usage(&self, body: &Value) -> TokenUsage {
+        match self.endpoint.api {
+            Api::Anthropic => TokenUsage {
+                input_tokens: json_u64(body.pointer("/usage/input_tokens")),
+                output_tokens: json_u64(body.pointer("/usage/output_tokens")),
+                total_tokens: None,
+            },
+            Api::OpenAiCompatible => TokenUsage {
+                input_tokens: json_u64(body.pointer("/usage/prompt_tokens")),
+                output_tokens: json_u64(body.pointer("/usage/completion_tokens")),
+                total_tokens: json_u64(body.pointer("/usage/total_tokens")),
+            },
+        }
+    }
 }
 
 #[async_trait]
@@ -207,6 +224,7 @@ impl Provider for CloudProvider {
         Ok(Reply {
             text: self.extract_text(&parsed)?,
             rate_limit,
+            usage: self.extract_usage(&parsed),
         })
     }
 
@@ -266,6 +284,33 @@ mod tests {
         let body = provider("openai").body(Some("be terse"), "hi");
         assert_eq!(body["messages"][0]["role"], json!("system"));
         assert_eq!(body["messages"][1]["content"], json!("hi"));
+    }
+
+    #[test]
+    fn extracts_provider_specific_token_usage() {
+        let anthropic = json!({
+            "usage": {"input_tokens": 120, "output_tokens": 30}
+        });
+        assert_eq!(
+            provider("anthropic").extract_usage(&anthropic),
+            TokenUsage {
+                input_tokens: Some(120),
+                output_tokens: Some(30),
+                total_tokens: None,
+            }
+        );
+
+        let openai = json!({
+            "usage": {"prompt_tokens": 80, "completion_tokens": 20, "total_tokens": 100}
+        });
+        assert_eq!(
+            provider("openai").extract_usage(&openai),
+            TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(20),
+                total_tokens: Some(100),
+            }
+        );
     }
 
     #[test]

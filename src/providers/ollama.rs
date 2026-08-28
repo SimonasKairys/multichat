@@ -5,7 +5,9 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::providers::{Provider, ProviderFailure, RateLimit, Reply, truncate_error_detail};
+use crate::providers::{
+    Provider, ProviderFailure, RateLimit, Reply, TokenUsage, json_u64, truncate_error_detail,
+};
 
 pub struct OllamaProvider {
     host: String,
@@ -24,6 +26,14 @@ impl OllamaProvider {
 
     fn base(&self) -> &str {
         self.host.trim_end_matches('/')
+    }
+
+    fn extract_usage(body: &Value) -> TokenUsage {
+        TokenUsage {
+            input_tokens: json_u64(body.get("prompt_eval_count")),
+            output_tokens: json_u64(body.get("eval_count")),
+            total_tokens: None,
+        }
     }
 
     /// Lists locally installed models via `GET /api/tags`.
@@ -137,6 +147,7 @@ impl Provider for OllamaProvider {
             text,
             // Local models have no quota to report.
             rate_limit: RateLimit::default(),
+            usage: Self::extract_usage(&parsed),
         })
     }
 
@@ -179,6 +190,23 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_ollama_prompt_and_generated_token_counts() {
+        let usage = OllamaProvider::extract_usage(&json!({
+            "prompt_eval_count": 90,
+            "eval_count": 25
+        }));
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: Some(90),
+                output_tokens: Some(25),
+                total_tokens: None,
+            }
+        );
+        assert_eq!(usage.observed_total(), Some(115));
+    }
 
     #[test]
     fn ollama_is_local_and_survives_classified_mode() {

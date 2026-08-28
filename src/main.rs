@@ -20,7 +20,7 @@ pub mod vault;
 pub mod workspace;
 
 #[cfg(test)]
-mod cli_discovery_windows_test;
+mod cli_discovery_test;
 
 #[cfg(test)]
 mod action_argument_path_backslash_test;

@@ -819,10 +819,14 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
 /// Windows extensions from `PATHEXT`. The project has no `which` dependency; this is
 /// the only place that needs one.
 pub(crate) fn which_on_path(name: &str) -> Option<String> {
-    which_on_path_in(name, std::env::var_os("PATH"))
+    let path_var = std::env::var_os("PATH");
+    which_on_path_in(name, path_var)
 }
 
 pub(crate) fn which_on_path_in(name: &str, path_var: Option<std::ffi::OsString>) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
     let path_var = path_var?;
     #[cfg(windows)]
     let extensions: Vec<String> = match std::env::var_os("PATHEXT") {

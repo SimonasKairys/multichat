@@ -32,3 +32,13 @@ fn action_argument_handles_paths_ending_with_backslash() {
         "quoted list_files path ending with backslash must be parsed"
     );
 }
+
+#[test]
+fn action_argument_keeps_an_escaped_quote_inside_a_quoted_prompt() {
+    let delegations =
+        SwarmLedger::parse_delegations(r#"ACTION: delegate_task(model, "say \"x) still")"#);
+
+    assert_eq!(delegations.len(), 1);
+    assert_eq!(delegations[0].target, "model");
+    assert_eq!(delegations[0].prompt, r#"say \"x) still"#);
+}

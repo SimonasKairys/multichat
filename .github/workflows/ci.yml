@@ -67,11 +67,17 @@ jobs:
       # because the FFI in security.rs needs a local override, and `forbid` is by
       # design not overridable. This job supplies the missing half of the guarantee:
       # the override may exist in exactly one audited file.
-      # Matches the attribute form as a fixed string, so prose in a doc comment that
-      # merely mentions the override does not trip the job.
+      # Matches both attribute spellings, so prose in a doc comment that merely
+      # mentions the override does not trip the job while neither real form escapes it.
+      # `#![allow(unsafe_code)]` (inner, with `!`) is the crate/module-wide form
+      # security.rs uses; `#[allow(unsafe_code)]` (outer, no `!`) is the equally valid
+      # per-item form. A fixed-string search for only the first spelling missed the
+      # second entirely: an `unsafe` block outside security.rs guarded by the outer
+      # attribute compiles cleanly under this crate's `#![deny(unsafe_code)]`, and this
+      # job reported "OK" on it — the whole guarantee turned on one `!`.
       - name: Reject unsafe_code overrides outside src/security.rs
         run: |
-          offenders=$(grep -rlnF '#![allow(unsafe_code)]' src/ | grep -v '^src/security.rs$' || true)
+          offenders=$(grep -rlnE '#!?\[allow\(unsafe_code\)\]' src/ | grep -v '^src/security.rs$' || true)
           if [ -n "$offenders" ]; then
             echo "unsafe_code is allowed outside the audited module:"
             echo "$offenders"

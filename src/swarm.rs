@@ -1142,6 +1142,8 @@ impl SwarmLedger {
         let mut depth = 1usize;
         let mut in_quote: Option<char> = None;
         let mut chars = rest.char_indices().peekable();
+        let mut at_argument_start = true;
+        let mut top_level_commas = 0usize;
 
         while let Some((i, c)) = chars.next() {
             if let Some(quote_char) = in_quote {
@@ -1155,12 +1157,21 @@ impl SwarmLedger {
                     // Skipping the quote only makes sense if the argument can still be
                     // closed afterwards; when nothing later can close it, this quote is
                     // the closing one and the backslash is a literal path separator.
-                    let mut lookahead = chars.clone();
-                    if let Some((qi, next_char)) = lookahead.next()
+                    if let Some(&(qi, next_char)) = chars.peek()
                         && next_char == quote_char
-                        && rest[qi + next_char.len_utf8()..].contains(quote_char)
                     {
-                        chars.next();
+                        let after_quote = &rest[qi + next_char.len_utf8()..];
+                        let closes_first_argument =
+                            top_level_commas == 0 && after_quote.trim_start().starts_with(',');
+                        let has_later_call_closing_quote =
+                            after_quote.match_indices(quote_char).any(|(offset, _)| {
+                                after_quote[offset + quote_char.len_utf8()..]
+                                    .trim_start()
+                                    .starts_with(')')
+                            });
+                        if !closes_first_argument && has_later_call_closing_quote {
+                            chars.next();
+                        }
                     }
                 } else if c == quote_char {
                     in_quote = None;
@@ -1169,14 +1180,26 @@ impl SwarmLedger {
             }
 
             match c {
-                '"' | '\'' => in_quote = Some(c),
-                '(' => depth += 1,
+                '"' | '\'' if at_argument_start && rest[i + c.len_utf8()..].contains(c) => {
+                    in_quote = Some(c);
+                    at_argument_start = false;
+                }
+                '(' => {
+                    depth += 1;
+                    at_argument_start = false;
+                }
                 ')' => {
                     depth -= 1;
                     if depth == 0 {
                         return Some(&rest[..i]);
                     }
+                    at_argument_start = false;
                 }
+                ',' if depth == 1 => {
+                    top_level_commas += 1;
+                    at_argument_start = true;
+                }
+                c if !c.is_whitespace() => at_argument_start = false,
                 _ => {}
             }
         }

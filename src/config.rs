@@ -236,7 +236,7 @@ pub struct LocalBinarySpec {
     /// opt into streaming the same way the auto-detected `claude`/`agy` rows do.
     /// `None` (the default) keeps the plain-text, buffered-output path unchanged —
     /// auto-detection never assumes a user's custom binary streams anything. Accepts
-    /// only `"claude"` or `"agy"`; parsed (and validated) in
+    /// only `"claude"`, `"agy"`, or `"copilot"`; parsed (and validated) in
     /// `orchestrator::detect_cli_tools` via `local_binary::StreamDialect::parse`, so
     /// an unrecognised value is a clear discovery-time error rather than a silent
     /// fallback to the non-streaming path.

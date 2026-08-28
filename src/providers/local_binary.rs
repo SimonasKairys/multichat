@@ -53,6 +53,8 @@ pub enum StreamDialect {
     ClaudeJson,
     /// `agy --output-format stream-json -p` (flags must precede `-p` for this CLI).
     AgyJson,
+    /// `copilot --output-format json --prompt`.
+    CopilotJson,
 }
 
 impl StreamDialect {
@@ -64,8 +66,9 @@ impl StreamDialect {
         match s {
             "claude" => Ok(StreamDialect::ClaudeJson),
             "agy" => Ok(StreamDialect::AgyJson),
+            "copilot" => Ok(StreamDialect::CopilotJson),
             other => Err(anyhow!(
-                "unknown stream_format `{other}`; expected \"claude\" or \"agy\""
+                "unknown stream_format `{other}`; expected \"claude\", \"agy\", or \"copilot\""
             )),
         }
     }
@@ -682,6 +685,7 @@ fn parse_stream_line(dialect: StreamDialect, line: &str) -> StreamLineEffect {
     match dialect {
         StreamDialect::ClaudeJson => parse_claude_line(line),
         StreamDialect::AgyJson => parse_agy_line(line),
+        StreamDialect::CopilotJson => parse_copilot_line(line),
     }
 }
 
@@ -696,6 +700,10 @@ fn parse_stream_usage(dialect: StreamDialect, line: &str) -> TokenUsage {
         StreamDialect::AgyJson => value
             .pointer("/result/usage")
             .or_else(|| value.get("usage")),
+        // Copilot's JSONL stream currently exposes billing checkpoints rather than
+        // per-call input/output token counts, so reporting those as this call's usage
+        // would be misleading.
+        StreamDialect::CopilotJson => None,
     };
     let Some(usage) = usage else {
         return TokenUsage::default();
@@ -910,6 +918,40 @@ fn agy_step_update_effect(value: &Value) -> StreamLineEffect {
         None => step_type.to_string(),
     };
     StreamLineEffect::Progress(detail)
+}
+
+/// Parses `copilot --output-format json` JSONL. The complete `assistant.message`
+/// event is used as the terminal reply, while deltas remain a fallback if a future
+/// CLI version omits that event. Tool starts provide lightweight live progress.
+fn parse_copilot_line(line: &str) -> StreamLineEffect {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return StreamLineEffect::Ignore;
+    };
+    match value.get("type").and_then(Value::as_str) {
+        Some("assistant.message_delta") => StreamLineEffect::AssistantText(
+            value
+                .pointer("/data/deltaContent")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        Some("assistant.message") => StreamLineEffect::Result(
+            value
+                .pointer("/data/content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ),
+        Some("tool.execution_start") => {
+            let tool = value
+                .pointer("/data/toolName")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("tool");
+            StreamLineEffect::Progress(tool.to_string())
+        }
+        _ => StreamLineEffect::Ignore,
+    }
 }
 
 #[async_trait]
@@ -1527,6 +1569,13 @@ mod tests {
                 total_tokens: Some(100),
             }
         );
+        assert_eq!(
+            parse_stream_usage(
+                StreamDialect::CopilotJson,
+                r#"{"type":"session.usage_checkpoint","data":{"prompt_tokens":999}}"#
+            ),
+            TokenUsage::default()
+        );
     }
 
     #[test]
@@ -1617,12 +1666,38 @@ mod tests {
     }
 
     #[test]
+    fn copilot_dialect_extracts_reply_deltas_final_text_and_tool_progress() {
+        assert_eq!(
+            parse_copilot_line(
+                r#"{"type":"assistant.message_delta","data":{"deltaContent":"hel"}}"#
+            ),
+            StreamLineEffect::AssistantText("hel".to_string())
+        );
+        assert_eq!(
+            parse_copilot_line(
+                r#"{"type":"tool.execution_start","data":{"toolName":"view","arguments":{"path":"Cargo.toml"}}}"#
+            ),
+            StreamLineEffect::Progress("view".to_string())
+        );
+        assert_eq!(
+            parse_copilot_line(
+                r#"{"type":"assistant.message","data":{"content":"hello","toolRequests":[]}}"#
+            ),
+            StreamLineEffect::Result("hello".to_string())
+        );
+    }
+
+    #[test]
     fn stream_dialect_parses_known_names_and_rejects_unknown_ones() {
         assert_eq!(
             StreamDialect::parse("claude").unwrap(),
             StreamDialect::ClaudeJson
         );
         assert_eq!(StreamDialect::parse("agy").unwrap(), StreamDialect::AgyJson);
+        assert_eq!(
+            StreamDialect::parse("copilot").unwrap(),
+            StreamDialect::CopilotJson
+        );
         let err = StreamDialect::parse("bogus").unwrap_err().to_string();
         assert!(err.contains("bogus"), "unexpected error: {err}");
     }

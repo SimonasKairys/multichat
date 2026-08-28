@@ -88,7 +88,7 @@ policy, and what a crash costs you.
 | `ollama` | local HTTP daemon | `GET /api/tags` at startup |
 | `anthropic` | `POST /v1/messages` | enabled when a key is stored |
 | `openai`, `openrouter`, `groq` | `POST /chat/completions` | enabled when a key is stored |
-| local CLI tools | subprocess (argv, no shell) | configured in `config.json` |
+| local CLI tools | subprocess (argv, no shell) | Copilot, Claude, Antigravity, Codex, and `llm` auto-detected; custom tools configured in `config.json` |
 
 Routing is per provider. A key stored for one vendor is only ever sent to that vendor's
 endpoint.
@@ -109,7 +109,7 @@ endpoint.
     }
   },
   "local_binaries": {
-    "copilot": { "path": "gh", "args": ["copilot", "suggest"] },
+    "copilot-enterprise": { "path": "/opt/copilot/bin/copilot", "args": ["--silent", "--prompt"], "stream_format": "copilot" },
     "claude": { "path": "/opt/claude/bin/claude", "stream_format": "claude" }
   }
 }
@@ -341,7 +341,7 @@ wants and an interactive one generally does not.
 
 #### This is not a sandbox for spawned CLI providers
 
-A `claude`/`gemini`/`codex` CLI configured as a local binary provider is started with
+A `copilot`/`claude`/`gemini`/`codex` CLI configured as a local binary provider is started with
 its working directory set to the project folder and, where the CLI supports it,
 `--add-dir <project root>`. That stops it stumbling onto whatever was lying around in
 `simon`'s own launch directory, and stops it searching elsewhere for files it was asked
@@ -354,7 +354,7 @@ own in-process model calls: the cloud APIs and Ollama.
 
 ### CLI provider streaming and timeouts
 
-`claude` and `agy` (Antigravity) are auto-detected with progress streaming already on.
+`copilot`, `claude`, and `agy` (Antigravity) are auto-detected with progress streaming already on.
 Each is invoked with its NDJSON stream flag, and every tool call or step the CLI reports
 while it works is parsed and shown live in the status line:
 
@@ -362,7 +362,10 @@ while it works is parsed and shown live in the status line:
 claude · awaiting reply · Bash: Read the readme · 42s · ●···
 ```
 
-Both are also passed `--add-dir <project root>`, and `agy` additionally gets
+All three are also passed `--add-dir <project root>`. Copilot runs with only its
+`view`, `grep`, and `glob` tools available and with its built-in GitHub MCP disabled,
+so its non-interactive auto-approval cannot execute commands, edit files, or make
+GitHub API calls. `agy` additionally gets
 `--sandbox` (its own terminal restrictions, which let it use tools without a permission
 prompt it cannot answer non-interactively) and `--print-timeout 30m` (its own default is
 5m, short enough to cut off a real task before any of the limits below apply). Flag
@@ -370,7 +373,8 @@ order is not cosmetic for `agy`: its `-p` takes the next argument as the prompt,
 every other flag must precede it.
 
 A hand-configured entry under `local_binaries` stays on the buffered-output path unless
-it opts in with `"stream_format": "claude"` or `"stream_format": "agy"` — whichever
+it opts in with `"stream_format": "claude"`, `"stream_format": "agy"`, or
+`"stream_format": "copilot"` — whichever
 NDJSON shape the binary actually speaks. Any other value is a startup error, not a
 silent fallback to buffering.
 

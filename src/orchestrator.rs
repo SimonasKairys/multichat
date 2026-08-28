@@ -618,7 +618,7 @@ pub struct CliSpec {
     /// re-parse or re-validate it.
     pub dialect: Option<StreamDialect>,
     /// The flag this CLI uses to declare an extra allowed working directory, or
-    /// `None` when it has none. Set to `--add-dir` for both known agentic CLIs — see
+    /// `None` when it has none. Set to `--add-dir` for known agentic CLIs — see
     /// `CliDefaults::workspace_arg` for why it matters.
     pub workspace_arg: Option<String>,
 }
@@ -691,6 +691,10 @@ fn cli_vendor_id(binary_name: &str) -> String {
 ///   does: `agy` takes `--output-format` itself as the prompt in that order. No
 ///   system-prompt flag at all, so its system text is folded into the prompt (see
 ///   `LocalBinaryProvider::send`). Streams the `AgyJson` dialect.
+/// - `copilot`: restricted to read-only project tools, with the built-in GitHub MCP
+///   disabled, and invoked as JSONL via `--output-format json --prompt`. Copilot
+///   requires `--allow-all-tools` in non-interactive mode, but `--available-tools`
+///   narrows that approval to `view`, `grep`, and `glob`.
 ///
 /// `codex` and `llm` are unverified best guesses, treated the same as before: no
 /// args, no system flag, and no streaming dialect until someone confirms their real
@@ -749,6 +753,20 @@ fn known_cli_default(binary_name: &str) -> CliDefaults {
             dialect: Some(StreamDialect::AgyJson),
             workspace_arg: Some("--add-dir".into()),
         },
+        "copilot" => CliDefaults {
+            args: vec![
+                "--allow-all-tools".into(),
+                "--available-tools=view,grep,glob".into(),
+                "--disable-builtin-mcps".into(),
+                "--output-format".into(),
+                "json".into(),
+                "--silent".into(),
+                "--prompt".into(),
+            ],
+            system_arg: None,
+            dialect: Some(StreamDialect::CopilotJson),
+            workspace_arg: Some("--add-dir".into()),
+        },
         _ => CliDefaults {
             args: Vec::new(),
             system_arg: None,
@@ -766,7 +784,7 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
     // individuals on that CLI's OAuth login, so auto-detecting it only ever produced
     // a row that failed on first use. `agy` is its replacement. A user who still has
     // a working `gemini` can add it under `local_binaries`, which always wins.
-    const KNOWN: &[&str] = &["claude", "agy", "codex", "llm"];
+    const KNOWN: &[&str] = &["claude", "agy", "copilot", "codex", "llm"];
     let mut found = Vec::new();
     let mut configured = std::collections::BTreeSet::new();
 
@@ -795,9 +813,9 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
             args: spec.args.clone(),
             system_arg: spec.system_arg.clone(),
             dialect,
-            // Tied to the declared dialect rather than the entry's name: declaring
-            // `stream_format = "claude"` or `"agy"` is a statement that this binary
-            // IS that CLI, and both of them spell the flag `--add-dir`. A custom CLI
+            // Tied to the declared dialect rather than the entry's name: a recognised
+            // `stream_format` is a statement that this binary is that CLI, and all
+            // supported streaming CLIs spell the flag `--add-dir`. A custom CLI
             // with no dialect gets nothing, since an unknown binary handed an
             // unknown flag would just fail to start.
             workspace_arg: dialect.map(|_| "--add-dir".to_string()),
@@ -2643,6 +2661,26 @@ mod tests {
         );
         assert_eq!(defaults.system_arg, Some("--system-prompt".to_string()));
         assert_eq!(defaults.dialect, Some(StreamDialect::ClaudeJson));
+        assert_eq!(defaults.workspace_arg, Some("--add-dir".to_string()));
+    }
+
+    #[test]
+    fn copilot_is_auto_detected_in_restricted_project_json_mode() {
+        let defaults = known_cli_default("copilot");
+        assert_eq!(defaults.args.last().unwrap(), "--prompt");
+        assert!(
+            defaults
+                .args
+                .contains(&"--available-tools=view,grep,glob".to_string())
+        );
+        assert!(
+            defaults
+                .args
+                .contains(&"--disable-builtin-mcps".to_string())
+        );
+        assert!(defaults.args.contains(&"json".to_string()));
+        assert!(defaults.system_arg.is_none());
+        assert_eq!(defaults.dialect, Some(StreamDialect::CopilotJson));
         assert_eq!(defaults.workspace_arg, Some("--add-dir".to_string()));
     }
 

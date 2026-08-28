@@ -25,6 +25,12 @@ mod cli_discovery_test;
 #[cfg(test)]
 mod action_argument_path_backslash_test;
 
+#[cfg(test)]
+mod action_argument_apostrophe_test;
+
+#[cfg(test)]
+mod action_argument_trailing_quote_test;
+
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;

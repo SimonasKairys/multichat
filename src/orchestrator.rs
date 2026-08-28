@@ -815,14 +815,41 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
     found
 }
 
-/// Minimal `which`: scans `PATH` for an executable regular file named `name`. The
-/// project has no `which` dependency; this is the only place that needs one.
-fn which_on_path(name: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
+/// Minimal `which`: scans `PATH` for an executable regular file named `name`, including
+/// Windows extensions from `PATHEXT`. The project has no `which` dependency; this is
+/// the only place that needs one.
+pub(crate) fn which_on_path(name: &str) -> Option<String> {
+    which_on_path_in(name, std::env::var_os("PATH"))
+}
+
+pub(crate) fn which_on_path_in(name: &str, path_var: Option<std::ffi::OsString>) -> Option<String> {
+    let path_var = path_var?;
+    #[cfg(windows)]
+    let extensions: Vec<String> = match std::env::var_os("PATHEXT") {
+        Some(ext) => std::env::split_paths(&ext)
+            .filter_map(|p| p.to_str().map(|s| s.to_string()))
+            .collect(),
+        None => vec![".exe".into(), ".cmd".into(), ".bat".into(), ".com".into()],
+    };
+
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
         if is_executable_file(&candidate) {
             return Some(candidate.to_string_lossy().into_owned());
+        }
+        #[cfg(windows)]
+        {
+            for ext in &extensions {
+                let ext_name = if ext.starts_with('.') {
+                    format!("{name}{ext}")
+                } else {
+                    format!("{name}.{ext}")
+                };
+                let candidate_ext = dir.join(&ext_name);
+                if is_executable_file(&candidate_ext) {
+                    return Some(candidate_ext.to_string_lossy().into_owned());
+                }
+            }
         }
     }
     None
@@ -933,14 +960,13 @@ fn discover_vendors(settings: &Settings, classified: bool) -> Vec<Candidate> {
             ids.push(vid);
         }
     }
-    ids.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    ids.sort_by_key(|id| id.to_ascii_lowercase());
     ids.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
 
     ids.iter()
         .filter_map(|id| build_vendor_candidate(id, settings, classified, &cli_tools))
         .collect()
 }
-
 fn build_vendor_candidate(
     id: &str,
     settings: &Settings,
@@ -5141,4 +5167,3 @@ mod tests {
         );
     }
 }
-

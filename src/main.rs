@@ -19,6 +19,12 @@ pub mod ui;
 pub mod vault;
 pub mod workspace;
 
+#[cfg(test)]
+mod cli_discovery_windows_test;
+
+#[cfg(test)]
+mod action_argument_path_backslash_test;
+
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;

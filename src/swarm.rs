@@ -1143,21 +1143,37 @@ impl SwarmLedger {
         let mut in_quote: Option<char> = None;
         let mut escaped = false;
 
-        for (i, c) in rest.char_indices() {
+        let chars: Vec<(usize, char)> = rest.char_indices().collect();
+        let len = chars.len();
+        let mut idx = 0;
+
+        while idx < len {
+            let (i, c) = chars[idx];
             if escaped {
                 escaped = false;
-                continue;
-            }
-
-            if c == '\\' {
-                escaped = true;
+                idx += 1;
                 continue;
             }
 
             if let Some(quote_char) = in_quote {
-                if c == quote_char {
+                if c == '\\' {
+                    let next_char = chars.get(idx + 1).map(|(_, ch)| *ch);
+                    let after_next = chars.get(idx + 2).map(|(_, ch)| *ch);
+                    if next_char == Some(quote_char) {
+                        let is_delimiter = matches!(after_next, Some(')') | Some(',') | None)
+                            || after_next.is_some_and(char::is_whitespace);
+                        if !is_delimiter {
+                            escaped = true;
+                            idx += 1;
+                            continue;
+                        }
+                    }
+                } else if c == quote_char {
                     in_quote = None;
+                    idx += 1;
+                    continue;
                 }
+                idx += 1;
                 continue;
             }
 
@@ -1172,6 +1188,7 @@ impl SwarmLedger {
                 }
                 _ => {}
             }
+            idx += 1;
         }
         None
     }

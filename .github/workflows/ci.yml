@@ -29,13 +29,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Tests
         shell: bash
         run: |
           set -o pipefail
-          cargo test --all-targets 2>&1 | tee test-output.txt
+          cargo test --locked --all-targets 2>&1 | tee test-output.txt
 
       # Job logs need admin rights to download through the API; annotations do not, and
       # they show up in the run's summary either way. Without this, a platform-specific
@@ -56,7 +56,7 @@ jobs:
           echo "::error title=${{ matrix.os }} tests::$(echo "$detail" | sed 's/%/%25/g; s/\r/%0D/g' | awk '{printf "%s%%0A", $0}')"
 
       - name: Build release
-        run: cargo build --release
+        run: cargo build --locked --release
 
   unsafe-boundary:
     name: unsafe confined to security.rs
@@ -175,3 +175,9 @@ jobs:
         run: cargo install cargo-audit --locked
       - name: Advisory scan
         run: cargo audit --deny warnings
+      - name: Dependency audit scripts
+        shell: pwsh
+        run: |
+          Get-ChildItem tests\dependency_audit\*.ps1 |
+            Sort-Object Name |
+            ForEach-Object { & $_.FullName }

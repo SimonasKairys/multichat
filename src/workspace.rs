@@ -219,14 +219,13 @@ impl Workspace {
             ));
         }
         self.reject_git_writes(requested, candidate)?;
-        if let Ok(meta) = fs::symlink_metadata(self.root.join(candidate)) {
-            if meta.is_dir() {
-                return Err(anyhow!("project path `{requested}` is a directory"));
-            }
+        if let Ok(meta) = fs::symlink_metadata(self.root.join(candidate))
+            && meta.is_dir()
+        {
+            return Err(anyhow!("project path `{requested}` is a directory"));
         }
         Ok(())
     }
-
     /// Refuses any write whose path passes through a `.git` component.
     ///
     /// The comparison is ASCII-case-insensitive, not exact. macOS and Windows default
@@ -971,4 +970,3 @@ mod tests {
         );
     }
 }
-

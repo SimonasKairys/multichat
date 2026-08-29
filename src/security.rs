@@ -88,7 +88,11 @@ pub fn enforce_seccomp_sandbox() -> Hardening {
 /// Rust exposes the same field through `MetadataExt::number_of_links`, but that
 /// method is still unstable on stable Rust. Keeping the FFI here preserves the
 /// crate's rule that `security.rs` is the only module allowed to contain unsafe.
+///
+/// Mutation CI runs on Linux, where this function is compiled out and therefore
+/// cannot be exercised. The real Windows CI job compiles and runs its callers.
 #[cfg(windows)]
+#[cfg_attr(test, mutants::skip)]
 pub fn windows_regular_file_link_count(path: &Path) -> Option<u64> {
     use std::fs::File;
     use std::os::windows::io::AsRawHandle as _;

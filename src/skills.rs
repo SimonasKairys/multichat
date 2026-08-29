@@ -28,6 +28,7 @@ fn regular_file_link_count(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, mutants::skip)]
 fn regular_file_link_count(path: &Path, meta: &fs::Metadata) -> Option<u64> {
     meta.is_file()
         .then(|| crate::security::windows_regular_file_link_count(path))

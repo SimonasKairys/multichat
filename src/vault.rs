@@ -72,6 +72,7 @@ fn regular_file_link_count(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
 }
 
 #[cfg(windows)]
+#[cfg_attr(test, mutants::skip)]
 fn regular_file_link_count(path: &Path, meta: &fs::Metadata) -> Option<u64> {
     meta.is_file()
         .then(|| crate::security::windows_regular_file_link_count(path))
@@ -1274,6 +1275,38 @@ mod tests {
             fs::read(&inspector).unwrap(),
             raw,
             "destroy() zeroed the shared inode behind a hard-linked vault"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn destroy_zeroes_the_vault_file_before_unlinking_it() {
+        // The path disappears either way, so keep its inode open across destroy:
+        // Unix descriptors remain readable after unlink and let this distinguish
+        // the promised zero-then-unlink from a bare unlink.
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"top secret transcript", &pw).unwrap();
+
+        let raw_len = fs::metadata(vault.path()).unwrap().len() as usize;
+        let mut inspector = fs::File::open(vault.path()).unwrap();
+
+        vault.destroy();
+
+        assert!(
+            !vault.path().exists(),
+            "destroy() must still unlink the vault file"
+        );
+        inspector.seek(SeekFrom::Start(0)).unwrap();
+        let mut observed = Vec::new();
+        inspector.read_to_end(&mut observed).unwrap();
+        assert_eq!(
+            observed,
+            vec![0u8; raw_len],
+            "destroy() unlinked the vault without zeroing it first"
         );
     }
 

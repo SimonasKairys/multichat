@@ -7,8 +7,11 @@
 use anyhow::{Result, anyhow};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt as _;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::mpsc;
 
 use crate::app::ActivityKind;
@@ -26,11 +29,19 @@ use crate::swarm::SwarmLedger;
 use crate::workspace::Workspace;
 
 /// Delegations honoured per user turn, so a model cannot spin the swarm forever.
-const MAX_DELEGATIONS_PER_TURN: usize = 3;
+///
+/// Ten leaves enough room for the common "ask every connected model" request while
+/// retaining a hard upper bound against a malformed or hostile commander response.
+const MAX_DELEGATIONS_PER_TURN: usize = 10;
+
+/// Skill loads and project reads honoured per turn. These are independent of the
+/// model roster: increasing delegation capacity for "ask everyone" must not also
+/// multiply filesystem work a model can trigger.
+const MAX_READ_ACTIONS_PER_TURN: usize = 3;
 
 /// How many files one model may write in a single turn.
 ///
-/// Higher than `MAX_DELEGATIONS_PER_TURN`, which it used to borrow, because the two
+/// Separate from `MAX_DELEGATIONS_PER_TURN`, which it used to borrow, because the two
 /// bound different things. A delegation costs a model call; a write costs a disk write
 /// the user has already been shown and has approved one at a time. Creating a project
 /// from nothing is the case that needs the headroom — a README, a module, a test and a
@@ -98,6 +109,9 @@ fn commander_preamble(primary: &str, roster: &[String]) -> Option<String> {
          delegated like anything else: tell it exactly which files to write and what \
          each must contain. Give one file, or one coherent group of files, per \
          delegation. Keep only judgement and synthesis for yourself.\n\
+         If the user asks to hear from every connected model, emit every required \
+         delegation in this reply (up to the 10-delegation safety cap). There is no \
+         automatic continuation turn, so never promise to query omitted models later.\n\
          If the user has already told you what to do, or already approved a plan, \
          treat step 2 as done and get on with it — do not re-propose what has been \
          settled.\n\
@@ -156,11 +170,9 @@ pub enum Event {
         usage: TokenUsage,
         rate_limit: RateLimit,
     },
-    /// A delegation was dispatched. `task` is the sub-agent's prompt, truncated to
-    /// `MAX_TASK_DISPLAY_CHARS` for display — the audit log already records the
-    /// delegation by size and label only (see `run_delegations`'s `task.delegated`
-    /// call), and that must stay true; this field exists for the TUI transcript
-    /// only, never for a `self.audit.log(...)` detail string.
+    /// A delegation was dispatched. `task` is the complete sub-agent prompt for the
+    /// scrollable TUI transcript. The audit log still records only its task id and
+    /// labels (see `run_delegations`'s `task.delegated` call).
     Delegated {
         from: String,
         to: String,
@@ -264,15 +276,10 @@ pub enum Event {
     },
 }
 
-/// Ceiling on how much of a delegated task's prompt is shown in the TUI transcript —
-/// mirrors `MAX_DELEGATIONS_PER_TURN`'s bound-the-noise reasoning, just for one line's
-/// length instead of a turn's total effort.
-const MAX_TASK_DISPLAY_CHARS: usize = 120;
-
 /// Ceiling on how much of a single streaming-CLI progress detail is kept before it
-/// reaches an `Event::ActivityProgress`. Mirrors `MAX_TASK_DISPLAY_CHARS`'s reasoning,
-/// just for a status-line detail instead of a transcript line — short enough that it
-/// never wraps the status line on its own.
+/// reaches an `Event::ActivityProgress`. Progress belongs in a one-line status area,
+/// unlike delegated task text, which lives in the scrollable transcript and is kept
+/// complete.
 /// The directive prepended to a delegated task's prompt before it is sent.
 ///
 /// Symmetric with `commander_preamble` and for the same underlying reason: an
@@ -418,6 +425,7 @@ const DELEGATION_RETRY_BACKOFF: [Duration; MAX_DELEGATION_ATTEMPTS - 1] =
 /// - a timeout has already spent the caller's patience (up to an hour for a streaming
 ///   CLI, see `local_binary`); doing that twice more is not a recovery strategy;
 /// - a misconfigured binary (missing path, empty path) fails identically forever;
+/// - an invalid model or exhausted quota needs user/configuration action;
 /// - a `--classified` refusal is a policy decision, not a blip.
 fn is_retryable_delegation_error(error: &str) -> bool {
     // "timed out after", not bare "timed out": every timeout simon raises itself is
@@ -430,6 +438,12 @@ fn is_retryable_delegation_error(error: &str) -> bool {
         "timed out after",
         "does not exist",
         "has an empty path",
+        "invalid model selection",
+        "not recognized as a known model",
+        "you've hit your weekly limit",
+        "insufficient_quota",
+        "quota exceeded",
+        "exceeded your current quota",
         // Not bare "classified": every real refusal is worded "refused under
         // --classified" (see `discover_ollama`/`build_vendor_candidate`), and bare
         // "classified" also matches "unclassified", "declassified" and
@@ -465,8 +479,19 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// the result is truncated with `truncate_chars`, never a raw byte index — the same
 /// panic class commit `923b934` fixed in `cloud.rs`.
 fn sanitize_progress_detail(raw: &str) -> String {
-    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
-    truncate_chars(cleaned.trim(), MAX_PROGRESS_DETAIL_CHARS)
+    truncate_chars(&sanitize_transcript_detail(raw), MAX_PROGRESS_DETAIL_CHARS)
+}
+
+/// Removes terminal control characters and folds whitespace without shortening the
+/// message. Used for retry explanations in the scrollable transcript, where the full
+/// reason is useful and wrapping is available.
+fn sanitize_transcript_detail(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The *kind* of a failure — safe to write to the audit log even though the error's
@@ -672,6 +697,12 @@ impl ModelStatus {
 
 /// Enough to construct a `LocalBinaryProvider` for a CLI transport option, captured
 /// at discovery time so construction never has to re-probe `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliModelOption {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct CliSpec {
     pub binary_name: String,
@@ -689,6 +720,10 @@ pub struct CliSpec {
     /// `None` when it has none. Set to `--add-dir` for known agentic CLIs — see
     /// `CliDefaults::workspace_arg` for why it matters.
     pub workspace_arg: Option<String>,
+    /// Models reported by the installed CLI itself. Empty when the CLI has no
+    /// discovery command or discovery failed, in which case the picker uses its
+    /// curated fallback list.
+    pub models: Vec<CliModelOption>,
 }
 
 /// One way to reach a [`Candidate`]: a specific transport, its availability, and
@@ -879,16 +914,6 @@ pub(crate) fn known_cli_models(binary_name: &str) -> &'static [&'static str] {
             "claude-opus-4-5",
             "claude-haiku-4-5",
         ],
-        // `agy` is a gateway CLI that serves Gemini, Claude and gpt-oss models
-        // alike (see `cli_vendor_id`), so its list spans vendors rather than
-        // sticking to Google's.
-        "agy" => &[
-            "gemini-3-pro",
-            "gemini-3.1-pro",
-            "gemini-2.5-pro",
-            "claude-opus-5",
-            "gpt-5.4",
-        ],
         "copilot" => &[
             "claude-sonnet-5",
             "claude-opus-4.8",
@@ -962,6 +987,7 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
             // with no dialect gets nothing, since an unknown binary handed an
             // unknown flag would just fail to start.
             workspace_arg: dialect.map(|_| "--add-dir".to_string()),
+            models: Vec::new(),
         });
     }
 
@@ -985,11 +1011,89 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
                 system_arg: defaults.system_arg,
                 dialect: defaults.dialect,
                 workspace_arg: defaults.workspace_arg,
+                models: Vec::new(),
             });
         }
     }
 
     found
+}
+
+const CLI_MODEL_LIST_MAX_BYTES: usize = 64 * 1024;
+const CLI_MODEL_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn parse_agy_models(output: &str) -> Vec<CliModelOption> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (id, name) = line.split_once('\t')?;
+            let id = id.trim();
+            let name = name.trim();
+            (!id.is_empty() && !name.is_empty()).then(|| CliModelOption {
+                id: id.to_string(),
+                name: name.to_string(),
+            })
+        })
+        .collect()
+}
+
+async fn read_model_list(mut stdout: tokio::process::ChildStdout) -> std::io::Result<Vec<u8>> {
+    let mut kept = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let read = stdout.read(&mut chunk).await?;
+        if read == 0 {
+            return Ok(kept);
+        }
+        let remaining = CLI_MODEL_LIST_MAX_BYTES.saturating_sub(kept.len());
+        kept.extend_from_slice(&chunk[..read.min(remaining)]);
+    }
+}
+
+async fn discover_agy_models(path: &str) -> Vec<CliModelOption> {
+    let mut command = TokioCommand::new(path);
+    command
+        .arg("models")
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let run = async move {
+        let mut child = command.spawn().ok()?;
+        let stdout = child.stdout.take()?;
+        let (output, status) = tokio::join!(read_model_list(stdout), child.wait());
+        let output = output.ok()?;
+        if !status.ok()?.success() {
+            return None;
+        }
+        Some(parse_agy_models(&String::from_utf8_lossy(&output)))
+    };
+
+    tokio::time::timeout(CLI_MODEL_LIST_TIMEOUT, run)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// Enriches picker candidates with model IDs and display names reported by CLIs that
+/// expose a model-list command. Kept separate from registry discovery so starting a
+/// non-interactive chat never waits on a cosmetic picker query.
+pub async fn enrich_cli_model_options(candidates: &mut [Candidate]) {
+    for candidate in candidates {
+        for option in &mut candidate.transports {
+            let Some(cli) = option.cli.as_mut() else {
+                continue;
+            };
+            if option.availability.is_available()
+                && cli.binary_name == "agy"
+                && cli.models.is_empty()
+            {
+                cli.models = discover_agy_models(&cli.path).await;
+            }
+        }
+    }
 }
 
 fn cli_is_available(path: &str) -> bool {
@@ -1348,6 +1452,7 @@ fn build_vendor_candidate(
                         system_arg: defaults.system_arg,
                         dialect: defaults.dialect,
                         workspace_arg: defaults.workspace_arg,
+                        models: Vec::new(),
                     }),
                     needs_key: false,
                 });
@@ -2227,7 +2332,7 @@ impl Orchestrator {
             self.emit(Event::Delegated {
                 from: from.to_string(),
                 to: target_label.clone(),
-                task: truncate_chars(&delegation.prompt, MAX_TASK_DISPLAY_CHARS),
+                task: delegation.prompt.clone(),
             })
             .await;
             self.emit(Event::ActivityStarted {
@@ -2246,7 +2351,14 @@ impl Orchestrator {
                 let progress = self.spawn_progress_forwarder(target_label.clone());
                 let result = target
                     .send_with_progress(Some(&system), &effective_task, &progress)
-                    .await;
+                    .await
+                    .and_then(|reply| {
+                        if reply.text.trim().is_empty() {
+                            Err(anyhow!("{target_label} produced no output"))
+                        } else {
+                            Ok(reply)
+                        }
+                    });
                 // Drops the sink, closing the forwarding task's channel — see
                 // `spawn_progress_forwarder`'s doc comment. Inside the loop because a
                 // retry needs a fresh sink; the old one's task has already ended.
@@ -2271,7 +2383,7 @@ impl Orchestrator {
                     to: target_label.clone(),
                     attempt: attempts + 1,
                     max: MAX_DELEGATION_ATTEMPTS,
-                    reason: sanitize_progress_detail(&reason),
+                    reason: sanitize_transcript_detail(&reason),
                 })
                 .await;
                 tokio::time::sleep(DELEGATION_RETRY_BACKOFF[attempts - 1]).await;
@@ -2380,12 +2492,13 @@ impl Orchestrator {
     async fn run_skill_reads(&mut self, primary_label: &str, reply_text: &str) {
         let requests = SwarmLedger::parse_read_skill(reply_text);
 
-        // Mirrors `run_delegations` capping to `MAX_DELEGATIONS_PER_TURN`: the
+        // Mirrors `run_delegations`' bounded-effort rule, but keeps its own smaller
+        // filesystem-action limit: the
         // ledger already caps how many skills stay loaded (`MAX_LOADED_SKILLS`), but
         // that caps storage, not effort per turn — without this, a reply with
         // hundreds of `read_skill` lines would still trigger hundreds of filesystem
         // reads, just to have all but the last few evicted immediately after.
-        for name in requests.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+        for name in requests.into_iter().take(MAX_READ_ACTIONS_PER_TURN) {
             self.emit(Event::ActivityStarted {
                 label: primary_label.to_string(),
                 kind: ActivityKind::ReadingSkill,
@@ -2575,10 +2688,10 @@ impl Orchestrator {
     async fn run_file_reads(&mut self, primary_label: &str, reply_text: &str) {
         let requests = SwarmLedger::parse_read_files(reply_text);
 
-        // Mirrors `run_skill_reads` capping to `MAX_DELEGATIONS_PER_TURN`: bounds how
+        // Mirrors `run_skill_reads` capping to `MAX_READ_ACTIONS_PER_TURN`: bounds how
         // much filesystem effort a single turn can trigger, independent of how many
         // of the results the ledger ends up keeping (`MAX_LOADED_READS`).
-        for path in requests.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+        for path in requests.into_iter().take(MAX_READ_ACTIONS_PER_TURN) {
             self.emit(Event::ActivityStarted {
                 label: primary_label.to_string(),
                 kind: ActivityKind::ReadingProject,
@@ -2623,7 +2736,7 @@ impl Orchestrator {
     async fn run_file_lists(&mut self, primary_label: &str, reply_text: &str) {
         let requests = SwarmLedger::parse_list_files(reply_text);
 
-        for path in requests.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+        for path in requests.into_iter().take(MAX_READ_ACTIONS_PER_TURN) {
             self.emit(Event::ActivityStarted {
                 label: primary_label.to_string(),
                 kind: ActivityKind::ReadingProject,
@@ -3143,6 +3256,7 @@ mod tests {
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,
+                        models: Vec::new(),
                     }),
                     needs_key: false,
                 },
@@ -3323,10 +3437,11 @@ mod tests {
     }
 
     #[test]
-    fn every_cli_with_a_model_flag_offers_a_known_model_list() {
+    fn every_static_cli_catalog_is_non_empty() {
         // `llm` deliberately keeps `model_arg` (it does take `--model`) but has no
-        // fixed catalog, so it is excluded here and pinned empty separately below.
-        for binary in ["claude", "agy", "copilot", "codex"] {
+        // fixed catalog. `agy` is also excluded because its live `models` command is
+        // authoritative and changes independently of simon releases.
+        for binary in ["claude", "copilot", "codex"] {
             assert!(
                 !known_cli_models(binary).is_empty(),
                 "expected a non-empty known-model list for {binary}"
@@ -3335,11 +3450,172 @@ mod tests {
     }
 
     #[test]
-    fn known_cli_models_is_empty_for_llm_and_unknown_binaries() {
+    fn known_cli_models_is_empty_for_dynamic_plugin_and_unknown_binaries() {
         // `llm` is a plugin-based wrapper with no fixed model set — hardcoding a
         // list for it would just go stale — so it keeps the free-text fallback.
         assert!(known_cli_models("llm").is_empty());
+        assert!(known_cli_models("agy").is_empty());
         assert!(known_cli_models("some-random-cli").is_empty());
+    }
+
+    #[test]
+    fn agy_model_output_parses_ids_and_human_names() {
+        let parsed = parse_agy_models(
+            "Fetching available models...\n\
+             gemini-3.7-flash-high\tGemini 3.7 Flash (High)\n\
+             claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)\n\
+             \tMissing ID\n\
+             missing-name\t \n\
+             malformed row\n",
+        );
+
+        assert_eq!(
+            parsed,
+            vec![
+                CliModelOption {
+                    id: "gemini-3.7-flash-high".into(),
+                    name: "Gemini 3.7 Flash (High)".into(),
+                },
+                CliModelOption {
+                    id: "claude-sonnet-4-6".into(),
+                    name: "Claude Sonnet 4.6 (Thinking)".into(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn agy_model_discovery_runs_the_installed_cli_and_ignores_banner_lines() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("agy");
+        let padding = "x".repeat(2048);
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n\
+                 printf 'Fetching available models...\\n'\n\
+                 printf '{padding}\\n'\n\
+                 printf 'gemini-3.7-flash-high\\tGemini 3.7 Flash (High)\\n'\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let mut candidates = vec![Candidate {
+            id: "agy".into(),
+            group: "AGY".into(),
+            model: "agy".into(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Cli),
+                label: "via CLI".into(),
+                detail: script.to_string_lossy().into_owned(),
+                availability: Availability::Available,
+                cli: Some(CliSpec {
+                    binary_name: "agy".into(),
+                    path: script.to_string_lossy().into_owned(),
+                    args: Vec::new(),
+                    model_arg: Some("--model".into()),
+                    system_arg: None,
+                    dialect: None,
+                    workspace_arg: None,
+                    models: Vec::new(),
+                }),
+                needs_key: false,
+            }],
+        }];
+
+        enrich_cli_model_options(&mut candidates).await;
+
+        assert_eq!(
+            candidates[0].transports[0].cli.as_ref().unwrap().models,
+            vec![CliModelOption {
+                id: "gemini-3.7-flash-high".into(),
+                name: "Gemini 3.7 Flash (High)".into(),
+            }]
+        );
+
+        let existing = CliModelOption {
+            id: "saved-id".into(),
+            name: "Saved Name".into(),
+        };
+        candidates[0].transports[0].cli.as_mut().unwrap().models = vec![existing.clone()];
+        candidates.push(Candidate {
+            id: "custom".into(),
+            group: "CUSTOM".into(),
+            model: "custom".into(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Cli),
+                label: "via CLI".into(),
+                detail: script.to_string_lossy().into_owned(),
+                availability: Availability::Available,
+                cli: Some(CliSpec {
+                    binary_name: "custom".into(),
+                    path: script.to_string_lossy().into_owned(),
+                    args: Vec::new(),
+                    model_arg: Some("--model".into()),
+                    system_arg: None,
+                    dialect: None,
+                    workspace_arg: None,
+                    models: Vec::new(),
+                }),
+                needs_key: false,
+            }],
+        });
+        candidates.push(Candidate {
+            id: "blocked-agy".into(),
+            group: "BLOCKED AGY".into(),
+            model: "agy".into(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Cli),
+                label: "via CLI".into(),
+                detail: script.to_string_lossy().into_owned(),
+                availability: Availability::Unavailable(
+                    "CLI tools are refused under --classified".into(),
+                ),
+                cli: Some(CliSpec {
+                    binary_name: "agy".into(),
+                    path: script.to_string_lossy().into_owned(),
+                    args: Vec::new(),
+                    model_arg: Some("--model".into()),
+                    system_arg: None,
+                    dialect: None,
+                    workspace_arg: None,
+                    models: Vec::new(),
+                }),
+                needs_key: false,
+            }],
+        });
+
+        enrich_cli_model_options(&mut candidates).await;
+
+        assert_eq!(
+            candidates[0].transports[0].cli.as_ref().unwrap().models,
+            vec![existing],
+            "an existing agy catalog must not be replaced"
+        );
+        assert!(
+            candidates[1].transports[0]
+                .cli
+                .as_ref()
+                .unwrap()
+                .models
+                .is_empty(),
+            "other CLIs must not run agy's model-list command"
+        );
+        assert!(
+            candidates[2].transports[0]
+                .cli
+                .as_ref()
+                .unwrap()
+                .models
+                .is_empty(),
+            "unavailable CLIs must not be executed for picker enrichment"
+        );
     }
 
     #[test]
@@ -3353,6 +3629,7 @@ mod tests {
             system_arg: defaults.system_arg,
             dialect: defaults.dialect,
             workspace_arg: defaults.workspace_arg,
+            models: Vec::new(),
         };
 
         let args = cli_args_with_model(&cli, Some("gemini-3.1-pro"));
@@ -3372,6 +3649,7 @@ mod tests {
             system_arg: defaults.system_arg,
             dialect: defaults.dialect,
             workspace_arg: defaults.workspace_arg,
+            models: Vec::new(),
         };
 
         assert_eq!(
@@ -3514,6 +3792,7 @@ mod tests {
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,
+                        models: Vec::new(),
                     }),
                     needs_key: false,
                 },
@@ -3797,6 +4076,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_turn_can_delegate_to_every_other_model_in_a_five_model_swarm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(
+            vec![
+                ("primary", "commander", false),
+                ("worker", "one", false),
+                ("worker", "two", false),
+                ("worker", "three", false),
+                ("worker", "four", false),
+            ],
+            "primary:commander",
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_delegations(
+            "primary:commander",
+            "ACTION: delegate_task(worker:one, reply one)\n\
+             ACTION: delegate_task(worker:two, reply two)\n\
+             ACTION: delegate_task(worker:three, reply three)\n\
+             ACTION: delegate_task(worker:four, reply four)",
+        )
+        .await;
+
+        let delegated = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter(|event| matches!(event, Event::Delegated { .. }))
+            .count();
+        assert_eq!(
+            delegated, 4,
+            "a request for all four non-commander models must not stop after three"
+        );
+    }
+
+    #[tokio::test]
     async fn delegating_to_an_unknown_model_is_reported_not_ignored() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
@@ -4060,12 +4386,87 @@ mod tests {
         )));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn an_empty_delegated_reply_is_retried_then_reported_as_a_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "ollama:llama3".into(),
+            Arc::new(StubProvider {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                remote: false,
+            }),
+        );
+        providers.insert(
+            "ollama:empty".into(),
+            Arc::new(ScriptedProvider {
+                provider: "ollama".into(),
+                model: "empty".into(),
+                reply: " \n\t".into(),
+            }),
+        );
+        let reg = Registry {
+            providers,
+            primary: "ollama:llama3".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_delegations(
+            "ollama:llama3",
+            "ACTION: delegate_task(ollama:empty, answer)",
+        )
+        .await;
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::DelegationRetry { .. }))
+                .count(),
+            MAX_DELEGATION_ATTEMPTS - 1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Reply { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Error(message) if message.contains("produced no output")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::DelegationFinished {
+                ok: false,
+                chars: 0,
+                ..
+            }
+        )));
+        assert_eq!(
+            orch.ledger.tasks()[0].status,
+            crate::swarm::TaskStatus::Failed
+        );
+    }
+
     #[tokio::test]
-    async fn a_long_task_is_truncated_on_a_char_boundary_not_a_byte_index() {
-        // Same trick as
-        // `providers::mod::error_detail_is_truncated_on_a_char_boundary_not_a_byte_index`:
-        // one ASCII byte followed by enough 3-byte `€` characters that a naive
-        // `&s[..MAX_TASK_DISPLAY_CHARS]` byte slice lands mid-character and panics.
+    async fn a_long_delegated_task_is_kept_complete_for_the_scrollable_transcript() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
         let project_dir = tempfile::tempdir().unwrap();
@@ -4102,9 +4503,7 @@ mod tests {
                 Err(_) => panic!("expected an Event::Delegated"),
             }
         };
-        assert!(task.ends_with('…'));
-        // MAX_TASK_DISPLAY_CHARS kept chars, plus the ellipsis marker.
-        assert_eq!(task.chars().count(), MAX_TASK_DISPLAY_CHARS + 1);
+        assert_eq!(task, long_task);
     }
 
     #[tokio::test]
@@ -5086,6 +5485,49 @@ mod tests {
         assert!(!is_retryable_delegation_error(
             "local binary `agy` has an empty path"
         ));
+        assert!(!is_retryable_delegation_error(
+            r#"agy failed: invalid model selection (--model "gemini-2.5-pro"): model is not recognized as a known model or custom model in settings"#
+        ));
+        assert!(!is_retryable_delegation_error(
+            "claude failed: You've hit your weekly limit · resets Aug 31"
+        ));
+        assert!(!is_retryable_delegation_error(
+            r#"openai returned 429: {"code":"insufficient_quota"}"#
+        ));
+        assert!(!is_retryable_delegation_error(
+            "provider failed: quota exceeded for this billing period"
+        ));
+        assert!(!is_retryable_delegation_error(
+            "You exceeded your current quota, please check your plan"
+        ));
+        assert!(
+            is_retryable_delegation_error("provider failed: rate limit exceeded"),
+            "short-lived rate limiting should still use the bounded retry path"
+        );
+    }
+
+    #[test]
+    fn retry_explanations_keep_the_full_message_but_remove_terminal_controls() {
+        let raw = format!("{}\nfinal detail\u{1b}[31m", "long reason ".repeat(20));
+        let sanitized = sanitize_transcript_detail(&raw);
+
+        assert!(sanitized.contains("final detail"));
+        assert!(
+            sanitized.chars().count() > MAX_PROGRESS_DETAIL_CHARS,
+            "transcript text must not inherit the one-line status cap"
+        );
+        assert!(!sanitized.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn progress_details_are_sanitized_and_truncated() {
+        let raw = format!("{}\nfinal\u{1b}[31m", "long detail ".repeat(20));
+        let sanitized = sanitize_progress_detail(&raw);
+
+        assert_eq!(sanitized.chars().count(), MAX_PROGRESS_DETAIL_CHARS + 1);
+        assert!(sanitized.ends_with('…'));
+        assert!(!sanitized.chars().any(char::is_control));
+        assert!(sanitized.starts_with("long detail"));
     }
 
     #[test]
@@ -5255,6 +5697,25 @@ mod tests {
         let preamble = commander_preamble("claude", &["claude".into(), "agy".into()]).unwrap();
         assert!(preamble.contains("already approved a plan"));
         assert!(preamble.contains("do not re-propose what has been settled"));
+    }
+
+    #[test]
+    fn an_all_models_request_must_be_delegated_in_one_turn() {
+        let preamble = commander_preamble(
+            "commander",
+            &[
+                "commander".into(),
+                "one".into(),
+                "two".into(),
+                "three".into(),
+                "four".into(),
+            ],
+        )
+        .unwrap();
+        assert!(preamble.contains("every connected model"));
+        assert!(preamble.contains("emit every required delegation in this reply"));
+        assert!(preamble.contains("There is no automatic continuation turn"));
+        assert!(preamble.contains("never promise to query omitted models later"));
     }
 
     #[test]

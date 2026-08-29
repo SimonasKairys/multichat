@@ -1039,13 +1039,16 @@ impl SwarmLedger {
              have no quota and cost nothing.\n\
              A sub-agent does NOT see this conversation, this ledger, or the user's \
              question — its prompt is all it gets, so state the full task and the \
-             context it needs in the prompt itself. You may emit up to 3 delegation \
+             context it needs in the prompt itself. You may emit up to 10 delegation \
              lines in one turn; they run one after another, not at the same time. The \
              result (or, on failure, the error) is recorded in this ledger under the \
              task and becomes visible to you on your NEXT turn — not this one, since \
              this reply is already on its way out when the sub-agent runs. So do not \
              promise the user an answer in the same turn you delegate: say what you \
-             have handed out, and deliver the synthesis next turn.\n",
+             have handed out, and deliver the synthesis next turn. There is no \
+             automatic continuation turn; when the user asks for every connected \
+             model, emit every required delegation now rather than promising to query \
+             omitted models later.\n",
         );
 
         out.push_str(
@@ -2151,6 +2154,7 @@ mod tests {
         assert!(text.contains("DEFAULT, not a fallback"));
         assert!(text.contains("CHEAPEST"));
         assert!(text.contains("ACTION: delegate_task"));
+        assert!(text.contains("up to 10 delegation"));
     }
 
     #[test]

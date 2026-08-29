@@ -23,6 +23,12 @@ struct Selection {
     chosen: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelChoice {
+    id: String,
+    name: String,
+}
+
 /// Browsing the row list, entering a masked API key, or entering a model override.
 /// Kept as an explicit mode rather than independent booleans so only one text field
 /// can own keyboard input at a time.
@@ -256,7 +262,7 @@ impl PickerState {
     /// the row's vendor/CLI has no known list (see `known_models_for`) — the UI
     /// falls back to showing just the typed buffer in that case, exactly as the
     /// model editor behaved before this list existed.
-    pub fn model_options(&self) -> Vec<(&str, bool)> {
+    pub fn model_options(&self) -> Vec<(String, bool)> {
         let options = self.current_model_options();
         let selected = match &self.mode {
             Mode::EnteringModel { selected, .. } => *selected,
@@ -265,7 +271,7 @@ impl PickerState {
         options
             .into_iter()
             .enumerate()
-            .map(|(i, name)| (name, i == selected))
+            .map(|(i, option)| (option.name, i == selected))
             .collect()
     }
 
@@ -274,12 +280,7 @@ impl PickerState {
     /// the `move_model_selection_*` methods (clamping and buffer sync), so all
     /// three can never disagree about what is currently on screen.
     ///
-    /// Returns `'static` strings (not tied to `&self`) even though computing which
-    /// ones apply reads `self.mode`/`self.candidates` — the strings themselves come
-    /// from `known_models_for`'s `'static` lists, never from `self`'s own data — so
-    /// callers that need to follow this with a `&mut self.mode` borrow (the
-    /// selection movers) can do so without the borrow checker seeing a conflict.
-    fn current_model_options(&self) -> Vec<&'static str> {
+    fn current_model_options(&self) -> Vec<ModelChoice> {
         match &self.mode {
             Mode::EnteringModel {
                 candidate,
@@ -289,7 +290,7 @@ impl PickerState {
             } => {
                 let option = &self.candidates[*candidate].transports[*transport];
                 let known = Self::known_models_for(option, &self.candidates[*candidate].id);
-                Self::filter_options(known, buffer)
+                Self::filter_options(&known, buffer)
             }
             _ => Vec::new(),
         }
@@ -301,15 +302,35 @@ impl PickerState {
     /// `llm` with no fixed model set), in which case the caller's list is empty and
     /// the model editor is free-text only, exactly as it was before this list
     /// existed.
-    fn known_models_for(option: &TransportOption, candidate_id: &str) -> &'static [&'static str] {
+    fn known_models_for(option: &TransportOption, candidate_id: &str) -> Vec<ModelChoice> {
         match option.transport {
-            Some(Transport::Api) => crate::config::known_models(candidate_id),
-            Some(Transport::Cli) => option
-                .cli
-                .as_ref()
-                .map(|cli| crate::orchestrator::known_cli_models(&cli.binary_name))
-                .unwrap_or(&[]),
-            None => &[],
+            Some(Transport::Api) => crate::config::known_models(candidate_id)
+                .iter()
+                .map(|model| ModelChoice {
+                    id: (*model).to_string(),
+                    name: (*model).to_string(),
+                })
+                .collect(),
+            Some(Transport::Cli) => option.cli.as_ref().map_or_else(Vec::new, |cli| {
+                if cli.models.is_empty() {
+                    crate::orchestrator::known_cli_models(&cli.binary_name)
+                        .iter()
+                        .map(|model| ModelChoice {
+                            id: (*model).to_string(),
+                            name: (*model).to_string(),
+                        })
+                        .collect()
+                } else {
+                    cli.models
+                        .iter()
+                        .map(|model| ModelChoice {
+                            id: model.id.clone(),
+                            name: model.name.clone(),
+                        })
+                        .collect()
+                }
+            }),
+            None => Vec::new(),
         }
     }
 
@@ -318,12 +339,16 @@ impl PickerState {
     /// `"claude-sonnet-5"` without requiring an exact prefix. An empty buffer
     /// matches everything, so the list opens showing every known option rather
     /// than nothing.
-    fn filter_options<'a>(known: &'a [&'a str], buffer: &str) -> Vec<&'a str> {
+    fn filter_options(known: &[ModelChoice], buffer: &str) -> Vec<ModelChoice> {
         let needle = buffer.trim().to_ascii_lowercase();
         known
             .iter()
-            .copied()
-            .filter(|m| needle.is_empty() || m.to_ascii_lowercase().contains(&needle))
+            .filter(|model| {
+                needle.is_empty()
+                    || model.id.to_ascii_lowercase().contains(&needle)
+                    || model.name.to_ascii_lowercase().contains(&needle)
+            })
+            .cloned()
             .collect()
     }
 
@@ -521,7 +546,9 @@ impl PickerState {
         let current = self.display_model(row.candidate, row.transport);
         let selected = known
             .iter()
-            .position(|m| m.eq_ignore_ascii_case(current))
+            .position(|model| {
+                model.id.eq_ignore_ascii_case(current) || model.name.eq_ignore_ascii_case(current)
+            })
             .unwrap_or(0);
 
         self.mode = Mode::EnteringModel {
@@ -633,14 +660,20 @@ impl PickerState {
             Some(
                 known
                     .iter()
-                    .find(|m| m.eq_ignore_ascii_case(typed))
-                    .copied()
-                    .or_else(|| Self::filter_options(known, &buffer).get(selected).copied())
-                    .unwrap_or(typed)
-                    .to_string(),
+                    .find(|model| {
+                        model.id.eq_ignore_ascii_case(typed)
+                            || model.name.eq_ignore_ascii_case(typed)
+                    })
+                    .map(|model| model.id.clone())
+                    .or_else(|| {
+                        Self::filter_options(&known, &buffer)
+                            .get(selected)
+                            .map(|model| model.id.clone())
+                    })
+                    .unwrap_or_else(|| typed.to_string()),
             )
         } else if touched {
-            known.get(selected).map(|s| s.to_string())
+            known.get(selected).map(|model| model.id.clone())
         } else {
             None
         };
@@ -844,6 +877,7 @@ mod tests {
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,
+                        models: Vec::new(),
                     }),
                     needs_key: false,
                 },
@@ -881,6 +915,7 @@ mod tests {
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,
+                        models: Vec::new(),
                     }),
                     needs_key: false,
                 },
@@ -1310,6 +1345,7 @@ mod tests {
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,
+                        models: Vec::new(),
                     }),
                     needs_key: false,
                 },
@@ -1423,13 +1459,16 @@ mod tests {
             !options.is_empty(),
             "a known vendor should offer a non-empty pick-list"
         );
-        assert!(options.iter().any(|(name, _)| *name == "claude-opus-5"));
+        assert!(options.iter().any(|(name, _)| name == "claude-opus-5"));
         // The row's current model (its endpoint default here) is highlighted first,
         // so re-opening the editor shows what's already in effect rather than
         // always landing on the top of the list regardless of the current value.
         assert_eq!(
-            options.iter().find(|(_, selected)| *selected),
-            Some(&("claude-opus-5", true))
+            options
+                .iter()
+                .find(|(_, selected)| *selected)
+                .map(|(name, selected)| (name.as_str(), *selected)),
+            Some(("claude-opus-5", true))
         );
     }
 
@@ -1636,8 +1675,134 @@ mod tests {
         picker.start_model_entry();
 
         let options = picker.model_options();
-        assert!(options.iter().any(|(name, _)| *name == "gpt-5.4"));
-        assert!(options.iter().any(|(name, _)| *name == "claude-sonnet-5"));
+        assert!(options.iter().any(|(name, _)| name == "gpt-5.4"));
+        assert!(options.iter().any(|(name, _)| name == "claude-sonnet-5"));
+    }
+
+    #[test]
+    fn a_discovered_cli_model_shows_its_name_but_saves_its_id() {
+        let mut candidate = candidate_dual_both_available("agy");
+        let cli = candidate.transports[0].cli.as_mut().unwrap();
+        cli.models = vec![
+            crate::orchestrator::CliModelOption {
+                id: "gemini-3.7-flash-high".into(),
+                name: "Gemini 3.7 Flash (High)".into(),
+            },
+            crate::orchestrator::CliModelOption {
+                id: "claude-sonnet-4-6".into(),
+                name: "Claude Sonnet 4.6 (Thinking)".into(),
+            },
+        ];
+        let mut picker = PickerState::new(vec![candidate], &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        assert_eq!(
+            picker
+                .model_options()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            ["Gemini 3.7 Flash (High)", "Claude Sonnet 4.6 (Thinking)"]
+        );
+        picker.move_model_selection_down();
+        picker.submit_model_entry();
+
+        assert_eq!(picker.display_model(0, 0), "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn discovered_cli_models_filter_by_id_or_human_name() {
+        let mut candidate = candidate_dual_both_available("agy");
+        candidate.transports[0].cli.as_mut().unwrap().models = vec![
+            crate::orchestrator::CliModelOption {
+                id: "gemini-3.7-flash-high".into(),
+                name: "Gemini 3.7 Flash (High)".into(),
+            },
+            crate::orchestrator::CliModelOption {
+                id: "claude-sonnet-4-6".into(),
+                name: "Claude Sonnet 4.6 (Thinking)".into(),
+            },
+        ];
+
+        let mut by_id = PickerState::new(vec![candidate.clone()], &BTreeMap::new(), None, false);
+        by_id.start_model_entry();
+        for c in "sonnet-4-6".chars() {
+            by_id.push_model_char(c);
+        }
+        assert_eq!(
+            by_id.model_options(),
+            vec![("Claude Sonnet 4.6 (Thinking)".into(), true)]
+        );
+
+        let mut by_name = PickerState::new(vec![candidate], &BTreeMap::new(), None, false);
+        by_name.start_model_entry();
+        for c in "thinking".chars() {
+            by_name.push_model_char(c);
+        }
+        assert_eq!(
+            by_name.model_options(),
+            vec![("Claude Sonnet 4.6 (Thinking)".into(), true)]
+        );
+    }
+
+    #[test]
+    fn discovered_cli_editor_highlights_a_saved_model_id() {
+        let mut candidate = candidate_dual_both_available("agy");
+        candidate.transports[0].cli.as_mut().unwrap().models = vec![
+            crate::orchestrator::CliModelOption {
+                id: "gemini-3.7-flash-high".into(),
+                name: "Gemini 3.7 Flash (High)".into(),
+            },
+            crate::orchestrator::CliModelOption {
+                id: "claude-sonnet-4-6".into(),
+                name: "Claude Sonnet 4.6 (Thinking)".into(),
+            },
+        ];
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "agy".into(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Cli),
+                path: None,
+                model: Some("claude-sonnet-4-6".into()),
+            },
+        );
+        let mut picker = PickerState::new(vec![candidate], &connections, Some("agy"), false);
+
+        picker.start_model_entry();
+
+        assert_eq!(
+            picker.model_options(),
+            vec![
+                ("Gemini 3.7 Flash (High)".into(), false),
+                ("Claude Sonnet 4.6 (Thinking)".into(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_human_name_wins_over_an_earlier_partial_match() {
+        let mut candidate = candidate_dual_both_available("agy");
+        candidate.transports[0].cli.as_mut().unwrap().models = vec![
+            crate::orchestrator::CliModelOption {
+                id: "preview-id".into(),
+                name: "Claude Sonnet 4.6 (Thinking) Preview".into(),
+            },
+            crate::orchestrator::CliModelOption {
+                id: "stable-id".into(),
+                name: "Claude Sonnet 4.6 (Thinking)".into(),
+            },
+        ];
+        let mut picker = PickerState::new(vec![candidate], &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        for c in "Claude Sonnet 4.6 (Thinking)".chars() {
+            picker.push_model_char(c);
+        }
+        picker.submit_model_entry();
+
+        assert_eq!(picker.display_model(0, 0), "stable-id");
     }
 
     #[test]
@@ -1779,6 +1944,7 @@ mod tests {
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,
+                        models: Vec::new(),
                     }),
                     needs_key: false,
                 },

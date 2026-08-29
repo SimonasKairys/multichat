@@ -25,7 +25,9 @@ use zeroize::Zeroize;
 
 use crate::app::{App, CommanderCommand, parse_commander_command, parse_forget_command};
 use crate::config::{Credentials, Settings};
-use crate::orchestrator::{Command, Event, WriteDecision, discover_candidates};
+use crate::orchestrator::{
+    Command, Event, WriteDecision, discover_candidates, enrich_cli_model_options,
+};
 use crate::picker::PickerState;
 
 /// Restores the terminal on drop, so a panic or an early `?` cannot leave the user in
@@ -255,7 +257,8 @@ async fn run_picker(
     {
         let settings = settings.clone();
         tokio::spawn(async move {
-            let candidates = discover_candidates(&settings, classified).await;
+            let mut candidates = discover_candidates(&settings, classified).await;
+            enrich_cli_model_options(&mut candidates).await;
             let _ = candidates_tx.send(candidates).await;
         });
     }

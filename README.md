@@ -62,12 +62,13 @@ picker, **tab** cycles a candidate's transport, and **enter** connects — but o
 once a commander has been chosen; until then it just flashes a reminder to press
 **c**. The model picker works for every cloud API and for CLI providers with a model
 flag (all auto-detected CLIs); Ollama already exposes each installed model as its own
-row, so **m** does not apply there. For a vendor or CLI `simon` ships a known-model
-list for, **m** shows it as a scrollable list — **↑/↓** move the highlight and
-**enter** confirms it, no typing required. Typing narrows the list to matching names,
-and — for OpenRouter's long tail, or any id not yet in a curated list — typed text
-that matches nothing is used verbatim, so it's still possible to enter one by hand
-(for example `anthropic/claude-sonnet-4`). Submitting an empty field without
+row, so **m** does not apply there. For a vendor or CLI `simon` knows, **m** shows a
+scrollable list — **↑/↓** move the highlight and **enter** confirms it, no typing
+required. `agy` choices come directly from the installed CLI's `agy models` command,
+so the picker shows its current human-readable names while saving the underlying
+model IDs. Typing narrows the list to matching names or IDs, and — for OpenRouter's
+long tail, or any id not in a discovered/curated list — unmatched text is used
+verbatim (for example `anthropic/claude-sonnet-4`). Submitting an empty field without
 selecting anything restores the provider default. `simon chat -m <label>` skips the
 picker and picks the commander non-interactively instead.
 

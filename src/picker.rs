@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use zeroize::Zeroize;
 
-use crate::config::ConnectionSpec;
-use crate::orchestrator::{Availability, Candidate};
+use crate::config::{ConnectionSpec, Transport};
+use crate::orchestrator::{Availability, Candidate, ConnectionState};
 
 /// One rendered, cursor-addressable line: a candidate's `transports[transport]`.
 #[derive(Debug, Clone, Copy)]
@@ -23,13 +23,20 @@ struct Selection {
     chosen: usize,
 }
 
-/// Browsing the row list, or entering a masked API key for a row that has none
-/// stored yet. Kept as an explicit mode rather than a bool so there is exactly one
-/// place ([`PickerState::key_entry`]) the UI has to ask "are we editing text right
-/// now" before routing a keypress.
+/// Browsing the row list, entering a masked API key, or entering a model override.
+/// Kept as an explicit mode rather than independent booleans so only one text field
+/// can own keyboard input at a time.
 enum Mode {
     Browsing,
-    EnteringKey { candidate: usize, buffer: String },
+    EnteringKey {
+        candidate: usize,
+        buffer: String,
+    },
+    EnteringModel {
+        candidate: usize,
+        transport: usize,
+        buffer: String,
+    },
 }
 
 /// Picker state: candidates discovered up front, plus the user's in-progress
@@ -40,6 +47,10 @@ pub struct PickerState {
     candidates: Vec<Candidate>,
     rows: Vec<RowRef>,
     selections: Vec<Selection>,
+    /// Per-connection model overrides restored from and written back to
+    /// `ConnectionSpec::model`. Providers use `None` for their default; a value such
+    /// as `anthropic/claude-sonnet-4` selects that exact OpenRouter model.
+    models: Vec<Option<String>>,
     cursor: usize,
     commander: Option<usize>,
     mode: Mode,
@@ -64,6 +75,10 @@ impl PickerState {
             .iter()
             .map(|c| Self::initial_selection(c, connections, first_run))
             .collect();
+        let models = candidates
+            .iter()
+            .map(|c| connections.get(&c.id).and_then(|conn| conn.model.clone()))
+            .collect();
 
         let rows: Vec<RowRef> = candidates
             .iter()
@@ -87,6 +102,7 @@ impl PickerState {
             candidates,
             rows,
             selections,
+            models,
             cursor: 0,
             commander: commander_idx,
             mode: Mode::Browsing,
@@ -147,9 +163,9 @@ impl PickerState {
     }
 
     /// Whether the given candidate is currently enabled with the given transport
-    /// index — i.e. whether that row's checkbox should render ticked. Two rows of
-    /// the same candidate (e.g. "via CLI" / "via API") can never both be checked:
-    /// they share one `Selection`, so ticking one always un-ticks the other.
+    /// index — i.e. whether that row should render as connected. Two rows of the
+    /// same candidate (e.g. "via CLI" / "via API") can never both be connected:
+    /// they share one `Selection`, so enabling one always disables the other.
     pub fn is_checked(&self, candidate: usize, transport: usize) -> bool {
         self.selections[candidate].enabled && self.selections[candidate].chosen == transport
     }
@@ -162,13 +178,32 @@ impl PickerState {
         self.commander == Some(candidate) && self.selections[candidate].chosen == transport
     }
 
+    pub fn connection_state(&self, candidate: usize, transport: usize) -> ConnectionState {
+        ConnectionState::from_availability(
+            self.is_checked(candidate, transport),
+            &self.candidates[candidate].transports[transport].availability,
+        )
+    }
+
+    /// Model name shown for a candidate. A user-entered override takes precedence
+    /// over the discovered/default model name.
+    pub fn display_model(&self, candidate: usize, transport: usize) -> &str {
+        if let Some(model) = self.models[candidate].as_deref() {
+            return model;
+        }
+        self.candidates[candidate].transports[transport]
+            .cli
+            .as_ref()
+            .map(|cli| cli.binary_name.as_str())
+            .unwrap_or(self.candidates[candidate].model.as_str())
+    }
+
     /// `Some((candidate id, buffer length))` while a masked key prompt is open, so
     /// the UI can render `API key for <id>: ` followed by one `•` per typed
     /// character — the buffer's actual contents never leave this module through
     /// this accessor.
     pub fn key_entry(&self) -> Option<(&str, usize)> {
         match &self.mode {
-            Mode::Browsing => None,
             Mode::EnteringKey { candidate, buffer } => {
                 // `chars().count()`, not `.len()`: the caller repeats one `•` per
                 // *typed character*, and this codebase's user types Lithuanian —
@@ -180,6 +215,25 @@ impl PickerState {
                     buffer.chars().count(),
                 ))
             }
+            Mode::Browsing | Mode::EnteringModel { .. } => None,
+        }
+    }
+
+    /// `Some((candidate id, current model, typed replacement))` while the model
+    /// editor is open. Model names are not secrets, so the UI renders the buffer
+    /// directly rather than masking it like an API key.
+    pub fn model_entry(&self) -> Option<(&str, &str, &str)> {
+        match &self.mode {
+            Mode::EnteringModel {
+                candidate,
+                transport,
+                buffer,
+            } => Some((
+                self.candidates[*candidate].id.as_str(),
+                self.display_model(*candidate, *transport),
+                buffer.as_str(),
+            )),
+            Mode::Browsing | Mode::EnteringKey { .. } => None,
         }
     }
 
@@ -208,10 +262,9 @@ impl PickerState {
     /// chosen from saved config (e.g. a key that was removed from the keyring
     /// after `enabled = true` was written), and construction drops a disabled row
     /// regardless of its availability — so refusing the un-tick would only trap
-    /// the user with a stale `[x]` they can never clear.
+    /// the user with a stale connected marker they can never clear.
     pub fn toggle(&mut self) {
-        // Key entry routes every keypress through the UI's dedicated match arm
-        // (`push_key_char`/`backspace_key`/`cancel_key_entry`/`submit_key_entry`);
+        // Text entry routes every keypress through the UI's dedicated match arm;
         // `toggle` should not fire underneath it even if a caller mis-routes.
         if !matches!(self.mode, Mode::Browsing) {
             return;
@@ -296,7 +349,7 @@ impl PickerState {
     pub fn submit_key_entry(&mut self) -> Option<(String, String)> {
         let (candidate, is_empty) = match &self.mode {
             Mode::EnteringKey { candidate, buffer } => (*candidate, buffer.trim().is_empty()),
-            Mode::Browsing => return None,
+            Mode::Browsing | Mode::EnteringModel { .. } => return None,
         };
 
         if is_empty {
@@ -308,7 +361,9 @@ impl PickerState {
         let id = self.candidates[candidate].id.clone();
         match std::mem::replace(&mut self.mode, Mode::Browsing) {
             Mode::EnteringKey { buffer, .. } => Some((id, buffer)),
-            Mode::Browsing => unreachable!("checked above: mode was EnteringKey"),
+            Mode::Browsing | Mode::EnteringModel { .. } => {
+                unreachable!("checked above: mode was EnteringKey")
+            }
         }
     }
 
@@ -333,6 +388,88 @@ impl PickerState {
     /// just surfaces why nothing was stored.
     pub fn mark_key_store_failed(&mut self, error: &str) {
         self.flash = Some(error.to_string());
+    }
+
+    // --- model entry -------------------------------------------------------------
+
+    /// Opens model entry for a row whose transport accepts an explicit model. The
+    /// buffer starts empty so a long identifier can be typed directly; submitting an
+    /// empty buffer deliberately restores the provider's default model.
+    pub fn start_model_entry(&mut self) {
+        if !matches!(self.mode, Mode::Browsing) {
+            return;
+        }
+
+        let Some(row) = self.current_row() else {
+            return;
+        };
+        let option = &self.candidates[row.candidate].transports[row.transport];
+        let unsupported = match option.transport {
+            Some(Transport::Api) => None,
+            Some(Transport::Cli)
+                if option
+                    .cli
+                    .as_ref()
+                    .and_then(|cli| cli.model_arg.as_ref())
+                    .is_some() =>
+            {
+                None
+            }
+            Some(Transport::Cli) => Some("this CLI has no model-selection flag configured"),
+            None => Some("choose a different Ollama model row"),
+        };
+        if let Some(reason) = unsupported {
+            self.flash = Some(reason.into());
+            return;
+        }
+
+        self.mode = Mode::EnteringModel {
+            candidate: row.candidate,
+            transport: row.transport,
+            buffer: String::new(),
+        };
+        self.flash = None;
+    }
+
+    pub fn push_model_char(&mut self, c: char) {
+        if let Mode::EnteringModel { buffer, .. } = &mut self.mode {
+            buffer.push(c);
+        }
+    }
+
+    pub fn backspace_model(&mut self) {
+        if let Mode::EnteringModel { buffer, .. } = &mut self.mode {
+            buffer.pop();
+        }
+    }
+
+    pub fn cancel_model_entry(&mut self) {
+        if matches!(self.mode, Mode::EnteringModel { .. }) {
+            self.mode = Mode::Browsing;
+        }
+    }
+
+    /// Applies the typed model override. Whitespace around an identifier is ignored;
+    /// an empty value clears the override and returns to the endpoint default.
+    pub fn submit_model_entry(&mut self) {
+        let (candidate, buffer) = match std::mem::replace(&mut self.mode, Mode::Browsing) {
+            Mode::EnteringModel {
+                candidate, buffer, ..
+            } => (candidate, buffer),
+            other => {
+                self.mode = other;
+                return;
+            }
+        };
+
+        let model = buffer.trim();
+        if model.is_empty() {
+            self.models[candidate] = None;
+            self.flash = Some("model reset to provider default".into());
+        } else {
+            self.models[candidate] = Some(model.to_string());
+            self.flash = Some(format!("model set to {model}"));
+        }
     }
 
     /// Cycles which transport the highlighted candidate would use, without changing
@@ -464,7 +601,7 @@ impl PickerState {
                     enabled: sel.enabled,
                     transport: option.and_then(|opt| opt.transport),
                     path: option.and_then(|opt| opt.cli.as_ref().map(|cli| cli.path.clone())),
-                    model: None,
+                    model: self.models[i].clone(),
                 },
             );
         }
@@ -518,6 +655,7 @@ mod tests {
                         binary_name: id.into(),
                         path: "/usr/bin/x".into(),
                         args: vec![],
+                        model_arg: Some("--model".into()),
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,
@@ -554,6 +692,7 @@ mod tests {
                         binary_name: id.into(),
                         path: "/usr/bin/x".into(),
                         args: vec![],
+                        model_arg: Some("--model".into()),
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,
@@ -595,10 +734,13 @@ mod tests {
     fn toggling_ticks_and_unticks_a_row() {
         let candidates = vec![candidate_single("ollama:llama3")];
         let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        assert_eq!(picker.connection_state(0, 0), ConnectionState::NotConnected);
         assert!(!picker.is_checked(0, 0));
         picker.toggle();
+        assert_eq!(picker.connection_state(0, 0), ConnectionState::Connected);
         assert!(picker.is_checked(0, 0));
         picker.toggle();
+        assert_eq!(picker.connection_state(0, 0), ConnectionState::NotConnected);
         assert!(!picker.is_checked(0, 0));
     }
 
@@ -830,7 +972,7 @@ mod tests {
         // Saved config can carry `enabled = true` for a transport that has since
         // gone unavailable (e.g. the API key was removed from the keyring after
         // the config was written). Construction drops a disabled row either way,
-        // so refusing the un-tick would trap the user with a permanent `[x]`.
+        // so refusing the un-tick would trap the user with a permanent connected marker.
         let candidates = vec![candidate_dual("google", false)];
         let mut connections = BTreeMap::new();
         connections.insert(
@@ -845,6 +987,10 @@ mod tests {
         let mut picker = PickerState::new(candidates, &connections, Some("google"), false);
         assert!(picker.is_checked(0, 1));
         assert!(picker.is_commander(0, 1));
+        assert_eq!(
+            picker.connection_state(0, 1),
+            ConnectionState::ConnectedUnavailable
+        );
 
         picker.move_down(); // land on the API row
         picker.toggle();
@@ -904,6 +1050,168 @@ mod tests {
         let (connections, commander) = picker.submit().unwrap();
         assert!(connections["ollama:llama3"].enabled);
         assert_eq!(commander.as_deref(), Some("ollama:llama3"));
+    }
+
+    #[test]
+    fn api_model_override_can_be_entered_and_is_saved() {
+        let candidates = vec![Candidate {
+            id: "openrouter".into(),
+            group: "OPENROUTER".into(),
+            model: "openai/gpt-4o".into(),
+            transports: vec![crate::orchestrator::TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://openrouter.ai/api/v1".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        }];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        for c in "anthropic/claude-sonnet-4".chars() {
+            picker.push_model_char(c);
+        }
+        picker.submit_model_entry();
+        picker.toggle();
+        picker.set_commander();
+
+        assert_eq!(picker.display_model(0, 0), "anthropic/claude-sonnet-4");
+        let (connections, commander) = picker.submit().expect("configured model should submit");
+        assert_eq!(commander.as_deref(), Some("openrouter"));
+        assert_eq!(
+            connections["openrouter"].model.as_deref(),
+            Some("anthropic/claude-sonnet-4")
+        );
+    }
+
+    #[test]
+    fn cli_model_override_can_be_entered_and_is_saved() {
+        let candidates = vec![candidate_dual_both_available("copilot")];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        for c in "gpt-5.4".chars() {
+            picker.push_model_char(c);
+        }
+        picker.submit_model_entry();
+        picker.toggle();
+        picker.set_commander();
+
+        assert_eq!(picker.display_model(0, 0), "gpt-5.4");
+        let (connections, commander) = picker.submit().expect("configured model should submit");
+        assert_eq!(commander.as_deref(), Some("copilot"));
+        assert_eq!(connections["copilot"].model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn api_and_cli_rows_show_their_own_default_model() {
+        let candidates = vec![Candidate {
+            id: "anthropic".into(),
+            group: "ANTHROPIC".into(),
+            model: "claude-opus-5".into(),
+            transports: vec![
+                crate::orchestrator::TransportOption {
+                    transport: Some(Transport::Cli),
+                    label: "via CLI".into(),
+                    detail: "/usr/bin/claude".into(),
+                    availability: Availability::Available,
+                    cli: Some(CliSpec {
+                        binary_name: "claude".into(),
+                        path: "/usr/bin/claude".into(),
+                        args: vec![],
+                        model_arg: Some("--model".into()),
+                        system_arg: None,
+                        dialect: None,
+                        workspace_arg: None,
+                    }),
+                    needs_key: false,
+                },
+                crate::orchestrator::TransportOption {
+                    transport: Some(Transport::Api),
+                    label: "via API".into(),
+                    detail: "https://api.anthropic.com".into(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                },
+            ],
+        }];
+        let picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        assert_eq!(picker.display_model(0, 0), "claude");
+        assert_eq!(picker.display_model(0, 1), "claude-opus-5");
+    }
+
+    #[test]
+    fn picker_preserves_an_existing_model_override() {
+        let candidates = vec![Candidate {
+            id: "openrouter".into(),
+            group: "OPENROUTER".into(),
+            model: "openai/gpt-4o".into(),
+            transports: vec![crate::orchestrator::TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://openrouter.ai/api/v1".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        }];
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "openrouter".into(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Api),
+                path: None,
+                model: Some("google/gemini-2.5-pro".into()),
+            },
+        );
+        let mut picker = PickerState::new(candidates, &connections, Some("openrouter"), false);
+
+        assert_eq!(picker.display_model(0, 0), "google/gemini-2.5-pro");
+        let (saved, _) = picker.submit().expect("restored selection should submit");
+        assert_eq!(
+            saved["openrouter"].model.as_deref(),
+            Some("google/gemini-2.5-pro")
+        );
+    }
+
+    #[test]
+    fn empty_model_entry_restores_the_provider_default() {
+        let candidates = vec![Candidate {
+            id: "openrouter".into(),
+            group: "OPENROUTER".into(),
+            model: "openai/gpt-4o".into(),
+            transports: vec![crate::orchestrator::TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://openrouter.ai/api/v1".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        }];
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "openrouter".into(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Api),
+                path: None,
+                model: Some("google/gemini-2.5-pro".into()),
+            },
+        );
+        let mut picker = PickerState::new(candidates, &connections, Some("openrouter"), false);
+
+        picker.start_model_entry();
+        picker.submit_model_entry();
+
+        assert_eq!(picker.display_model(0, 0), "openai/gpt-4o");
+        let (saved, _) = picker.submit().expect("restored selection should submit");
+        assert_eq!(saved["openrouter"].model, None);
     }
 
     #[test]
@@ -982,6 +1290,7 @@ mod tests {
         let picker = PickerState::new(candidates, &connections, Some("anthropic"), false);
         assert!(picker.is_checked(0, 0));
         assert!(picker.is_commander(0, 0));
+        assert_eq!(picker.connection_state(0, 0), ConnectionState::Connected);
     }
 
     #[test]
@@ -1040,6 +1349,7 @@ mod tests {
                         binary_name: id.into(),
                         path: "/usr/bin/x".into(),
                         args: vec![],
+                        model_arg: Some("--model".into()),
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,

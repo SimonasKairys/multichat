@@ -64,6 +64,29 @@ const MIN_SALT_LEN: usize = 8;
 const KEY_LEN: usize = 32;
 const HEADER_FIXED_LEN: usize = 8 + 1 + 1 + 8 + 1; // magic..salt_len inclusive
 
+#[cfg(unix)]
+fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    meta.is_file().then(|| meta.nlink())
+}
+
+#[cfg(windows)]
+fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    meta.is_file().then(|| meta.number_of_links())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+    meta.is_file().then_some(2)
+}
+
+fn should_zero_before_unlink(meta: &fs::Metadata) -> bool {
+    matches!(regular_file_link_count(meta), Some(0 | 1))
+}
+
 /// Consecutive wrong passwords before the vault is destroyed.
 pub const MAX_ATTEMPTS: u8 = 5;
 /// Idle window after which the vault is reported as stale on next open.
@@ -374,7 +397,10 @@ impl EncryptedVault {
     /// share a directory entry with the vault — while reporting the vault destroyed.
     /// `fs::symlink_metadata` inspects the link itself rather than following it, so a
     /// symlink here is detected and the zero-fill is skipped entirely: there is
-    /// nothing belonging to the vault to shred.
+    /// nothing belonging to the vault to shred. Hard links need their own refusal for
+    /// the opposite reason: zeroing `self.path` would modify the shared inode and
+    /// therefore every sibling path too, so multi-linked regular files are also left
+    /// unwiped and only unlinked at this path.
     ///
     /// The unconditional `fs::remove_file` below is safe either way without any
     /// special-casing: `remove_file` unlinks the directory entry named `self.path`
@@ -385,12 +411,12 @@ impl EncryptedVault {
     /// vault destroy`) actually want.
     pub fn destroy(&self) {
         match fs::symlink_metadata(&self.path) {
-            Ok(meta) if !meta.file_type().is_symlink() => {
+            Ok(meta) if !meta.file_type().is_symlink() && should_zero_before_unlink(&meta) => {
                 let _ = fs::write(&self.path, vec![0u8; meta.len() as usize]);
             }
             _ => {
-                // Either a symlink (refuse to zero through it — see above) or the
-                // path is already gone; either way there is nothing safe to zero.
+                // Either a symlink, a multi-linked/unsupported-platform regular file,
+                // or the path is already gone; either way there is nothing safe to zero.
             }
         }
         let _ = fs::remove_file(&self.path);
@@ -407,7 +433,7 @@ impl EncryptedVault {
         // is a harmless no-op.
         let tmp = tmp_path_for(&self.path);
         match fs::symlink_metadata(&tmp) {
-            Ok(meta) if !meta.file_type().is_symlink() => {
+            Ok(meta) if !meta.file_type().is_symlink() && should_zero_before_unlink(&meta) => {
                 let _ = fs::write(&tmp, vec![0u8; meta.len() as usize]);
             }
             _ => {}
@@ -1223,6 +1249,30 @@ mod tests {
     }
 
     #[test]
+    fn destroy_refuses_to_zero_a_hard_links_other_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"payload", &pw).unwrap();
+
+        let raw = fs::read(vault.path()).unwrap();
+        let inspector = dir.path().join("vault.inspector");
+        fs::hard_link(vault.path(), &inspector).unwrap();
+
+        vault.destroy();
+
+        assert!(
+            !vault.path().exists(),
+            "destroy() must still unlink the configured vault path"
+        );
+        assert_eq!(
+            fs::read(&inspector).unwrap(),
+            raw,
+            "destroy() zeroed the shared inode behind a hard-linked vault"
+        );
+    }
+
+    #[test]
     fn destroy_leaves_a_crash_orphaned_tmp_file_with_the_secret_still_recoverable() {
         // `write_atomically` writes the new vault to `vault.enc.tmp` and only then
         // renames it over `vault.enc`. A crash or power loss between those two steps
@@ -1292,10 +1342,39 @@ mod tests {
         // not merely unlink it and leave the secret sitting in the freed disk blocks.
         // `remove_file` unlinks the `.tmp` path unconditionally either way, so
         // checking `!tmp.exists()` afterward (as the crash-orphan test above does)
-        // can't tell a zero-then-unlink from a bare unlink. To catch that, hard-link
-        // the `.tmp` file to a second path first: `fs::write` truncates and rewrites
-        // the *same inode* in place, so the hard link keeps observing that inode's
-        // bytes even after the original `.tmp` name is unlinked out from under it.
+        // can't tell a zero-then-unlink from a bare unlink. Open the file first and
+        // keep that descriptor alive across `destroy()`: on Unix, unlinking the path
+        // does not invalidate the already-open inode, so the descriptor still lets us
+        // inspect the bytes after the name is gone without introducing a second hard
+        // link (which is now itself something `destroy()` must refuse to zero).
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("pw".to_string());
+        vault.save(b"top secret transcript", &pw).unwrap();
+
+        let raw = fs::read(vault.path()).unwrap();
+        let tmp = tmp_path_for(vault.path());
+        fs::write(&tmp, &raw).unwrap();
+        let mut inspector = fs::File::open(&tmp).unwrap();
+
+        vault.destroy();
+
+        assert!(!tmp.exists(), "destroy() must still unlink the .tmp file");
+        inspector.seek(SeekFrom::Start(0)).unwrap();
+        let mut observed = Vec::new();
+        inspector.read_to_end(&mut observed).unwrap();
+        assert_eq!(
+            observed,
+            vec![0u8; raw.len()],
+            "destroy() unlinked the crash-orphaned .tmp file without zeroing it \
+             first — the secret is still fully recoverable from the freed blocks"
+        );
+    }
+
+    #[test]
+    fn destroy_refuses_to_zero_a_multi_linked_crash_orphaned_tmp_file() {
         let dir = tempfile::tempdir().unwrap();
         let vault = vault_in(&dir);
         let pw = SecretString::from("pw".to_string());
@@ -1312,9 +1391,8 @@ mod tests {
         assert!(!tmp.exists(), "destroy() must still unlink the .tmp file");
         assert_eq!(
             fs::read(&inspector).unwrap(),
-            vec![0u8; raw.len()],
-            "destroy() unlinked the crash-orphaned .tmp file without zeroing it \
-             first — the secret is still fully recoverable from the freed blocks"
+            raw,
+            "destroy() zeroed the shared inode behind a hard-linked tmp vault file"
         );
     }
 

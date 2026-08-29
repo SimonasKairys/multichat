@@ -34,6 +34,40 @@ const MAX_FILE_BYTES: usize = 256 * 1024;
 /// itself. Truncation is reported, not silent — see `list`.
 const MAX_LIST_ENTRIES: usize = 500;
 
+#[cfg(unix)]
+fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    meta.is_file().then(|| meta.nlink())
+}
+
+#[cfg(windows)]
+fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    meta.is_file().then(|| meta.number_of_links())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+    meta.is_file().then_some(2)
+}
+
+fn reject_multi_linked_regular_file(
+    meta: &fs::Metadata,
+    requested: &str,
+    action: &str,
+) -> Result<()> {
+    if let Some(count) = regular_file_link_count(meta)
+        && count > 1
+    {
+        return Err(anyhow!(
+            "project path `{requested}` has {count} hard links, refusing to {action} a multi-linked file"
+        ));
+    }
+    Ok(())
+}
+
 pub struct Workspace {
     root: PathBuf,
 }
@@ -122,6 +156,7 @@ impl Workspace {
         if !meta.is_file() {
             return Err(anyhow!("project path `{requested}` is not a file"));
         }
+        reject_multi_linked_regular_file(&meta, requested, "read")?;
         if meta.len() > MAX_FILE_BYTES as u64 {
             return Err(anyhow!(
                 "project file `{requested}` is {} bytes, over the {MAX_FILE_BYTES}-byte limit",
@@ -219,10 +254,11 @@ impl Workspace {
             ));
         }
         self.reject_git_writes(requested, candidate)?;
-        if let Ok(meta) = fs::symlink_metadata(self.root.join(candidate))
-            && meta.is_dir()
-        {
-            return Err(anyhow!("project path `{requested}` is a directory"));
+        if let Ok(meta) = fs::symlink_metadata(self.root.join(candidate)) {
+            if meta.is_dir() {
+                return Err(anyhow!("project path `{requested}` is a directory"));
+            }
+            reject_multi_linked_regular_file(&meta, requested, "write")?;
         }
         Ok(())
     }
@@ -418,6 +454,7 @@ impl Workspace {
             if meta.is_dir() {
                 return Err(anyhow!("project path `{requested}` is a directory"));
             }
+            reject_multi_linked_regular_file(&meta, requested, "write")?;
         }
 
         fs::write(&resolved, content)
@@ -619,6 +656,30 @@ mod tests {
         let err = w.write("link.txt", "clobbered").unwrap_err().to_string();
         assert!(err.contains("symlink"), "unexpected error: {err}");
         // The link's target must be untouched — the whole point of the refusal.
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "original");
+    }
+
+    #[test]
+    fn a_hard_link_target_is_refused_on_read() {
+        let (guard, w) = workspace();
+        let outside = guard.path().join("outside.txt");
+        fs::write(&outside, "secret").unwrap();
+        fs::hard_link(&outside, w.root().join("linked.txt")).unwrap();
+
+        let err = w.read("linked.txt").unwrap_err().to_string();
+        assert!(err.contains("hard links"), "unexpected error: {err}");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
+    }
+
+    #[test]
+    fn a_write_through_a_hard_linked_file_leaves_the_other_path_untouched() {
+        let (guard, w) = workspace();
+        let outside = guard.path().join("outside.txt");
+        fs::write(&outside, "original").unwrap();
+        fs::hard_link(&outside, w.root().join("linked.txt")).unwrap();
+
+        let err = w.write("linked.txt", "clobbered").unwrap_err().to_string();
+        assert!(err.contains("hard links"), "unexpected error: {err}");
         assert_eq!(fs::read_to_string(&outside).unwrap(), "original");
     }
 

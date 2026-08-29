@@ -1,11 +1,11 @@
 # Mutation Coverage Debt
 
-CI gates changed lines only. Full crate: 953 mutants, ~3.5h.
+CI gates changed lines. Full crate: ~953 mutants / ~3.5h, not recently re-measured.
 
-**Measured, 0 missed**: `workspace.rs`, `config.rs`.
-**Unmeasured**: everything else — `audit.rs`, `swarm.rs`, `orchestrator.rs`,
-`providers/*`, `security.rs`, `skills.rs`, `picker.rs`, `app.rs`, `ui/`.
-**Known debt**: ~13 in old `vault.rs` (`aad`, `parse_header`, `destroy`).
-**Skipped**: `Credentials::*` — OS keyring, absent on runners.
+2026-08-26 accumulated audit diff: 107 tested, 97 caught, 9 unviable, 1 equivalent
+survivor. This is diff evidence, not full-module coverage.
 
-RUSTFLAGS must be unset: `-D warnings` hides stub mutants as unviable.
+Remaining debt includes untouched provider/orchestrator/security paths and historical
+vault branches. `Credentials::*` is skipped where runners lack a keyring.
+
+Unset `RUSTFLAGS`: `-D warnings` can hide stub mutants as unviable.

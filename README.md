@@ -52,10 +52,19 @@ row marked `(no key stored)` to open a masked entry field instead of quitting to
 `simon auth`. Either way, the key lands in the OS keyring only — never in
 `config.json`.
 
-In the picker: **space** ticks a connection, **c** marks the highlighted row
-commander, **tab** cycles a candidate's transport, and **enter** connects — but only
+In the picker, status dots show **● connected/ready**, **○ not connected**, and
+**× connected but unavailable** (with the failure reason shown on that row).
+The same legend is used by `simon models` and `/commander`. These are discovery
+readiness states: `simon` never sends an automatic test prompt just to turn a dot
+green, because that could cost money or let an agentic CLI run tools.
+**Space** toggles a connection, **c** marks the highlighted row, **m** edits the exact
+model ID, **tab** cycles a candidate's transport, and **enter** connects — but only
 once a commander has been chosen; until then it just flashes a reminder to press
-**c**. `simon chat -m <label>` skips the picker and picks the commander
+**c**. Model editing works for every cloud API and for CLI providers with a model flag
+(all auto-detected CLIs); Ollama already exposes each installed model as its own row.
+For OpenRouter, enter an ID such as
+`anthropic/claude-sonnet-4`; submitting an empty model field restores the provider
+default. `simon chat -m <label>` skips the picker and picks the commander
 non-interactively instead.
 
 `chat` is the default subcommand, and its flags work without naming it: `simon --vault`
@@ -66,12 +75,11 @@ In the TUI: type and press **Enter** to send, **PageUp/PageDown** to scroll, **E
 caret, **Home/End** jump to either edge, **Backspace/Delete** cut on either side of it,
 and modified chords are not typed as text (a stray **Ctrl-A** used to insert a bare
 `a`). `/forget` clears the ledger's accumulated content when a long session has piled
-up more than the commander needs. Type `/commander` on its own to list every reachable
-model, marking the current commander, connected choices, and models that need to be
-connected through **Ctrl+O** first. `/commander <name>` (a full label, a bare model
-name, or a provider name) switches to any connected choice live, without leaving the
-conversation — the choice persists across restarts, same as the picker's. Neither form
-is ever sent to a model as a prompt.
+up more than the commander needs. Type `/commander` on its own to list every discovered
+model, including connected-but-unavailable choices and their reason. `/commander
+<name>` (a full label, a bare model name, or a provider name) switches to any connected
+choice live, without leaving the conversation — the choice persists across restarts,
+same as the picker's. Neither form is ever sent to a model as a prompt.
 
 `--vault` persists the TUI transcript — what you and the models said — to an encrypted
 file so it survives between runs of `simon chat --vault`. It is **not** conversation
@@ -110,8 +118,8 @@ endpoint.
     }
   },
   "local_binaries": {
-    "copilot-enterprise": { "path": "/opt/copilot/bin/copilot", "args": ["--silent", "--prompt"], "stream_format": "copilot" },
-    "claude": { "path": "/opt/claude/bin/claude", "stream_format": "claude" }
+    "copilot-enterprise": { "path": "/opt/copilot/bin/copilot", "args": ["--silent", "--prompt"], "model_arg": "--model", "stream_format": "copilot" },
+    "claude": { "path": "/opt/claude/bin/claude", "model_arg": "--model", "stream_format": "claude" }
   }
 }
 ```
@@ -276,7 +284,8 @@ rest of the session, so it is deliberately a separate tree from the project fold
 Models can list, read, and write files in the **project folder** — the directory `simon`
 was started in, or whatever `--project <dir>` points at. Every access goes through the
 same path-traversal hardening as the skills directory: `..`, absolute paths, and
-symlinks escaping the root are all rejected.
+symlinks escaping the root are all rejected. Multi-linked regular files are rejected
+too, because an in-root hard link can share an inode with a path outside the root.
 
 ```
 ACTION: list_files(notes)          # one directory's immediate entries
@@ -305,8 +314,10 @@ can corrupt the repository in ways you cannot easily undo. Reading `.git/` is no
 special-cased, since only a write can corrupt it.
 
 Everything is audited (`project.list`, `project.read`, `file.written`, and their
-`_failed` counterparts) and shown in the TUI as it happens. **The audit log and the
-ledger record paths, byte counts, and entry counts only — never file content.**
+`_failed` counterparts) and shown in the TUI as it happens. **The audit log records
+paths and counts only — never file content.** Successful reads enter the bounded ledger
+because that is how their content reaches the model; failed reads and listings enter it
+as bounded failure text, so they remain visible to the commander on its next turn.
 
 #### Writes are not applied silently
 
@@ -383,6 +394,12 @@ Progress details are third-party process output: control characters and newlines
 stripped and the length capped before they reach the TUI, and they are never written to
 the audit log, which stays limited to sizes, paths, and outcomes.
 
+Each logical NDJSON line is bounded before parsing as well. The line allowance is larger
+than the retained 1 MiB reply cap so a valid result with JSON escaping can still be
+decoded and then truncated normally; an even larger line fails explicitly rather than
+allocating without limit. A structured stream error is returned immediately, so a later
+idle or process-exit timeout cannot replace the real reason.
+
 The two paths are timed differently:
 
 - **Streaming**: an **idle timeout of 180s**, reset on every line the CLI emits, so an
@@ -448,13 +465,15 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   could have triggered exactly that, making a forged history look like ordinary
   corruption. A keyring entry that is present but unusable is now a hard error naming
   the service and what to do about it. An absent entry is still a normal first run.
-- **Symlinks are never followed where a file's identity is the point.** The vault's
+- **Links are refused where a file's identity is the point.** The vault's
   self-destruct used `fs::write`, which follows a link: pointing `vault.enc` at another
   file made the wipe zero *that* file and unlink only the link. The atomic writer took
   its permission bits through a link the same way, so `vault.enc` and `config.json`
   could land at 644 instead of owner-only. And a symlink named after anything, pointing
   at `.git`, let `create_dir_all` build directories inside the real repository before
-  the write was refused. All three now use `symlink_metadata` and refuse.
+  the write was refused. All three now use `symlink_metadata` and refuse. Skills and
+  project files also reject multi-linked regular files; vault destruction unlinks its
+  own path but never zeroes an inode shared by another hard link.
 - **`--classified`** — refuses any provider whose traffic leaves the machine, and
   requires process-wide memory locking to succeed rather than warning.
 - **Process-wide memory locking on Linux** — `mlockall` at startup (`main.rs`), pinning
@@ -475,9 +494,10 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   [Known limits](#known-limits-of-what-is-implemented)). `simon vault destroy` deletes
   it after a typed `yes`.
 - **Path-traversal protection** on the read-only skills directory: `..`, absolute paths,
-  and symlinks escaping the root are all rejected. This is reachable from model output
-  via `ACTION: read_skill(<name>)` (see [Skills](#skills)), not just from trusted
-  callers, so the rejection is load-bearing, not defensive dead code.
+  symlinks escaping the root, and multi-linked regular files are all rejected. This is
+  reachable from model output via `ACTION: read_skill(<name>)` (see [Skills](#skills)),
+  not just from trusted callers, so the rejection is load-bearing, not defensive dead
+  code.
 - **Model-initiated file listing, reading, and writing confined to the project
   folder** (see [Project files](#project-files)) — the same traversal hardening as
   skills (`..`, absolute paths, and symlinks escaping the root are all rejected),
@@ -610,12 +630,10 @@ was there. Both were caught by hand, by removing the fix and re-running.
 `cargo mutants` does that mechanically: it deletes a branch, flips a comparison or
 stubs a function, and reports anything the suite still accepts.
 
-It is scoped to the diff. A full run is 953 mutants, roughly three and a half hours,
-and it would fail immediately — `src/config.rs` alone has nine misses, among them
-`restrict_to_owner -> Ok(())`, which is the entire data-directory permission tightening
-deleted with nothing to notice. Those are worth closing, but blocking every push on a
-backlog that predates the check teaches people to ignore a red job. Requiring it of
-changed lines stops the backlog growing.
+It is scoped to the diff. A full run is about 953 mutants and roughly three and a half
+hours, so it is not the per-push gate. The 2026-08-26 audit re-measured its accumulated
+diff at 107 mutants: 97 caught, 9 unviable, and 1 equivalent survivor. Full-crate
+coverage remains a backlog; requiring changed lines stops that backlog growing.
 
 ## History
 
@@ -625,7 +643,9 @@ repository is still called `multichat`, after the Python project that used to li
 The repository previously held a Python/FastAPI implementation, replaced by this Rust
 one in commit `9a51fc6`. That version is recoverable at commit `06c6c76`.
 
-Two audits are current, and they split the tree rather than supersede each other.
+Three audits are retained. The latest, `docs/AUDIT-2026-08-26.md`, covers the complete
+Rust tree and now includes the follow-up reliability and boundary fixes verified after
+the original audit.
 `docs/AUDIT-2026-07-30.md` covers `9540ace` — the delegation, skills, and vault-wiring
 changes — and is the one the source cites: `src/swarm.rs` points at its §3.2,
 `src/orchestrator.rs` at its §3.5. `docs/AUDIT-2026-07-31.md` covers `6da2772`, a tree
@@ -633,12 +653,10 @@ whose `src/` differs from `9540ace` only in comment text, and deliberately reads
 the first one skimmed or never reached: `picker.rs`, `ui/`, `app.rs`, `config.rs`,
 `main.rs`, and the provider transports.
 
-Both describe a July tree. The code has moved since and later fixes live in the git
-history, not in these documents, so read their findings as claims to re-check rather
-than as current status. §3.2 and §3.3 of the 07-30 audit — the unbounded system prompt
-and the silently truncatable tail — are closed, and the sections above describe what
-replaced them. Others are still open, among them the non-atomic `Settings::save`
-(07-31 §3.4).
+The July documents describe historical trees, so read their findings as claims to
+re-check rather than current status. Their unbounded system prompt, silently
+truncatable audit tail, and non-atomic `Settings::save` findings are closed; the
+2026-08-26 audit and the sections above describe the current implementation.
 
 The two earlier audits (of the initial Rust commit and of `2cca5da`) described trees
 that no longer exist and were removed as superseded; both are recoverable at commit

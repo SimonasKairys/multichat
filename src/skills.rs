@@ -20,6 +20,36 @@ const MAX_SKILL_BYTES: u64 = 256 * 1024;
 /// keeps this cheap no matter how many skills or how large the files get.
 const FRONTMATTER_HEAD_BYTES: usize = 1024;
 
+#[cfg(unix)]
+fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    meta.is_file().then(|| meta.nlink())
+}
+
+#[cfg(windows)]
+fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    meta.is_file().then(|| meta.number_of_links())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+    meta.is_file().then_some(2)
+}
+
+fn reject_multi_linked_regular_file(meta: &fs::Metadata, requested: &str) -> Result<()> {
+    if let Some(count) = regular_file_link_count(meta)
+        && count > 1
+    {
+        return Err(anyhow!(
+            "skill `{requested}` has {count} hard links, refusing to read a multi-linked file"
+        ));
+    }
+    Ok(())
+}
+
 pub struct SkillsDir {
     root: PathBuf,
 }
@@ -137,6 +167,7 @@ impl SkillsDir {
         if !meta.is_file() {
             return Err(anyhow!("skill `{requested}` is not a file"));
         }
+        reject_multi_linked_regular_file(&meta, requested)?;
         if meta.len() > MAX_SKILL_BYTES {
             return Err(anyhow!(
                 "skill `{requested}` is {} bytes, over the {MAX_SKILL_BYTES}-byte limit",
@@ -193,6 +224,10 @@ impl SkillsDir {
         // ones — even though `read()` already refuses to serve the same file. Both
         // paths must agree on what's inside the root.
         let path = self.resolve(name).ok()?;
+        let meta = fs::metadata(&path).ok()?;
+        if !meta.is_file() || reject_multi_linked_regular_file(&meta, name).is_err() {
+            return None;
+        }
         let file = File::open(path).ok()?;
         // `Read::read` is allowed to return a short read even when more data is
         // available (a single syscall hitting a pipe buffer boundary, for example),
@@ -467,6 +502,25 @@ mod tests {
         let metas = s.list_with_descriptions().unwrap();
         let alias = metas.iter().find(|m| m.name == "alias.md").unwrap();
         assert_eq!(alias.description.as_deref(), Some("a real in-root skill"));
+    }
+
+    #[test]
+    fn a_hard_link_escaping_the_root_leaks_no_description_and_fails_to_read() {
+        let (guard, s) = skills();
+        let outside = guard.path().join("secret.md");
+        fs::write(
+            &outside,
+            "---\nname: secret\ndescription: LEAKED_FROM_OUTSIDE\n---\nbody\n",
+        )
+        .unwrap();
+        fs::hard_link(&outside, s.root().join("escape.md")).unwrap();
+
+        let metas = s.list_with_descriptions().unwrap();
+        let escape = metas.iter().find(|m| m.name == "escape.md").unwrap();
+        assert_eq!(escape.description, None);
+
+        let err = s.read("escape.md").unwrap_err().to_string();
+        assert!(err.contains("hard links"), "unexpected error: {err}");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::providers::{
@@ -20,6 +20,10 @@ use crate::providers::{
 
 /// Ceiling on captured output, so a runaway child cannot exhaust memory.
 const MAX_OUTPUT_BYTES: usize = 1 << 20;
+/// A structured JSON line includes escaping and envelope fields around the reply.
+/// Eight times the retained reply cap accommodates even heavily escaped text while
+/// still putting a hard bound on one logical line before it reaches serde_json.
+const MAX_STREAM_LINE_BYTES: usize = MAX_OUTPUT_BYTES * 8;
 
 /// Ceiling on how long a *non-streaming* CLI call may run. There is nothing to reset
 /// this clock on — a plain `claude -p` (no `--output-format stream-json`) buffers all
@@ -247,6 +251,63 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(reader: R, cap: usize) -> 
     (buf, drained > 0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamLineRead {
+    Eof,
+    Line { truncated: bool },
+}
+
+/// Reads one logical stdout line without ever retaining more than `cap` bytes of it.
+///
+/// `AsyncBufReadExt::read_until` keeps appending until it sees a delimiter or EOF, so
+/// a child that emits one giant line can force unbounded growth before any later
+/// `MAX_OUTPUT_BYTES` check gets a say. This keeps only the first `cap` bytes in
+/// memory, then drains the rest of the same line by consuming the reader directly so
+/// later lines (if any) are still aligned correctly. Like `read_capped` above, the
+/// drain is deliberate: dropping the reader at the cap would close the pipe under a
+/// child that is still writing and can turn its real exit into SIGPIPE.
+async fn read_stream_line_capped<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<StreamLineRead> {
+    buf.clear();
+    let mut truncated = false;
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() && !truncated {
+                StreamLineRead::Eof
+            } else {
+                StreamLineRead::Line { truncated }
+            });
+        }
+
+        let consumed = available
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(available.len());
+        let saw_newline = available.get(consumed.saturating_sub(1)) == Some(&b'\n');
+
+        let remaining = cap.saturating_sub(buf.len());
+        let kept = remaining.min(consumed);
+        if kept > 0 {
+            buf.extend_from_slice(&available[..kept]);
+        }
+        if kept < consumed {
+            truncated = true;
+        }
+
+        reader.consume(consumed);
+
+        if saw_newline {
+            return Ok(StreamLineRead::Line { truncated });
+        }
+    }
+}
+
 impl LocalBinaryProvider {
     /// Does the actual work of `Provider::send`, parameterised on the timeout so a
     /// test can use a short one instead of waiting out `CLI_TIMEOUT` for real —
@@ -466,7 +527,6 @@ impl LocalBinaryProvider {
         let mut stdout_reader = BufReader::new(stdout);
         let mut line_bytes = Vec::new();
         let mut result_text: Option<String> = None;
-        let mut stream_error: Option<String> = None;
         let mut assistant_text = String::new();
         let mut assistant_text_truncated = false;
         let mut usage = TokenUsage::default();
@@ -479,13 +539,10 @@ impl LocalBinaryProvider {
         tokio::pin!(total_deadline);
 
         loop {
-            line_bytes.clear();
-            // `read_until` is NOT cancellation-safe (unlike the `lines().next_line()`
-            // this replaced): if another `select!` branch wins, whatever it had already
-            // read into `line_bytes` is lost. That is sound only because every other
-            // branch below returns immediately instead of looping again. Anyone adding
-            // a branch that *continues* the loop has to move the read out of `select!`
-            // first, or it will silently drop a partially-read line of model output.
+            // `read_stream_line_capped` is not cancellation-safe for the same reason
+            // `read_until` is not: if another `select!` branch wins, any bytes it had
+            // already copied into `line_bytes` are lost. That is sound only because
+            // every other branch below returns immediately instead of looping again.
             tokio::select! {
                 biased;
                 _ = &mut total_deadline => {
@@ -500,7 +557,14 @@ impl LocalBinaryProvider {
                         total_timeout.as_secs()
                     )));
                 }
-                next = tokio::time::timeout(idle_timeout, stdout_reader.read_until(b'\n', &mut line_bytes)) => {
+                next = tokio::time::timeout(
+                    idle_timeout,
+                    read_stream_line_capped(
+                        &mut stdout_reader,
+                        &mut line_bytes,
+                        MAX_STREAM_LINE_BYTES,
+                    ),
+                ) => {
                     match next {
                         Err(_) => {
                             drop(child);
@@ -517,8 +581,16 @@ impl LocalBinaryProvider {
                                 format!("failed reading {} output", self.binary_path)
                             });
                         }
-                        Ok(Ok(0)) => break, // stdout closed: child is finishing up
-                        Ok(Ok(_)) => {
+                        Ok(Ok(StreamLineRead::Eof)) => break, // stdout closed: child is finishing up
+                        Ok(Ok(StreamLineRead::Line { truncated: true })) => {
+                            drop(child);
+                            return Err(anyhow!(
+                                "{} emitted a structured output line over {} bytes",
+                                self.binary_path,
+                                MAX_STREAM_LINE_BYTES
+                            ));
+                        }
+                        Ok(Ok(StreamLineRead::Line { truncated: false })) => {
                             let line = String::from_utf8_lossy(&line_bytes);
                             let line = line.trim_end_matches(['\r', '\n']);
                             usage.merge(parse_stream_usage(dialect, line));
@@ -538,11 +610,9 @@ impl LocalBinaryProvider {
                                     }
                                 }
                                 StreamLineEffect::Result(text) => result_text = Some(text),
-                                // Recorded rather than returned immediately: the
-                                // child is still running, and letting it exit on its
-                                // own keeps the `wait()` below meaningful.
                                 StreamLineEffect::Failure(reason) => {
-                                    stream_error = Some(reason);
+                                    drop(child);
+                                    return Err(anyhow!("{} failed: {}", self.binary_path, reason));
                                 }
                                 // A line that isn't valid JSON, or is JSON of a shape
                                 // this dialect doesn't recognise, is skipped silently
@@ -572,14 +642,6 @@ impl LocalBinaryProvider {
         };
 
         let stderr_text = stderr_task.await.unwrap_or_default();
-
-        // A reason reported in the stream beats both the exit status and stderr: an
-        // agentic CLI that fails a tool permission check exits non-zero with empty
-        // stderr, which on its own produces "exited with exit status: 1: " and tells
-        // the user nothing about what actually went wrong.
-        if let Some(reason) = stream_error {
-            return Err(anyhow!("{} failed: {}", self.binary_path, reason));
-        }
 
         if !status.success() {
             return Err(anyhow!(
@@ -2122,6 +2184,147 @@ mod tests {
             matches!(timeout, Some(crate::providers::ProviderFailure::Timeout)),
             "expected Timeout, got {timeout:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_copilot_session_error_preempts_idle_timeout() {
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec![
+                    "-c".into(),
+                    r#"printf '%s\n' '{"type":"session.error","data":{"message":"rate limit exceeded","errorType":"model"}}'; sleep 1"#
+                        .into(),
+                ],
+                system_arg: None,
+                dialect: Some(StreamDialect::CopilotJson),
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+
+        let err = p
+            .send_streaming_with_timeouts(
+                StreamDialect::CopilotJson,
+                None,
+                "ignored",
+                &ProgressSink::disconnected(),
+                Duration::from_millis(50),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        let timeout = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::providers::ProviderFailure>());
+        assert!(
+            !matches!(timeout, Some(crate::providers::ProviderFailure::Timeout)),
+            "structured stream error was masked by a timeout: {err:#}"
+        );
+        assert!(
+            err.to_string().contains("rate limit exceeded"),
+            "Copilot's session.error message was lost: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn streaming_copilot_session_error_preempts_post_stream_wait_timeout() {
+        let p = LocalBinaryProvider::new(
+            "sh",
+            "/bin/sh",
+            "sh",
+            PathBuf::from("."),
+            CliInvocation {
+                args: vec![
+                    "-c".into(),
+                    r#"printf '%s\n' '{"type":"session.error","data":{"message":"rate limit exceeded","errorType":"model"}}'; exec 1>&-; sleep 1"#
+                        .into(),
+                ],
+                system_arg: None,
+                dialect: Some(StreamDialect::CopilotJson),
+                workspace_arg: None,
+            },
+        )
+        .unwrap();
+
+        let err = p
+            .send_streaming_with_timeouts(
+                StreamDialect::CopilotJson,
+                None,
+                "ignored",
+                &ProgressSink::disconnected(),
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        let timeout = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<crate::providers::ProviderFailure>());
+        assert!(
+            !matches!(timeout, Some(crate::providers::ProviderFailure::Timeout)),
+            "structured stream error was masked while waiting for child exit: {err:#}"
+        );
+        assert!(
+            err.to_string().contains("rate limit exceeded"),
+            "Copilot's session.error message was lost: {err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn capped_stream_reader_bounds_an_oversized_unterminated_line_lossily() {
+        let bytes = "€".repeat((MAX_OUTPUT_BYTES / "€".len()) + 10).into_bytes();
+        let mut reader = BufReader::new(std::io::Cursor::new(bytes));
+        let mut line = Vec::new();
+
+        let first = read_stream_line_capped(&mut reader, &mut line, MAX_OUTPUT_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(first, StreamLineRead::Line { truncated: true });
+        assert_eq!(line.len(), MAX_OUTPUT_BYTES);
+        assert!(
+            String::from_utf8_lossy(&line).ends_with('�'),
+            "a cap landing mid-codepoint must remain UTF-8-lossy-safe"
+        );
+
+        let second = read_stream_line_capped(&mut reader, &mut line, MAX_OUTPUT_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(second, StreamLineRead::Eof);
+    }
+
+    #[tokio::test]
+    async fn a_structured_result_line_can_exceed_the_reply_cap_without_being_discarded() {
+        let response = "\"".repeat(MAX_OUTPUT_BYTES + 1);
+        let encoded = serde_json::json!({
+            "event": "result",
+            "result": {
+                "status": "SUCCESS",
+                "response": response,
+            }
+        })
+        .to_string();
+        assert!(encoded.len() > MAX_OUTPUT_BYTES);
+        assert!(encoded.len() < MAX_STREAM_LINE_BYTES);
+
+        let mut reader = BufReader::new(std::io::Cursor::new(encoded.into_bytes()));
+        let mut line = Vec::new();
+        assert_eq!(
+            read_stream_line_capped(&mut reader, &mut line, MAX_STREAM_LINE_BYTES)
+                .await
+                .unwrap(),
+            StreamLineRead::Line { truncated: false }
+        );
+        match parse_agy_line(&String::from_utf8(line).unwrap()) {
+            StreamLineEffect::Result(text) => assert_eq!(text.len(), MAX_OUTPUT_BYTES + 1),
+            other => panic!("large structured result was discarded: {other:?}"),
+        }
     }
 
     #[test]

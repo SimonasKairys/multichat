@@ -341,36 +341,30 @@ async fn list_models(settings: &Settings, classified: bool) -> Result<()> {
     // ones the picker has not enabled, distinguishing the two — not just the
     // filtered set `Registry::build` would actually connect.
     let candidates = crate::orchestrator::discover_candidates(settings, classified).await;
-    let first_run = settings.connections.is_empty();
+    let statuses = crate::orchestrator::candidate_statuses(&candidates, settings);
 
-    println!("Reachable models ([x] connected, [ ] available but not connected):");
-    let mut any = false;
-    for candidate in &candidates {
-        for option in &candidate.transports {
-            if !option.availability.is_available() {
-                continue;
-            }
-            any = true;
-            let label = crate::orchestrator::candidate_label(candidate, option, settings);
-            let enabled = first_run
-                || settings
-                    .connections
-                    .get(&candidate.id)
-                    .is_some_and(|c| c.enabled && c.transport == option.transport);
-            let checkbox = if enabled { "[x]" } else { "[ ]" };
-            // Only the row actually enabled with this transport can be the
-            // commander — a vendor with both a CLI and an API row must not show
-            // "(commander)" on both just because the id matches.
-            let commander =
-                if enabled && settings.commander.as_deref() == Some(candidate.id.as_str()) {
-                    "  (commander)"
-                } else {
-                    ""
-                };
-            println!("  {checkbox} {label}{commander}");
-        }
+    println!("Models: ● connected/ready, ○ not connected, × connected but unavailable");
+    for model in &statuses {
+        let commander = if model.state.is_connected()
+            && model.matches_commander(settings.commander.as_deref())
+        {
+            "  (commander)"
+        } else {
+            ""
+        };
+        let reason = model
+            .reason
+            .as_deref()
+            .map(|reason| format!(" — {reason}"))
+            .unwrap_or_default();
+        println!(
+            "  {} {} — {}{commander}{reason}",
+            model.state.symbol(),
+            model.label,
+            model.state.description()
+        );
     }
-    if !any {
+    if statuses.is_empty() {
         println!("  (none)");
     }
     Ok(())
@@ -457,14 +451,14 @@ async fn chat(
     }
 
     let candidates = crate::orchestrator::discover_candidates(&settings, classified).await;
-    let available_models = crate::orchestrator::available_candidate_labels(&candidates, &settings);
+    let model_statuses = crate::orchestrator::candidate_statuses(&candidates, &settings);
     let registry =
         Registry::build_discovered(&settings, model, classified, project_root, candidates)?;
     let primary = registry.primary().to_string();
     let roster = registry.labels();
 
     let mut app = App::new(primary, &roster, project_root.display().to_string());
-    app.set_available_models(available_models);
+    app.set_model_statuses(model_statuses);
 
     // Password prompting and all vault I/O happen here — before the picker's result
     // is wired to a running orchestrator and, crucially, before `ui::run` ever calls

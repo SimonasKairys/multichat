@@ -227,6 +227,10 @@ pub struct LocalBinarySpec {
     pub path: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Flag used to choose a model, for example `--model`. Known built-in CLIs get
+    /// their native default automatically; custom binaries can opt in here.
+    #[serde(default)]
+    pub model_arg: Option<String>,
     /// The flag this CLI uses to accept a system prompt, e.g. `--system-prompt` for
     /// `claude`. `None` means the CLI has no such flag (e.g. `gemini`), so the system
     /// text is folded into the prompt instead — see `LocalBinaryProvider::send`.
@@ -653,6 +657,23 @@ mod tests {
         assert!(settings.connections.is_empty());
         assert!(settings.commander.is_none());
         assert_eq!(settings.ollama_host, "http://127.0.0.1:11434");
+    }
+
+    #[test]
+    fn a_local_binary_without_model_arg_still_parses() {
+        let settings: Settings = serde_json::from_str(
+            r#"{
+                "local_binaries": {
+                    "custom": {
+                        "path": "/usr/bin/custom",
+                        "args": ["--prompt"]
+                    }
+                }
+            }"#,
+        )
+        .expect("model_arg is optional for existing config files");
+
+        assert_eq!(settings.local_binaries["custom"].model_arg, None);
     }
 
     #[test]

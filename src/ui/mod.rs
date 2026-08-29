@@ -302,6 +302,11 @@ async fn run_picker(
                                     }
                                     PickerKeyOutcome::Cancel | PickerKeyOutcome::Continue => {}
                                 }
+                            } else if state.model_entry().is_some() {
+                                match handle_picker_key(state, key.code, key.modifiers) {
+                                    PickerKeyOutcome::Submit => state.submit_model_entry(),
+                                    PickerKeyOutcome::Cancel | PickerKeyOutcome::Continue => {}
+                                }
                             } else {
                                 match handle_picker_key(state, key.code, key.modifiers) {
                                     PickerKeyOutcome::Submit => {
@@ -387,6 +392,29 @@ pub(crate) fn handle_picker_key(
             }
             _ => PickerKeyOutcome::Continue,
         }
+    } else if state.model_entry().is_some() {
+        match code {
+            KeyCode::Esc => {
+                state.cancel_model_entry();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                state.cancel_model_entry();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Backspace => {
+                state.backspace_model();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Enter => PickerKeyOutcome::Submit,
+            KeyCode::Char(c) if !modifiers.contains(KeyModifiers::CONTROL) => {
+                state.push_model_char(c);
+                PickerKeyOutcome::Continue
+            }
+            _ => PickerKeyOutcome::Continue,
+        }
     } else {
         match code {
             KeyCode::Up => {
@@ -419,6 +447,12 @@ pub(crate) fn handle_picker_key(
             // would make plain `c` and Ctrl+C do the same thing.
             KeyCode::Char('c') | KeyCode::Char('C') => {
                 state.set_commander();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Char('m') | KeyCode::Char('M')
+                if !modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                state.start_model_entry();
                 PickerKeyOutcome::Continue
             }
             KeyCode::Enter => PickerKeyOutcome::Submit,
@@ -543,8 +577,11 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         .split(frame.area());
 
     let history_body = app.body();
-    let total_lines = history_body.lines().count();
     let history_interior_height = chunks[0].height.saturating_sub(2) as usize;
+    let history_interior_width = chunks[0].width.saturating_sub(2);
+    let total_lines = Paragraph::new(history_body.as_str())
+        .wrap(Wrap { trim: false })
+        .line_count(history_interior_width);
     let base_scroll = total_lines.saturating_sub(history_interior_height);
     let effective_scroll = base_scroll.saturating_sub(app.scroll as usize) as u16;
 
@@ -642,17 +679,22 @@ fn draw_picker(frame: &mut ratatui::Frame, picker: Option<&PickerState>) {
 
     // Key entry takes over the hint/flash line with a masked prompt — never the
     // typed characters themselves, only a `•` per character typed so far.
-    let hint = match picker.and_then(|p| p.key_entry()) {
-        Some((id, len)) => format!(
+    let hint = if let Some((id, len)) = picker.and_then(|p| p.key_entry()) {
+        format!(
             "API key for {id} (stored in OS keyring, never in config; enter confirms, esc cancels): {}",
             "•".repeat(len)
-        ),
-        None => picker
+        )
+    } else if let Some((id, current, buffer)) = picker.and_then(|p| p.model_entry()) {
+        format!(
+            "Model for {id} (current: {current}; type exact id, empty = default; enter confirms, esc cancels): {buffer}"
+        )
+    } else {
+        picker
             .and_then(|p| p.flash.as_deref())
             .map(str::to_string)
             .unwrap_or_else(|| {
-                "space toggle · c commander · tab transport · enter connect · q quit".to_string()
-            }),
+                "● connected · ○ not connected · × unavailable   space toggle · c commander · m model · tab transport · enter connect · q quit".to_string()
+            })
     };
     frame.render_widget(Paragraph::new(hint), chunks[1]);
 }
@@ -693,11 +735,7 @@ fn render_picker_body_with_cursor(picker: &PickerState) -> (String, usize) {
         }
 
         let option = &candidate.transports[row.transport];
-        let checkbox = if picker.is_checked(row.candidate, row.transport) {
-            "[x]"
-        } else {
-            "[ ]"
-        };
+        let state = picker.connection_state(row.candidate, row.transport);
         let is_current = picker.cursor() == line_idx;
         let cursor = if is_current {
             cursor_line = current_line;
@@ -711,7 +749,7 @@ fn render_picker_body_with_cursor(picker: &PickerState) -> (String, usize) {
             format!("  {}", option.label)
         };
         let commander = if picker.is_commander(row.candidate, row.transport) {
-            "  ● commander"
+            "  ★ commander"
         } else {
             ""
         };
@@ -721,8 +759,10 @@ fn render_picker_body_with_cursor(picker: &PickerState) -> (String, usize) {
         };
 
         out.push_str(&format!(
-            "{cursor}{checkbox} {}{label}   {}{commander}{reason}\n",
-            candidate.model, option.detail
+            "{cursor}{} {}{label}   {}{commander}{reason}\n",
+            state.symbol(),
+            picker.display_model(row.candidate, row.transport),
+            option.detail
         ));
         current_line += 1;
     }
@@ -825,6 +865,34 @@ mod tests {
     }
 
     #[test]
+    fn draw_shows_the_tail_of_a_long_wrapped_reply_at_scroll_zero() {
+        let mut app = App::new("copilot", &[], ".".to_string());
+        app.transcript.push(crate::app::Line {
+            speaker: crate::app::Speaker::Model("copilot".into()),
+            text: format!("{} TAIL_MARKER", "long response ".repeat(24)),
+        });
+        assert_eq!(app.scroll, 0);
+
+        let backend = TestBackend::new(30, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut rendered = String::new();
+        for y in 1..4 {
+            for x in 1..29 {
+                rendered.push_str(buffer.cell((x, y)).unwrap().symbol());
+            }
+            rendered.push('\n');
+        }
+
+        assert!(
+            rendered.contains("TAIL_MARKER"),
+            "the final wrapped line must remain visible at scroll zero, but rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
     fn picker_scroll_offset_never_scrolls_when_the_interior_has_no_rows() {
         // Pins `interior_height > 0`: with zero interior rows there is nothing to
         // scroll into view, so the offset must stay 0 no matter how far down the
@@ -887,6 +955,83 @@ mod tests {
             "wrong row marked as current: {marked:?}"
         );
         assert_eq!(lines[cursor_line], *marked[0]);
+    }
+
+    #[test]
+    fn render_picker_body_shows_all_three_connection_states() {
+        use crate::config::ConnectionSpec;
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+        let candidates = vec![
+            Candidate {
+                id: "ready".to_string(),
+                group: "MODELS".to_string(),
+                model: "ready".to_string(),
+                transports: vec![TransportOption {
+                    transport: None,
+                    label: String::new(),
+                    detail: String::new(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                }],
+            },
+            Candidate {
+                id: "idle".to_string(),
+                group: "MODELS".to_string(),
+                model: "idle".to_string(),
+                transports: vec![TransportOption {
+                    transport: None,
+                    label: String::new(),
+                    detail: String::new(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                }],
+            },
+            Candidate {
+                id: "broken".to_string(),
+                group: "MODELS".to_string(),
+                model: "broken".to_string(),
+                transports: vec![TransportOption {
+                    transport: None,
+                    label: String::new(),
+                    detail: String::new(),
+                    availability: Availability::Unavailable("daemon is down".to_string()),
+                    cli: None,
+                    needs_key: false,
+                }],
+            },
+        ];
+        let connections = [
+            (
+                "ready".to_string(),
+                ConnectionSpec {
+                    enabled: true,
+                    transport: None,
+                    path: None,
+                    model: None,
+                },
+            ),
+            (
+                "broken".to_string(),
+                ConnectionSpec {
+                    enabled: true,
+                    transport: None,
+                    path: None,
+                    model: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let picker = PickerState::new(candidates, &connections, None, false);
+
+        let (body, _) = render_picker_body_with_cursor(&picker);
+
+        assert!(body.contains("● ready"));
+        assert!(body.contains("○ idle"));
+        assert!(body.contains("× broken"));
+        assert!(body.contains("(daemon is down)"));
     }
 
     #[test]
@@ -1281,6 +1426,46 @@ mod tests {
             picker.is_commander(0, 0),
             "plain 'c' must set the highlighted row as commander"
         );
+    }
+
+    #[test]
+    fn handle_picker_key_m_edits_an_api_model() {
+        use crate::config::Transport;
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+
+        let candidate = Candidate {
+            id: "openrouter".into(),
+            group: "OPENROUTER".into(),
+            model: "openai/gpt-4o".into(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://openrouter.ai/api/v1".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        };
+        let mut picker = PickerState::new(
+            vec![candidate],
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+        );
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Char('m'), KeyModifiers::NONE);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert!(picker.model_entry().is_some());
+
+        for c in "anthropic/claude-sonnet-4".chars() {
+            let outcome = handle_picker_key(&mut picker, KeyCode::Char(c), KeyModifiers::NONE);
+            assert_eq!(outcome, PickerKeyOutcome::Continue);
+        }
+        let outcome = handle_picker_key(&mut picker, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(outcome, PickerKeyOutcome::Submit);
+        picker.submit_model_entry();
+
+        assert_eq!(picker.display_model(0, 0), "anthropic/claude-sonnet-4");
     }
 
     #[test]

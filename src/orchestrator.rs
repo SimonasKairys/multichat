@@ -243,7 +243,7 @@ pub enum Event {
     Reconfigured {
         primary: String,
         roster: Vec<String>,
-        available_models: Vec<String>,
+        model_statuses: Vec<ModelStatus>,
     },
     /// `/commander <name>` resolved and switched the primary. `connection_id` is
     /// `settings.commander`'s key (see `Registry::connection_id`'s doc comment for
@@ -603,6 +603,71 @@ impl Availability {
     pub fn is_available(&self) -> bool {
         matches!(self, Availability::Available)
     }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Availability::Available => None,
+            Availability::Unavailable(reason) => Some(reason),
+        }
+    }
+}
+
+/// User-facing state for one candidate transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Connected,
+    NotConnected,
+    ConnectedUnavailable,
+}
+
+impl ConnectionState {
+    pub fn from_availability(connected: bool, availability: &Availability) -> Self {
+        match (connected, availability.is_available()) {
+            (true, true) => Self::Connected,
+            (true, false) => Self::ConnectedUnavailable,
+            (false, _) => Self::NotConnected,
+        }
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Connected => "●",
+            Self::NotConnected => "○",
+            Self::ConnectedUnavailable => "×",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Connected => "connected/ready",
+            Self::NotConnected => "not connected",
+            Self::ConnectedUnavailable => "connected but unavailable",
+        }
+    }
+
+    pub fn is_connected(self) -> bool {
+        matches!(self, Self::Connected | Self::ConnectedUnavailable)
+    }
+}
+
+/// Status metadata shared by `simon models`, `/commander`, and reconfiguration
+/// events so those surfaces cannot disagree about the same connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelStatus {
+    pub connection_id: String,
+    pub label: String,
+    pub transport: Option<Transport>,
+    pub state: ConnectionState,
+    pub reason: Option<String>,
+}
+
+impl ModelStatus {
+    pub fn matches_commander(&self, commander: Option<&str>) -> bool {
+        commander.is_some_and(|commander| {
+            self.connection_id.eq_ignore_ascii_case(commander)
+                || self.label.eq_ignore_ascii_case(commander)
+        })
+    }
 }
 
 /// Enough to construct a `LocalBinaryProvider` for a CLI transport option, captured
@@ -612,6 +677,8 @@ pub struct CliSpec {
     pub binary_name: String,
     pub path: String,
     pub args: Vec<String>,
+    /// Flag used to select an explicit model, when this CLI supports one.
+    pub model_arg: Option<String>,
     pub system_arg: Option<String>,
     /// `Some` when this CLI's stdout is a recognised NDJSON progress dialect;
     /// resolved once here (from `known_cli_default` or a validated
@@ -707,6 +774,7 @@ fn cli_vendor_id(binary_name: &str) -> String {
 /// call site says nothing about which `Option<String>` is which.
 struct CliDefaults {
     args: Vec<String>,
+    model_arg: Option<String>,
     system_arg: Option<String>,
     dialect: Option<StreamDialect>,
     /// The flag that declares an additional directory the CLI may work in.
@@ -730,6 +798,7 @@ fn known_cli_default(binary_name: &str) -> CliDefaults {
                 "stream-json".into(),
                 "--verbose".into(),
             ],
+            model_arg: Some("--model".into()),
             system_arg: Some("--system-prompt".into()),
             dialect: Some(StreamDialect::ClaudeJson),
             workspace_arg: Some("--add-dir".into()),
@@ -750,6 +819,7 @@ fn known_cli_default(binary_name: &str) -> CliDefaults {
                 "stream-json".into(),
                 "-p".into(),
             ],
+            model_arg: Some("--model".into()),
             system_arg: None,
             dialect: Some(StreamDialect::AgyJson),
             workspace_arg: Some("--add-dir".into()),
@@ -764,12 +834,28 @@ fn known_cli_default(binary_name: &str) -> CliDefaults {
                 "--silent".into(),
                 "--prompt".into(),
             ],
+            model_arg: Some("--model".into()),
             system_arg: None,
             dialect: Some(StreamDialect::CopilotJson),
             workspace_arg: Some("--add-dir".into()),
         },
+        "codex" => CliDefaults {
+            args: vec!["exec".into()],
+            model_arg: Some("--model".into()),
+            system_arg: None,
+            dialect: None,
+            workspace_arg: None,
+        },
+        "llm" => CliDefaults {
+            args: Vec::new(),
+            model_arg: Some("--model".into()),
+            system_arg: None,
+            dialect: None,
+            workspace_arg: None,
+        },
         _ => CliDefaults {
             args: Vec::new(),
+            model_arg: None,
             system_arg: None,
             dialect: None,
             workspace_arg: None,
@@ -812,6 +898,10 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
             binary_name: name.clone(),
             path: spec.path.clone(),
             args: spec.args.clone(),
+            model_arg: spec
+                .model_arg
+                .clone()
+                .or_else(|| known_cli_default(name).model_arg),
             system_arg: spec.system_arg.clone(),
             dialect,
             // Tied to the declared dialect rather than the entry's name: a recognised
@@ -827,12 +917,19 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
         if configured.contains(*name) {
             continue;
         }
-        if let Some(path) = which_on_path(name) {
+        let id = cli_vendor_id(name);
+        let saved_path = settings
+            .connections
+            .get(&id)
+            .filter(|connection| connection.transport == Some(Transport::Cli))
+            .and_then(|connection| connection.path.clone());
+        if let Some(path) = saved_path.or_else(|| which_on_path(name)) {
             let defaults = known_cli_default(name);
             found.push(CliSpec {
                 binary_name: name.to_string(),
                 path,
                 args: defaults.args,
+                model_arg: defaults.model_arg,
                 system_arg: defaults.system_arg,
                 dialect: defaults.dialect,
                 workspace_arg: defaults.workspace_arg,
@@ -841,6 +938,15 @@ fn detect_cli_tools(settings: &Settings) -> Vec<CliSpec> {
     }
 
     found
+}
+
+fn cli_is_available(path: &str) -> bool {
+    let path = Path::new(path);
+    if path.components().count() > 1 {
+        is_executable_file(path)
+    } else {
+        which_on_path(path.to_string_lossy().as_ref()).is_some()
+    }
 }
 
 /// Minimal `which`: scans `PATH` for an executable regular file named `name`, including
@@ -917,46 +1023,84 @@ async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate
         // non-loopback `ollama_host` must not get to make an outbound request just
         // to be told no. This is finding 1.2 of the 2026-07-29 audit (doc removed
         // as superseded; recoverable at commit `2e7984e`).
-        return vec![Candidate {
-            id: "ollama".into(),
-            group: "OLLAMA".into(),
-            // No model list was fetched, so name the daemon itself rather than
-            // rendering a row that begins with a blank column.
-            model: "daemon".into(),
-            transports: vec![TransportOption {
-                transport: None,
-                label: String::new(),
-                detail: settings.ollama_host.clone(),
-                availability: Availability::Unavailable(
-                    "remote Ollama hosts are refused under --classified".into(),
-                ),
-                cli: None,
-                needs_key: false,
-            }],
-        }];
+        return unavailable_ollama_candidates(
+            settings,
+            "remote Ollama hosts are refused under --classified".into(),
+        );
     }
 
     let Ok(client) = http_client(classified) else {
         return Vec::new();
     };
     match OllamaProvider::list_models(&settings.ollama_host, &client).await {
-        Ok(models) => models
-            .into_iter()
-            .map(|model| Candidate {
-                id: format!("ollama:{model}"),
-                group: "OLLAMA".into(),
-                model,
-                transports: vec![TransportOption {
-                    transport: None,
-                    label: String::new(),
-                    detail: settings.ollama_host.clone(),
-                    availability: Availability::Available,
-                    cli: None,
-                    needs_key: false,
-                }],
-            })
-            .collect(),
-        Err(e) => vec![Candidate {
+        Ok(models) => {
+            let mut candidates = models
+                .into_iter()
+                .map(|model| Candidate {
+                    id: format!("ollama:{model}"),
+                    group: "OLLAMA".into(),
+                    model,
+                    transports: vec![TransportOption {
+                        transport: None,
+                        label: String::new(),
+                        detail: settings.ollama_host.clone(),
+                        availability: Availability::Available,
+                        cli: None,
+                        needs_key: false,
+                    }],
+                })
+                .collect::<Vec<_>>();
+            let discovered = candidates
+                .iter()
+                .map(|candidate| candidate.id.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let missing = settings
+                .connections
+                .keys()
+                .filter(|id| id.starts_with("ollama:") && !discovered.contains(id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            for id in missing {
+                let model = id
+                    .strip_prefix("ollama:")
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or("unknown")
+                    .to_string();
+                candidates.push(Candidate {
+                    id,
+                    group: "OLLAMA".into(),
+                    model,
+                    transports: vec![TransportOption {
+                        transport: None,
+                        label: String::new(),
+                        detail: settings.ollama_host.clone(),
+                        availability: Availability::Unavailable(
+                            "model is not installed in Ollama".into(),
+                        ),
+                        cli: None,
+                        needs_key: false,
+                    }],
+                });
+            }
+            candidates
+        }
+        Err(e) => unavailable_ollama_candidates(settings, format!("unreachable: {e}")),
+    }
+}
+
+fn unavailable_ollama_candidates(settings: &Settings, reason: String) -> Vec<Candidate> {
+    let saved = settings
+        .connections
+        .keys()
+        .filter_map(|id| {
+            id.strip_prefix("ollama:")
+                .filter(|model| !model.is_empty())
+                .map(|model| (id.clone(), model.to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    if saved.is_empty() {
+        return vec![Candidate {
             id: "ollama".into(),
             group: "OLLAMA".into(),
             model: "daemon".into(),
@@ -964,18 +1108,41 @@ async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate
                 transport: None,
                 label: String::new(),
                 detail: settings.ollama_host.clone(),
-                availability: Availability::Unavailable(format!("unreachable: {e}")),
+                availability: Availability::Unavailable(reason),
                 cli: None,
                 needs_key: false,
             }],
-        }],
+        }];
     }
+
+    saved
+        .into_iter()
+        .map(|(id, model)| Candidate {
+            id,
+            group: "OLLAMA".into(),
+            model,
+            transports: vec![TransportOption {
+                transport: None,
+                label: String::new(),
+                detail: settings.ollama_host.clone(),
+                availability: Availability::Unavailable(reason.clone()),
+                cli: None,
+                needs_key: false,
+            }],
+        })
+        .collect()
 }
 
 fn discover_vendors(settings: &Settings, classified: bool) -> Vec<Candidate> {
     let cli_tools = detect_cli_tools(settings);
 
     let mut ids: Vec<String> = Vec::new();
+    for (id, connection) in &settings.connections {
+        if connection.transport.is_some() && !ids.iter().any(|known| known.eq_ignore_ascii_case(id))
+        {
+            ids.push(id.clone());
+        }
+    }
     for custom in settings.custom_endpoints.keys() {
         if !ids.iter().any(|id| id.eq_ignore_ascii_case(custom)) {
             ids.push(custom.clone());
@@ -1046,8 +1213,20 @@ fn build_vendor_candidate(
 
     let cli = cli_tools
         .iter()
-        .find(|c| cli_vendor_id(&c.binary_name).eq_ignore_ascii_case(id));
-    if let Some(cli) = cli {
+        .find(|c| cli_vendor_id(&c.binary_name).eq_ignore_ascii_case(id))
+        .cloned()
+        .map(|mut cli| {
+            if let Some(saved_path) = settings
+                .connections
+                .get(id)
+                .filter(|connection| connection.transport == Some(Transport::Cli))
+                .and_then(|connection| connection.path.as_ref())
+            {
+                cli.path = saved_path.clone();
+            }
+            cli
+        });
+    if let Some(cli) = cli.as_ref() {
         // `local_binary` is already `is_remote() -> true`, so under --classified this
         // must render unavailable with a reason rather than being silently dropped
         // (or, worse, constructed and only excluded via the primary check).
@@ -1055,6 +1234,11 @@ fn build_vendor_candidate(
             Availability::Unavailable(
                 "CLI tools may reach the network and are refused under --classified".into(),
             )
+        } else if !cli_is_available(&cli.path) {
+            Availability::Unavailable(format!(
+                "CLI executable is missing or not executable: {}",
+                cli.path
+            ))
         } else {
             Availability::Available
         };
@@ -1068,13 +1252,66 @@ fn build_vendor_candidate(
         });
     }
 
+    if let Some(connection) = settings.connections.get(id)
+        && connection.transport.is_some()
+        && !transports
+            .iter()
+            .any(|option| option.transport == connection.transport)
+    {
+        match connection.transport {
+            Some(Transport::Api) => transports.push(TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "(endpoint no longer configured)".into(),
+                availability: Availability::Unavailable(
+                    "cloud endpoint is no longer configured".into(),
+                ),
+                cli: None,
+                needs_key: false,
+            }),
+            Some(Transport::Cli) => {
+                let binary_name = match id {
+                    "anthropic" => "claude",
+                    "google" => "gemini",
+                    other => other,
+                };
+                let defaults = known_cli_default(binary_name);
+                let path = connection.path.clone().unwrap_or_default();
+                transports.push(TransportOption {
+                    transport: Some(Transport::Cli),
+                    label: "via CLI".into(),
+                    detail: if path.is_empty() {
+                        "(saved CLI path missing)".into()
+                    } else {
+                        path.clone()
+                    },
+                    availability: Availability::Unavailable(
+                        "CLI is no longer configured or detected".into(),
+                    ),
+                    cli: Some(CliSpec {
+                        binary_name: binary_name.to_string(),
+                        path,
+                        args: defaults.args,
+                        model_arg: defaults.model_arg,
+                        system_arg: defaults.system_arg,
+                        dialect: defaults.dialect,
+                        workspace_arg: defaults.workspace_arg,
+                    }),
+                    needs_key: false,
+                });
+            }
+            None => {}
+        }
+    }
+
     if transports.is_empty() {
         return None;
     }
 
-    let model = cli
-        .map(|c| c.binary_name.clone())
-        .or_else(|| settings.endpoint(id).map(|e| e.default_model))
+    let model = settings
+        .endpoint(id)
+        .map(|e| e.default_model)
+        .or_else(|| cli.as_ref().map(|c| c.binary_name.clone()))
         .unwrap_or_else(|| id.to_string());
 
     Some(Candidate {
@@ -1131,22 +1368,44 @@ pub fn candidate_label(
     }
 }
 
-/// Every currently reachable candidate/transport label, including models that are
-/// available but not enabled in the saved connection set.
-pub fn available_candidate_labels(candidates: &[Candidate], settings: &Settings) -> Vec<String> {
-    let mut labels = candidates
-        .iter()
-        .flat_map(|candidate| {
-            candidate
-                .transports
-                .iter()
-                .filter(|option| option.availability.is_available())
-                .map(|option| candidate_label(candidate, option, settings))
-        })
-        .collect::<Vec<_>>();
-    labels.sort();
-    labels.dedup();
-    labels
+/// Classifies every discovered candidate transport using the same first-run and
+/// saved-selection rules as `PickerState` and `Registry`.
+pub fn candidate_statuses(candidates: &[Candidate], settings: &Settings) -> Vec<ModelStatus> {
+    let first_run = settings.connections.is_empty();
+    let mut statuses = Vec::new();
+
+    for candidate in candidates {
+        let first_available = candidate
+            .transports
+            .iter()
+            .position(|option| option.availability.is_available());
+        for (option_index, option) in candidate.transports.iter().enumerate() {
+            let connected = if first_run {
+                first_available == Some(option_index)
+            } else {
+                settings
+                    .connections
+                    .get(&candidate.id)
+                    .is_some_and(|connection| {
+                        connection.enabled && connection.transport == option.transport
+                    })
+            };
+            statuses.push(ModelStatus {
+                connection_id: candidate.id.clone(),
+                label: candidate_label(candidate, option, settings),
+                transport: option.transport,
+                state: ConnectionState::from_availability(connected, &option.availability),
+                reason: option.availability.reason().map(str::to_string),
+            });
+        }
+    }
+
+    statuses.sort_by(|left, right| {
+        left.label
+            .cmp(&right.label)
+            .then_with(|| left.connection_id.cmp(&right.connection_id))
+    });
+    statuses
 }
 
 fn transport_tag(transport: Option<Transport>) -> &'static str {
@@ -1155,6 +1414,25 @@ fn transport_tag(transport: Option<Transport>) -> &'static str {
         Some(Transport::Cli) => "cli",
         Some(Transport::Api) => "api",
     }
+}
+
+/// Builds a CLI's fixed argv prefix, adding an explicit model before any
+/// prompt-taking flag such as agy's trailing `-p`.
+fn cli_args_with_model(cli: &CliSpec, model: Option<&str>) -> Vec<String> {
+    let mut args = cli.args.clone();
+    if let (Some(model_arg), Some(model)) = (
+        cli.model_arg.as_deref(),
+        model.map(str::trim).filter(|model| !model.is_empty()),
+    ) {
+        // Subcommand-based CLIs (notably `codex exec`) need the subcommand first;
+        // flag-first CLIs (`copilot`, `claude`, `agy`, `llm`) insert at zero.
+        let insert_at = usize::from(args.first().is_some_and(|arg| !arg.starts_with('-')));
+        args.splice(
+            insert_at..insert_at,
+            [model_arg.to_string(), model.to_string()],
+        );
+    }
+    args
 }
 
 /// Builds one provider from a chosen candidate, transport, and any per-connection
@@ -1205,13 +1483,14 @@ fn construct_provider(
                 .model
                 .clone()
                 .unwrap_or_else(|| cli.binary_name.clone());
+            let args = cli_args_with_model(cli, conn.model.as_deref());
             let p = LocalBinaryProvider::new(
                 &cli.binary_name,
                 &path,
                 &model,
                 project_root.to_path_buf(),
                 CliInvocation {
-                    args: cli.args.clone(),
+                    args,
                     system_arg: cli.system_arg.clone(),
                     dialect: cli.dialect,
                     workspace_arg: cli.workspace_arg.clone(),
@@ -1681,7 +1960,7 @@ impl Orchestrator {
     /// reality.
     async fn reconfigure(&mut self, settings: Settings) {
         let candidates = discover_candidates(&settings, self.classified).await;
-        let available_models = available_candidate_labels(&candidates, &settings);
+        let model_statuses = candidate_statuses(&candidates, &settings);
         match Registry::build_discovered(
             &settings,
             None,
@@ -1703,7 +1982,7 @@ impl Orchestrator {
                 self.emit(Event::Reconfigured {
                     primary: self.registry.primary().to_string(),
                     roster: self.registry.labels(),
-                    available_models,
+                    model_statuses,
                 })
                 .await;
             }
@@ -2094,6 +2373,11 @@ impl Orchestrator {
                         "skill.read_failed",
                         &format!("name={name} {}", safe_error_detail(&e)),
                     );
+                    // Record the failure so the commander learns next turn that
+                    // the skill could not be loaded — without this the model
+                    // would see the request silently vanish from its context and
+                    // have no way to know the read failed.
+                    self.ledger.record_skill(&name, &format!("failed: {e}"));
                     self.emit(Event::Error(format!("skill `{name}`: {e}")))
                         .await;
                 }
@@ -2272,6 +2556,9 @@ impl Orchestrator {
                         "project.read_failed",
                         &format!("path={path} {}", safe_error_detail(&e)),
                     );
+                    // Record the failure so the commander learns next turn that
+                    // the file could not be read — mirrors the skill read case above.
+                    self.ledger.record_file_read(&path, &format!("failed: {e}"));
                     self.emit(Event::Error(format!("read `{path}`: {e}"))).await;
                 }
             }
@@ -2311,6 +2598,9 @@ impl Orchestrator {
                         "project.list_failed",
                         &format!("path={path} {}", safe_error_detail(&e)),
                     );
+                    // Record the failure so the commander learns next turn that
+                    // the listing could not be completed — mirrors the read cases above.
+                    self.ledger.record_file_list(&path, &format!("failed: {e}"));
                     self.emit(Event::Error(format!("list `{path}`: {e}"))).await;
                 }
             }
@@ -2667,6 +2957,250 @@ mod tests {
     }
 
     #[test]
+    fn a_configured_cli_with_a_missing_executable_is_discovered_as_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing-cli");
+        let mut local_binaries = BTreeMap::new();
+        local_binaries.insert(
+            "broken".to_string(),
+            crate::config::LocalBinarySpec {
+                path: missing.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                model_arg: None,
+                system_arg: None,
+                stream_format: None,
+            },
+        );
+        let settings = Settings {
+            local_binaries,
+            ..Default::default()
+        };
+
+        let cli_tools = detect_cli_tools(&settings);
+        let candidate = build_vendor_candidate("broken", &settings, false, &cli_tools).unwrap();
+        assert_eq!(candidate.transports.len(), 1);
+        let Availability::Unavailable(reason) = &candidate.transports[0].availability else {
+            panic!("a missing configured executable must not be reported as ready");
+        };
+        assert!(reason.contains("missing or not executable"));
+        assert!(reason.contains("missing-cli"));
+    }
+
+    #[test]
+    fn a_stale_saved_cli_path_is_not_masked_by_a_working_configured_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let configured_path = std::env::current_exe().unwrap();
+        let stale_path = tmp.path().join("removed-wrapper");
+        let mut local_binaries = BTreeMap::new();
+        local_binaries.insert(
+            "tool".to_string(),
+            crate::config::LocalBinarySpec {
+                path: configured_path.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                model_arg: None,
+                system_arg: None,
+                stream_format: None,
+            },
+        );
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "tool".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Cli),
+                path: Some(stale_path.to_string_lossy().into_owned()),
+                model: None,
+            },
+        );
+        let settings = Settings {
+            local_binaries,
+            connections,
+            ..Default::default()
+        };
+
+        let cli_tools = detect_cli_tools(&settings);
+        let candidate = build_vendor_candidate("tool", &settings, false, &cli_tools).unwrap();
+        let option = &candidate.transports[0];
+
+        assert_eq!(option.detail, stale_path.to_string_lossy());
+        assert_eq!(
+            option.cli.as_ref().map(|cli| cli.path.as_str()),
+            stale_path.to_str()
+        );
+        assert!(
+            matches!(option.availability, Availability::Unavailable(_)),
+            "status discovery must validate the same saved path provider construction will use"
+        );
+        let status = candidate_statuses(&[candidate], &settings).remove(0);
+        assert_eq!(status.state, ConnectionState::ConnectedUnavailable);
+    }
+
+    #[test]
+    fn a_saved_cli_removed_from_configuration_remains_visible_as_broken() {
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "retired-tool".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Cli),
+                path: Some("/removed/retired-tool".to_string()),
+                model: Some("old-model".to_string()),
+            },
+        );
+        let settings = Settings {
+            connections,
+            ..Default::default()
+        };
+
+        let candidate = build_vendor_candidate("retired-tool", &settings, false, &[]).unwrap();
+        let status = candidate_statuses(&[candidate], &settings).remove(0);
+
+        assert_eq!(status.label, "retired-tool:old-model");
+        assert_eq!(status.state, ConnectionState::ConnectedUnavailable);
+        assert_eq!(
+            status.reason.as_deref(),
+            Some("CLI is no longer configured or detected")
+        );
+    }
+
+    #[test]
+    fn candidate_statuses_use_one_shared_three_state_classification() {
+        let candidate = Candidate {
+            id: "anthropic".to_string(),
+            group: "ANTHROPIC".to_string(),
+            model: "claude-opus-5".to_string(),
+            transports: vec![
+                TransportOption {
+                    transport: Some(Transport::Api),
+                    label: "via API".to_string(),
+                    detail: "https://api.anthropic.com".to_string(),
+                    availability: Availability::Unavailable("no key stored".to_string()),
+                    cli: None,
+                    needs_key: true,
+                },
+                TransportOption {
+                    transport: Some(Transport::Cli),
+                    label: "via CLI".to_string(),
+                    detail: "/bin/claude".to_string(),
+                    availability: Availability::Available,
+                    cli: Some(CliSpec {
+                        binary_name: "claude".to_string(),
+                        path: "/bin/claude".to_string(),
+                        args: Vec::new(),
+                        model_arg: Some("--model".to_string()),
+                        system_arg: None,
+                        dialect: None,
+                        workspace_arg: None,
+                    }),
+                    needs_key: false,
+                },
+            ],
+        };
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "anthropic".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Api),
+                path: None,
+                model: None,
+            },
+        );
+        let settings = Settings {
+            connections,
+            commander: Some("anthropic:claude-opus-5".to_string()),
+            ..Default::default()
+        };
+
+        let statuses = candidate_statuses(&[candidate], &settings);
+        let api = statuses
+            .iter()
+            .find(|status| status.transport == Some(Transport::Api))
+            .unwrap();
+        let cli = statuses
+            .iter()
+            .find(|status| status.transport == Some(Transport::Cli))
+            .unwrap();
+
+        assert_eq!(api.state, ConnectionState::ConnectedUnavailable);
+        assert_eq!(api.reason.as_deref(), Some("no key stored"));
+        assert_eq!(api.state.symbol(), "×");
+        assert!(api.matches_commander(settings.commander.as_deref()));
+        assert_eq!(cli.state, ConnectionState::NotConnected);
+        assert_eq!(cli.state.symbol(), "○");
+    }
+
+    #[test]
+    fn first_run_status_connects_only_the_first_available_transport_per_candidate() {
+        let candidate = Candidate {
+            id: "anthropic".to_string(),
+            group: "ANTHROPIC".to_string(),
+            model: "claude-opus-5".to_string(),
+            transports: vec![
+                TransportOption {
+                    transport: Some(Transport::Cli),
+                    label: "via CLI".to_string(),
+                    detail: "/bin/claude".to_string(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                },
+                TransportOption {
+                    transport: Some(Transport::Api),
+                    label: "via API".to_string(),
+                    detail: "https://api.anthropic.com".to_string(),
+                    availability: Availability::Available,
+                    cli: None,
+                    needs_key: false,
+                },
+            ],
+        };
+
+        let statuses = candidate_statuses(&[candidate], &Settings::default());
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| status.state == ConnectionState::Connected)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .find(|status| status.transport == Some(Transport::Cli))
+                .unwrap()
+                .state,
+            ConnectionState::Connected
+        );
+    }
+
+    #[test]
+    fn an_unreachable_ollama_daemon_keeps_saved_models_visible_as_broken() {
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "ollama:llama3.2:3b".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: None,
+                path: None,
+                model: None,
+            },
+        );
+        let settings = Settings {
+            connections,
+            ..Default::default()
+        };
+
+        let candidates = unavailable_ollama_candidates(&settings, "daemon is down".to_string());
+        let statuses = candidate_statuses(&candidates, &settings);
+
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].label, "ollama:llama3.2:3b");
+        assert_eq!(statuses[0].state, ConnectionState::ConnectedUnavailable);
+        assert_eq!(statuses[0].reason.as_deref(), Some("daemon is down"));
+    }
+
+    #[test]
     fn agy_is_auto_detected_with_streaming_flags_before_p_and_no_system_flag() {
         let defaults = known_cli_default("agy");
         // Flags must precede `-p` for `agy`: `agy -p --output-format ...` is broken
@@ -2683,6 +3217,7 @@ mod tests {
         assert!(defaults.system_arg.is_none());
         assert_eq!(defaults.dialect, Some(StreamDialect::AgyJson));
         assert_eq!(defaults.workspace_arg, Some("--add-dir".to_string()));
+        assert_eq!(defaults.model_arg, Some("--model".to_string()));
     }
 
     #[test]
@@ -2700,6 +3235,7 @@ mod tests {
         assert_eq!(defaults.system_arg, Some("--system-prompt".to_string()));
         assert_eq!(defaults.dialect, Some(StreamDialect::ClaudeJson));
         assert_eq!(defaults.workspace_arg, Some("--add-dir".to_string()));
+        assert_eq!(defaults.model_arg, Some("--model".to_string()));
     }
 
     #[test]
@@ -2720,6 +3256,7 @@ mod tests {
         assert!(defaults.system_arg.is_none());
         assert_eq!(defaults.dialect, Some(StreamDialect::CopilotJson));
         assert_eq!(defaults.workspace_arg, Some("--add-dir".to_string()));
+        assert_eq!(defaults.model_arg, Some("--model".to_string()));
     }
 
     #[test]
@@ -2730,6 +3267,45 @@ mod tests {
         assert!(defaults.dialect.is_none());
         // An unknown binary handed an unknown flag would just fail to start.
         assert!(defaults.workspace_arg.is_none());
+        assert!(defaults.model_arg.is_none());
+    }
+
+    #[test]
+    fn cli_model_argument_precedes_prompt_taking_flags() {
+        let defaults = known_cli_default("agy");
+        let cli = CliSpec {
+            binary_name: "agy".into(),
+            path: "/bin/agy".into(),
+            args: defaults.args,
+            model_arg: defaults.model_arg,
+            system_arg: defaults.system_arg,
+            dialect: defaults.dialect,
+            workspace_arg: defaults.workspace_arg,
+        };
+
+        let args = cli_args_with_model(&cli, Some("gemini-3.1-pro"));
+
+        assert_eq!(&args[..2], ["--model", "gemini-3.1-pro"]);
+        assert_eq!(args.last().map(String::as_str), Some("-p"));
+    }
+
+    #[test]
+    fn cli_model_argument_follows_a_required_subcommand() {
+        let defaults = known_cli_default("codex");
+        let cli = CliSpec {
+            binary_name: "codex".into(),
+            path: "/bin/codex".into(),
+            args: defaults.args,
+            model_arg: defaults.model_arg,
+            system_arg: defaults.system_arg,
+            dialect: defaults.dialect,
+            workspace_arg: defaults.workspace_arg,
+        };
+
+        assert_eq!(
+            cli_args_with_model(&cli, Some("gpt-5.4")),
+            ["exec", "--model", "gpt-5.4"]
+        );
     }
 
     // Unix-only: both this test and its sibling below hardcode `/bin/echo`, which
@@ -2755,6 +3331,7 @@ mod tests {
             crate::config::LocalBinarySpec {
                 path: "/bin/echo".into(),
                 args: vec![],
+                model_arg: None,
                 system_arg: None,
                 stream_format: None,
             },
@@ -2800,6 +3377,7 @@ mod tests {
             crate::config::LocalBinarySpec {
                 path: "/bin/echo".into(),
                 args: vec![],
+                model_arg: None,
                 system_arg: None,
                 stream_format: None,
             },
@@ -2860,6 +3438,7 @@ mod tests {
                         binary_name: "claude".to_string(),
                         path: "/bin/claude".to_string(),
                         args: vec![],
+                        model_arg: Some("--model".to_string()),
                         system_arg: None,
                         dialect: None,
                         workspace_arg: None,
@@ -2974,6 +3553,7 @@ mod tests {
             crate::config::LocalBinarySpec {
                 path: "/bin/echo".into(),
                 args: vec![],
+                model_arg: None,
                 system_arg: None,
                 stream_format: None,
             },
@@ -3586,7 +4166,18 @@ mod tests {
         }
         assert!(saw_error);
         assert!(!saw_loaded, "a failed skill read must not report success");
-        assert!(orch.ledger.loaded_skills().is_empty());
+        let skills = orch.ledger.loaded_skills();
+        assert_eq!(
+            skills.len(),
+            1,
+            "a failed skill read must record the failure in the ledger"
+        );
+        assert_eq!(skills[0].name, "../../../../etc/passwd");
+        assert!(
+            skills[0].content.starts_with("failed:"),
+            "ledger entry must start with 'failed:', got: {}",
+            skills[0].content
+        );
     }
 
     #[tokio::test]
@@ -3627,7 +4218,18 @@ mod tests {
         }
         assert!(saw_error);
         assert!(!saw_loaded, "a failed skill read must not report success");
-        assert!(orch.ledger.loaded_skills().is_empty());
+        let skills = orch.ledger.loaded_skills();
+        assert_eq!(
+            skills.len(),
+            1,
+            "a failed skill read must record the failure in the ledger"
+        );
+        assert_eq!(skills[0].name, "nope.md");
+        assert!(
+            skills[0].content.starts_with("failed:"),
+            "ledger entry must start with 'failed:', got: {}",
+            skills[0].content
+        );
     }
 
     #[tokio::test]
@@ -4838,9 +5440,17 @@ mod tests {
         }
         assert!(saw_error);
         assert!(!saw_read, "a failed read must not emit Event::FileRead");
+        let reads = orch.ledger.loaded_reads();
+        assert_eq!(
+            reads.len(),
+            1,
+            "a failed read must record the failure in the ledger"
+        );
+        assert_eq!(reads[0].path, "../secret.txt");
         assert!(
-            orch.ledger.loaded_reads().is_empty(),
-            "a failed read must not also record success in the ledger"
+            reads[0].content.starts_with("failed:"),
+            "ledger entry must start with 'failed:', got: {}",
+            reads[0].content
         );
     }
 
@@ -4943,6 +5553,156 @@ mod tests {
         assert_eq!(listings.len(), 1);
         assert!(listings[0].outcome.contains("a.txt"));
         assert!(listings[0].outcome.contains("b.txt"));
+    }
+
+    // Regression tests: failed ACTION: read_skill / read_file / list_files must be
+    // recorded in the SwarmLedger so the commander can see them on its next turn.
+    // Previously the error was only shown in the TUI (Event::Error) but not written to
+    // the ledger, so the commander's next-turn system prompt contained no trace of the
+    // failure.
+
+    #[tokio::test]
+    async fn a_failed_skill_read_records_error_in_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(missing.md)")
+            .await;
+
+        let skills = orch.ledger.loaded_skills();
+        assert_eq!(
+            skills.len(),
+            1,
+            "failed read_skill must write exactly one failure record to the ledger"
+        );
+        assert_eq!(skills[0].name, "missing.md");
+        assert!(
+            skills[0].content.starts_with("failed:"),
+            "ledger record must use 'failed:' prefix so the commander can identify it; got: {}",
+            skills[0].content
+        );
+        // The error must also be visible in the rendered system prompt.
+        let prompt = orch.ledger.system_prompt();
+        assert!(
+            prompt.contains("missing.md"),
+            "system prompt must name the failed skill"
+        );
+        assert!(
+            prompt.contains("failed:"),
+            "system prompt must contain the failure marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_file_read_records_error_in_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        // Traversal attempt: the file exists outside the project root but must be
+        // refused. The error goes to the ledger, not the file content.
+        orch.run_file_reads("ollama:llama3", "ACTION: read_file(../outside.txt)")
+            .await;
+
+        let reads = orch.ledger.loaded_reads();
+        assert_eq!(
+            reads.len(),
+            1,
+            "failed read_file must write exactly one failure record to the ledger"
+        );
+        assert_eq!(reads[0].path, "../outside.txt");
+        assert!(
+            reads[0].content.starts_with("failed:"),
+            "ledger record must use 'failed:' prefix so the commander can identify it; got: {}",
+            reads[0].content
+        );
+        // The failure must surface in the system prompt the commander receives next turn.
+        let prompt = orch.ledger.system_prompt();
+        assert!(
+            prompt.contains("../outside.txt"),
+            "system prompt must name the failed path"
+        );
+        assert!(
+            prompt.contains("failed:"),
+            "system prompt must contain the failure marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_file_list_records_error_in_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let reg = registry_with(vec![("ollama", "llama3", false)], "ollama:llama3");
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut orch = Orchestrator {
+            registry: reg,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![3u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        // Request listing of a path that does not exist inside the project root.
+        orch.run_file_lists("ollama:llama3", "ACTION: list_files(nonexistent-dir)")
+            .await;
+
+        let listings = orch.ledger.file_listings();
+        assert_eq!(
+            listings.len(),
+            1,
+            "failed list_files must write exactly one failure record to the ledger"
+        );
+        assert_eq!(listings[0].path, "nonexistent-dir");
+        assert!(
+            listings[0].outcome.starts_with("failed:"),
+            "ledger record must use 'failed:' prefix so the commander can identify it; got: {}",
+            listings[0].outcome
+        );
+        // The failure must surface in the system prompt the commander receives next turn.
+        let prompt = orch.ledger.system_prompt();
+        assert!(
+            prompt.contains("nonexistent-dir"),
+            "system prompt must name the failed path"
+        );
+        assert!(
+            prompt.contains("failed:"),
+            "system prompt must contain the failure marker"
+        );
     }
 
     #[tokio::test(start_paused = true)]

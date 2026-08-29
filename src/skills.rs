@@ -21,26 +21,30 @@ const MAX_SKILL_BYTES: u64 = 256 * 1024;
 const FRONTMATTER_HEAD_BYTES: usize = 1024;
 
 #[cfg(unix)]
-fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+fn regular_file_link_count(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
 
     meta.is_file().then(|| meta.nlink())
 }
 
 #[cfg(windows)]
-fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    meta.is_file().then(|| meta.number_of_links())
+fn regular_file_link_count(path: &Path, meta: &fs::Metadata) -> Option<u64> {
+    meta.is_file()
+        .then(|| crate::security::windows_regular_file_link_count(path))
+        .flatten()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+fn regular_file_link_count(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
     meta.is_file().then_some(2)
 }
 
-fn reject_multi_linked_regular_file(meta: &fs::Metadata, requested: &str) -> Result<()> {
-    if let Some(count) = regular_file_link_count(meta)
+fn reject_multi_linked_regular_file(
+    path: &Path,
+    meta: &fs::Metadata,
+    requested: &str,
+) -> Result<()> {
+    if let Some(count) = regular_file_link_count(path, meta)
         && count > 1
     {
         return Err(anyhow!(
@@ -167,7 +171,7 @@ impl SkillsDir {
         if !meta.is_file() {
             return Err(anyhow!("skill `{requested}` is not a file"));
         }
-        reject_multi_linked_regular_file(&meta, requested)?;
+        reject_multi_linked_regular_file(&path, &meta, requested)?;
         if meta.len() > MAX_SKILL_BYTES {
             return Err(anyhow!(
                 "skill `{requested}` is {} bytes, over the {MAX_SKILL_BYTES}-byte limit",
@@ -225,7 +229,7 @@ impl SkillsDir {
         // paths must agree on what's inside the root.
         let path = self.resolve(name).ok()?;
         let meta = fs::metadata(&path).ok()?;
-        if !meta.is_file() || reject_multi_linked_regular_file(&meta, name).is_err() {
+        if !meta.is_file() || reject_multi_linked_regular_file(&path, &meta, name).is_err() {
             return None;
         }
         let file = File::open(path).ok()?;

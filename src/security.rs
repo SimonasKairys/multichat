@@ -11,6 +11,9 @@
 use anyhow::{Result, anyhow};
 use zeroize::Zeroize;
 
+#[cfg(windows)]
+use std::path::Path;
+
 /// Outcome of a hardening step: applied, or unavailable with a reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hardening {
@@ -78,6 +81,27 @@ pub fn enforce_memory_protection(strict: bool) -> Result<Hardening> {
 /// implies a sandbox exists. See `docs/progress/22_status.md`.
 pub fn enforce_seccomp_sandbox() -> Hardening {
     Hardening::Unavailable("seccomp sandboxing is not implemented".to_string())
+}
+
+/// Returns a Windows regular file's hard-link count using the stable Win32 API.
+///
+/// Rust exposes the same field through `MetadataExt::number_of_links`, but that
+/// method is still unstable on stable Rust. Keeping the FFI here preserves the
+/// crate's rule that `security.rs` is the only module allowed to contain unsafe.
+#[cfg(windows)]
+pub fn windows_regular_file_link_count(path: &Path) -> Option<u64> {
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = File::open(path).ok()?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a live OS handle for the duration of the call, and
+    // `info` points to writable storage of the exact structure the API expects.
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
+    (succeeded != 0).then_some(u64::from(info.nNumberOfLinks))
 }
 
 /// A heap buffer whose pages are locked into RAM and zeroed when dropped.

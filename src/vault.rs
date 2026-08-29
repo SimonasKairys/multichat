@@ -65,26 +65,26 @@ const KEY_LEN: usize = 32;
 const HEADER_FIXED_LEN: usize = 8 + 1 + 1 + 8 + 1; // magic..salt_len inclusive
 
 #[cfg(unix)]
-fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+fn regular_file_link_count(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
 
     meta.is_file().then(|| meta.nlink())
 }
 
 #[cfg(windows)]
-fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    meta.is_file().then(|| meta.number_of_links())
+fn regular_file_link_count(path: &Path, meta: &fs::Metadata) -> Option<u64> {
+    meta.is_file()
+        .then(|| crate::security::windows_regular_file_link_count(path))
+        .flatten()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+fn regular_file_link_count(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
     meta.is_file().then_some(2)
 }
 
-fn should_zero_before_unlink(meta: &fs::Metadata) -> bool {
-    matches!(regular_file_link_count(meta), Some(0 | 1))
+fn should_zero_before_unlink(path: &Path, meta: &fs::Metadata) -> bool {
+    matches!(regular_file_link_count(path, meta), Some(0 | 1))
 }
 
 /// Consecutive wrong passwords before the vault is destroyed.
@@ -411,7 +411,10 @@ impl EncryptedVault {
     /// vault destroy`) actually want.
     pub fn destroy(&self) {
         match fs::symlink_metadata(&self.path) {
-            Ok(meta) if !meta.file_type().is_symlink() && should_zero_before_unlink(&meta) => {
+            Ok(meta)
+                if !meta.file_type().is_symlink()
+                    && should_zero_before_unlink(&self.path, &meta) =>
+            {
                 let _ = fs::write(&self.path, vec![0u8; meta.len() as usize]);
             }
             _ => {
@@ -433,7 +436,9 @@ impl EncryptedVault {
         // is a harmless no-op.
         let tmp = tmp_path_for(&self.path);
         match fs::symlink_metadata(&tmp) {
-            Ok(meta) if !meta.file_type().is_symlink() && should_zero_before_unlink(&meta) => {
+            Ok(meta)
+                if !meta.file_type().is_symlink() && should_zero_before_unlink(&tmp, &meta) =>
+            {
                 let _ = fs::write(&tmp, vec![0u8; meta.len() as usize]);
             }
             _ => {}

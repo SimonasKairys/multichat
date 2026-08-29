@@ -35,30 +35,31 @@ const MAX_FILE_BYTES: usize = 256 * 1024;
 const MAX_LIST_ENTRIES: usize = 500;
 
 #[cfg(unix)]
-fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+fn regular_file_link_count(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
 
     meta.is_file().then(|| meta.nlink())
 }
 
 #[cfg(windows)]
-fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
-    use std::os::windows::fs::MetadataExt as _;
-
-    meta.is_file().then(|| meta.number_of_links())
+fn regular_file_link_count(path: &Path, meta: &fs::Metadata) -> Option<u64> {
+    meta.is_file()
+        .then(|| crate::security::windows_regular_file_link_count(path))
+        .flatten()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn regular_file_link_count(meta: &fs::Metadata) -> Option<u64> {
+fn regular_file_link_count(_path: &Path, meta: &fs::Metadata) -> Option<u64> {
     meta.is_file().then_some(2)
 }
 
 fn reject_multi_linked_regular_file(
+    path: &Path,
     meta: &fs::Metadata,
     requested: &str,
     action: &str,
 ) -> Result<()> {
-    if let Some(count) = regular_file_link_count(meta)
+    if let Some(count) = regular_file_link_count(path, meta)
         && count > 1
     {
         return Err(anyhow!(
@@ -156,7 +157,7 @@ impl Workspace {
         if !meta.is_file() {
             return Err(anyhow!("project path `{requested}` is not a file"));
         }
-        reject_multi_linked_regular_file(&meta, requested, "read")?;
+        reject_multi_linked_regular_file(&path, &meta, requested, "read")?;
         if meta.len() > MAX_FILE_BYTES as u64 {
             return Err(anyhow!(
                 "project file `{requested}` is {} bytes, over the {MAX_FILE_BYTES}-byte limit",
@@ -254,11 +255,12 @@ impl Workspace {
             ));
         }
         self.reject_git_writes(requested, candidate)?;
-        if let Ok(meta) = fs::symlink_metadata(self.root.join(candidate)) {
+        let path = self.root.join(candidate);
+        if let Ok(meta) = fs::symlink_metadata(&path) {
             if meta.is_dir() {
                 return Err(anyhow!("project path `{requested}` is a directory"));
             }
-            reject_multi_linked_regular_file(&meta, requested, "write")?;
+            reject_multi_linked_regular_file(&path, &meta, requested, "write")?;
         }
         Ok(())
     }
@@ -454,7 +456,7 @@ impl Workspace {
             if meta.is_dir() {
                 return Err(anyhow!("project path `{requested}` is a directory"));
             }
-            reject_multi_linked_regular_file(&meta, requested, "write")?;
+            reject_multi_linked_regular_file(&resolved, &meta, requested, "write")?;
         }
 
         fs::write(&resolved, content)

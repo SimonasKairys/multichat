@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use zeroize::Zeroize;
 
 use crate::config::{ConnectionSpec, Transport};
-use crate::orchestrator::{Availability, Candidate, ConnectionState};
+use crate::orchestrator::{Availability, Candidate, ConnectionState, TransportOption};
 
 /// One rendered, cursor-addressable line: a candidate's `transports[transport]`.
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +36,18 @@ enum Mode {
         candidate: usize,
         transport: usize,
         buffer: String,
+        /// Index into the (possibly typed-filtered) known-model list — see
+        /// `model_options` — that `Up`/`Down` move and `Enter` confirms. Meaningless
+        /// when that list is empty, which is the free-text-only case.
+        selected: usize,
+        /// Set once `Up`/`Down` has moved `selected`. `submit_model_entry` needs
+        /// this to tell "the user arrowed onto a specific option, with an otherwise
+        /// empty buffer" apart from "the user pressed `Enter` without touching
+        /// anything" — the list can open pre-highlighted on the row's *current*
+        /// model (which may be an override), and an untouched `Enter` must still
+        /// clear that override back to the provider default, exactly as it did
+        /// before this list existed.
+        touched: bool,
     },
 }
 
@@ -228,6 +240,7 @@ impl PickerState {
                 candidate,
                 transport,
                 buffer,
+                ..
             } => Some((
                 self.candidates[*candidate].id.as_str(),
                 self.display_model(*candidate, *transport),
@@ -235,6 +248,83 @@ impl PickerState {
             )),
             Mode::Browsing | Mode::EnteringKey { .. } => None,
         }
+    }
+
+    /// The row being edited's known-model pick-list, narrowed by whatever has been
+    /// typed so far, paired with whether each entry is the one `Up`/`Down` last
+    /// landed on. Always empty outside model entry, and also empty within it when
+    /// the row's vendor/CLI has no known list (see `known_models_for`) — the UI
+    /// falls back to showing just the typed buffer in that case, exactly as the
+    /// model editor behaved before this list existed.
+    pub fn model_options(&self) -> Vec<(&str, bool)> {
+        let options = self.current_model_options();
+        let selected = match &self.mode {
+            Mode::EnteringModel { selected, .. } => *selected,
+            _ => 0,
+        };
+        options
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| (name, i == selected))
+            .collect()
+    }
+
+    /// The known-model pick-list for the row currently being edited, filtered to
+    /// whatever has been typed so far. Shared by `model_options` (rendering) and
+    /// the `move_model_selection_*` methods (clamping and buffer sync), so all
+    /// three can never disagree about what is currently on screen.
+    ///
+    /// Returns `'static` strings (not tied to `&self`) even though computing which
+    /// ones apply reads `self.mode`/`self.candidates` — the strings themselves come
+    /// from `known_models_for`'s `'static` lists, never from `self`'s own data — so
+    /// callers that need to follow this with a `&mut self.mode` borrow (the
+    /// selection movers) can do so without the borrow checker seeing a conflict.
+    fn current_model_options(&self) -> Vec<&'static str> {
+        match &self.mode {
+            Mode::EnteringModel {
+                candidate,
+                transport,
+                buffer,
+                ..
+            } => {
+                let option = &self.candidates[*candidate].transports[*transport];
+                let known = Self::known_models_for(option, &self.candidates[*candidate].id);
+                Self::filter_options(known, buffer)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Known model identifiers for the given row: the vendor's known models for an
+    /// API row, or the CLI's known models for a CLI row. Empty when nothing is known
+    /// (a custom endpoint, a hand-configured `local_binaries` CLI, or a CLI like
+    /// `llm` with no fixed model set), in which case the caller's list is empty and
+    /// the model editor is free-text only, exactly as it was before this list
+    /// existed.
+    fn known_models_for(option: &TransportOption, candidate_id: &str) -> &'static [&'static str] {
+        match option.transport {
+            Some(Transport::Api) => crate::config::known_models(candidate_id),
+            Some(Transport::Cli) => option
+                .cli
+                .as_ref()
+                .map(|cli| crate::orchestrator::known_cli_models(&cli.binary_name))
+                .unwrap_or(&[]),
+            None => &[],
+        }
+    }
+
+    /// Narrows a known-model list to whatever has been typed so far, with a
+    /// case-insensitive substring match so e.g. `"sonnet"` finds
+    /// `"claude-sonnet-5"` without requiring an exact prefix. An empty buffer
+    /// matches everything, so the list opens showing every known option rather
+    /// than nothing.
+    fn filter_options<'a>(known: &'a [&'a str], buffer: &str) -> Vec<&'a str> {
+        let needle = buffer.trim().to_ascii_lowercase();
+        known
+            .iter()
+            .copied()
+            .filter(|m| needle.is_empty() || m.to_ascii_lowercase().contains(&needle))
+            .collect()
     }
 
     // --- interaction -----------------------------------------------------------
@@ -393,8 +483,12 @@ impl PickerState {
     // --- model entry -------------------------------------------------------------
 
     /// Opens model entry for a row whose transport accepts an explicit model. The
-    /// buffer starts empty so a long identifier can be typed directly; submitting an
-    /// empty buffer deliberately restores the provider's default model.
+    /// buffer starts empty so the known-model list (see `model_options`) renders
+    /// unfiltered, and the highlight opens on the row's current model when that
+    /// model is one of the known ones — so re-opening the editor shows what's
+    /// already in effect instead of always resetting to the top of the list.
+    /// Submitting an empty buffer still deliberately restores the provider's
+    /// default model, exactly as before this list existed.
     pub fn start_model_entry(&mut self) {
         if !matches!(self.mode, Mode::Browsing) {
             return;
@@ -423,23 +517,75 @@ impl PickerState {
             return;
         }
 
+        let known = Self::known_models_for(option, &self.candidates[row.candidate].id);
+        let current = self.display_model(row.candidate, row.transport);
+        let selected = known
+            .iter()
+            .position(|m| m.eq_ignore_ascii_case(current))
+            .unwrap_or(0);
+
         self.mode = Mode::EnteringModel {
             candidate: row.candidate,
             transport: row.transport,
             buffer: String::new(),
+            selected,
+            touched: false,
         };
         self.flash = None;
     }
 
+    /// Appends a typed character to the model filter and resets the highlight back
+    /// to the top match — the same behaviour any filtered pick-list needs, since the
+    /// previously highlighted row may no longer be part of the narrowed list at all.
     pub fn push_model_char(&mut self, c: char) {
-        if let Mode::EnteringModel { buffer, .. } = &mut self.mode {
+        if let Mode::EnteringModel {
+            buffer, selected, ..
+        } = &mut self.mode
+        {
             buffer.push(c);
+            *selected = 0;
         }
     }
 
     pub fn backspace_model(&mut self) {
-        if let Mode::EnteringModel { buffer, .. } = &mut self.mode {
+        if let Mode::EnteringModel {
+            buffer, selected, ..
+        } = &mut self.mode
+        {
             buffer.pop();
+            *selected = 0;
+        }
+    }
+
+    /// Moves the model pick-list highlight up by one row. A no-op at the top, and a
+    /// no-op outside model entry (the `if let` simply does not match). Deliberately
+    /// leaves `buffer` untouched — writing the highlighted name into it would make
+    /// the very next list computation filter on that name and collapse down to just
+    /// one row, trapping further movement a single step in.
+    pub fn move_model_selection_up(&mut self) {
+        if let Mode::EnteringModel {
+            selected, touched, ..
+        } = &mut self.mode
+        {
+            *selected = selected.saturating_sub(1);
+            *touched = true;
+        }
+    }
+
+    /// Moves the model pick-list highlight down by one row, clamped to the
+    /// (possibly filtered) list's current length so it can never point past the
+    /// last option actually on screen. See `move_model_selection_up` for why
+    /// `buffer` is left alone.
+    pub fn move_model_selection_down(&mut self) {
+        let len = self.current_model_options().len();
+        if let Mode::EnteringModel {
+            selected, touched, ..
+        } = &mut self.mode
+        {
+            if *selected + 1 < len {
+                *selected += 1;
+            }
+            *touched = true;
         }
     }
 
@@ -449,26 +595,65 @@ impl PickerState {
         }
     }
 
-    /// Applies the typed model override. Whitespace around an identifier is ignored;
-    /// an empty value clears the override and returns to the endpoint default.
+    /// Applies the chosen model override.
+    ///
+    /// With typed text: an exact (case-insensitive) match against the row's
+    /// known-model list always wins — so typing an id in full behaves the same
+    /// regardless of what else that id happens to be a substring of — and failing
+    /// that, whatever the (typed-filtered) pick-list highlight currently rests on
+    /// is used. If the row has no known list at all, or the typed text matches
+    /// nothing in it, the typed buffer is used verbatim, exactly like the
+    /// free-text-only editor this replaced.
+    ///
+    /// With an empty buffer: confirms the pick-list highlight if `Up`/`Down` was
+    /// used to explicitly land on it (`touched`), otherwise clears the override
+    /// and returns to the endpoint default — the behaviour the empty case always
+    /// had, preserved for a bare `Enter` that never touched the list at all.
     pub fn submit_model_entry(&mut self) {
-        let (candidate, buffer) = match std::mem::replace(&mut self.mode, Mode::Browsing) {
-            Mode::EnteringModel {
-                candidate, buffer, ..
-            } => (candidate, buffer),
-            other => {
-                self.mode = other;
-                return;
-            }
+        let (candidate, transport, buffer, selected, touched) =
+            match std::mem::replace(&mut self.mode, Mode::Browsing) {
+                Mode::EnteringModel {
+                    candidate,
+                    transport,
+                    buffer,
+                    selected,
+                    touched,
+                } => (candidate, transport, buffer, selected, touched),
+                other => {
+                    self.mode = other;
+                    return;
+                }
+            };
+
+        let typed = buffer.trim();
+        let option = &self.candidates[candidate].transports[transport];
+        let known = Self::known_models_for(option, &self.candidates[candidate].id);
+
+        let chosen = if !typed.is_empty() {
+            Some(
+                known
+                    .iter()
+                    .find(|m| m.eq_ignore_ascii_case(typed))
+                    .copied()
+                    .or_else(|| Self::filter_options(known, &buffer).get(selected).copied())
+                    .unwrap_or(typed)
+                    .to_string(),
+            )
+        } else if touched {
+            known.get(selected).map(|s| s.to_string())
+        } else {
+            None
         };
 
-        let model = buffer.trim();
-        if model.is_empty() {
-            self.models[candidate] = None;
-            self.flash = Some("model reset to provider default".into());
-        } else {
-            self.models[candidate] = Some(model.to_string());
-            self.flash = Some(format!("model set to {model}"));
+        match chosen {
+            Some(model) => {
+                self.models[candidate] = Some(model.clone());
+                self.flash = Some(format!("model set to {model}"));
+            }
+            None => {
+                self.models[candidate] = None;
+                self.flash = Some("model reset to provider default".into());
+            }
         }
     }
 
@@ -1212,6 +1397,247 @@ mod tests {
         assert_eq!(picker.display_model(0, 0), "openai/gpt-4o");
         let (saved, _) = picker.submit().expect("restored selection should submit");
         assert_eq!(saved["openrouter"].model, None);
+    }
+
+    #[test]
+    fn model_entry_opens_with_the_known_list_for_a_known_vendor() {
+        let candidates = vec![Candidate {
+            id: "anthropic".into(),
+            group: "ANTHROPIC".into(),
+            model: "claude-opus-5".into(),
+            transports: vec![crate::orchestrator::TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://api.anthropic.com".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        }];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        let options = picker.model_options();
+
+        assert!(
+            !options.is_empty(),
+            "a known vendor should offer a non-empty pick-list"
+        );
+        assert!(options.iter().any(|(name, _)| *name == "claude-opus-5"));
+        // The row's current model (its endpoint default here) is highlighted first,
+        // so re-opening the editor shows what's already in effect rather than
+        // always landing on the top of the list regardless of the current value.
+        assert_eq!(
+            options.iter().find(|(_, selected)| *selected),
+            Some(&("claude-opus-5", true))
+        );
+    }
+
+    #[test]
+    fn model_entry_has_no_known_list_for_an_unlisted_vendor() {
+        let candidates = vec![Candidate {
+            id: "my-custom-gateway".into(),
+            group: "MY-CUSTOM-GATEWAY".into(),
+            model: "whatever-they-called-it".into(),
+            transports: vec![crate::orchestrator::TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://example.com".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        }];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+
+        assert!(picker.model_options().is_empty());
+    }
+
+    #[test]
+    fn typing_filters_the_known_model_list() {
+        let candidates = vec![candidate_refused("anthropic", "unused")];
+        // `candidate_refused` builds a single API row; availability does not matter
+        // for entering a model, only for connecting.
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        for c in "sonnet".chars() {
+            picker.push_model_char(c);
+        }
+
+        let options = picker.model_options();
+        assert!(!options.is_empty());
+        assert!(
+            options
+                .iter()
+                .all(|(name, _)| name.to_ascii_lowercase().contains("sonnet")),
+            "filtered list must only contain matches for the typed text: {options:?}"
+        );
+    }
+
+    #[test]
+    fn arrow_down_moves_the_highlight_without_touching_the_typed_buffer() {
+        let candidates = vec![candidate_refused("anthropic", "unused")];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        assert!(picker.model_options()[0].1);
+
+        picker.move_model_selection_down();
+
+        assert!(!picker.model_options()[0].1);
+        assert!(picker.model_options()[1].1);
+        // Arrowing must not fill the buffer — otherwise the very next
+        // recomputation of the list would filter itself down to just that one
+        // name (a self-collapsing list), trapping further `Down` presses on the
+        // second row forever.
+        assert_eq!(picker.model_entry().unwrap().2, "");
+    }
+
+    #[test]
+    fn arrow_down_can_move_through_the_entire_known_list_without_collapsing() {
+        let candidates = vec![candidate_refused("anthropic", "unused")];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        let len = picker.model_options().len();
+        assert!(
+            len > 1,
+            "anthropic's known list should have more than one entry"
+        );
+
+        for _ in 0..len - 1 {
+            picker.move_model_selection_down();
+            assert_eq!(
+                picker.model_options().len(),
+                len,
+                "the list must not shrink while arrowing through it"
+            );
+        }
+        assert!(picker.model_options()[len - 1].1);
+
+        // One more `Down` past the end stays clamped on the last row.
+        picker.move_model_selection_down();
+        assert!(picker.model_options()[len - 1].1);
+    }
+
+    #[test]
+    fn arrow_up_from_the_top_of_the_list_is_a_no_op() {
+        let candidates = vec![candidate_refused("anthropic", "unused")];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        picker.move_model_selection_up();
+
+        // Still on the first row. Note that `touched` is now `true` (the key was
+        // pressed), so — unlike a bare `Enter` that never arrowed at all — this
+        // would confirm that first row rather than reset to the provider default;
+        // see `enter_after_arrowing_with_no_typing_confirms_the_highlighted_model`.
+        assert!(picker.model_options()[0].1);
+        assert_eq!(picker.model_entry().unwrap().2, "");
+    }
+
+    #[test]
+    fn enter_after_arrowing_with_no_typing_confirms_the_highlighted_model() {
+        let candidates = vec![Candidate {
+            id: "openrouter".into(),
+            group: "OPENROUTER".into(),
+            model: "openai/gpt-4o".into(),
+            transports: vec![crate::orchestrator::TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://openrouter.ai/api/v1".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        }];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        picker.move_model_selection_down();
+        let expected = picker
+            .model_options()
+            .into_iter()
+            .find(|(_, selected)| *selected)
+            .map(|(name, _)| name.to_string())
+            .expect("moving down should keep some row highlighted");
+        picker.submit_model_entry();
+
+        // Distinguishes this from `empty_model_entry_restores_the_provider_default`:
+        // arrowing (even with zero typed characters) must not be read as an empty
+        // submit, or the pick-list would be unusable by keyboard alone.
+        assert_eq!(picker.display_model(0, 0), expected);
+    }
+
+    #[test]
+    fn arrow_keys_are_a_no_op_when_the_row_has_no_known_model_list() {
+        let candidates = vec![Candidate {
+            id: "my-custom-gateway".into(),
+            group: "MY-CUSTOM-GATEWAY".into(),
+            model: "whatever-they-called-it".into(),
+            transports: vec![crate::orchestrator::TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://example.com".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        }];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        picker.move_model_selection_down();
+        picker.move_model_selection_up();
+
+        assert!(picker.model_options().is_empty());
+        assert_eq!(picker.model_entry().unwrap().2, "");
+    }
+
+    #[test]
+    fn typing_a_value_outside_the_known_list_falls_back_to_the_typed_text() {
+        // OpenRouter's real catalog is far larger than the curated pick-list, so an
+        // id that is not one of the suggestions must still work exactly as free-text
+        // entry did before the list existed.
+        let candidates = vec![Candidate {
+            id: "openrouter".into(),
+            group: "OPENROUTER".into(),
+            model: "openai/gpt-4o".into(),
+            transports: vec![crate::orchestrator::TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://openrouter.ai/api/v1".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        }];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+
+        picker.start_model_entry();
+        for c in "mistralai/mistral-large-2411".chars() {
+            picker.push_model_char(c);
+        }
+        picker.submit_model_entry();
+
+        assert_eq!(picker.display_model(0, 0), "mistralai/mistral-large-2411");
+    }
+
+    #[test]
+    fn a_cli_row_offers_its_own_known_model_list() {
+        let candidates = vec![candidate_dual_both_available("copilot")];
+        let mut picker = PickerState::new(candidates, &BTreeMap::new(), None, false);
+        picker.move_down(); // land on the API row first...
+        picker.move_up(); //  ...then back onto the CLI row (index 0), explicitly.
+
+        picker.start_model_entry();
+
+        let options = picker.model_options();
+        assert!(options.iter().any(|(name, _)| *name == "gpt-5.4"));
+        assert!(options.iter().any(|(name, _)| *name == "claude-sonnet-5"));
     }
 
     #[test]

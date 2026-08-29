@@ -159,6 +159,56 @@ pub fn builtin_endpoint(provider: &str) -> Option<CloudEndpoint> {
     Some(e)
 }
 
+/// Well-known model identifiers offered as a pick-list in the picker's model
+/// editor, so choosing a model means picking a visible name rather than recalling
+/// one from memory. Deliberately a curated sample, not an exhaustive live catalog —
+/// especially for `openrouter`, whose real catalog runs into the hundreds and
+/// changes on its own schedule no build of this program tracks. Kept visibly next
+/// to `builtin_endpoint` so both stay about the same set of vendors. Anything not
+/// listed here (a custom endpoint, or a builtin whose catalog would just go stale)
+/// returns an empty slice, and the model editor falls back to free-text entry for
+/// those, exactly as it did before this list existed.
+pub fn known_models(provider: &str) -> &'static [&'static str] {
+    match provider.to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => &[
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+        ],
+        "openai" => &[
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5-mini",
+            "gpt-5.3-codex",
+            "gpt-4o",
+        ],
+        "google" | "gemini" => &[
+            "gemini-3-pro",
+            "gemini-3.1-pro",
+            "gemini-2.5-pro",
+            "gemini-2.5-flash",
+        ],
+        "openrouter" => &[
+            "anthropic/claude-opus-5",
+            "anthropic/claude-sonnet-4",
+            "openai/gpt-4o",
+            "openai/gpt-5.4",
+            "google/gemini-2.5-pro",
+            "google/gemini-3-pro",
+            "meta-llama/llama-3.3-70b-instruct",
+            "deepseek/deepseek-chat",
+        ],
+        "groq" => &[
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "mixtral-8x7b-32768",
+            "gemma2-9b-it",
+        ],
+        _ => &[],
+    }
+}
+
 /// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`) to the
 /// canonical id vendor discovery actually looks up in the keyring (`anthropic`,
 /// `google`). A key stored under the alias would be stored successfully but never
@@ -472,6 +522,46 @@ mod tests {
                 "wrong default_model for {provider}"
             );
         }
+    }
+
+    #[test]
+    fn every_builtin_provider_offers_a_known_model_list() {
+        // Mirrors `every_builtin_provider_is_pinned_to_its_own_wire_format`: a
+        // provider with an endpoint but an empty `known_models` list would silently
+        // fall back to free-text entry in the picker, exactly like an unknown
+        // provider — this pins that every builtin actually has choices to show.
+        for provider in ["anthropic", "openai", "google", "openrouter", "groq"] {
+            assert!(
+                !known_models(provider).is_empty(),
+                "expected a non-empty known-model list for {provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_models_includes_each_endpoints_own_default() {
+        // The default a fresh connection would actually use has to be a choice the
+        // list itself offers — otherwise the model editor would open on a value
+        // its own pick-list can't select.
+        for provider in ["anthropic", "openai", "google", "openrouter", "groq"] {
+            let default_model = builtin_endpoint(provider).unwrap().default_model;
+            assert!(
+                known_models(provider).contains(&default_model.as_str()),
+                "{provider}'s known list is missing its own default {default_model}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_models_is_empty_for_an_unknown_or_custom_provider() {
+        assert!(known_models("definitely-not-a-provider").is_empty());
+        assert!(known_models("my-custom-gateway").is_empty());
+    }
+
+    #[test]
+    fn known_models_aliases_match_their_canonical_provider() {
+        assert_eq!(known_models("claude"), known_models("anthropic"));
+        assert_eq!(known_models("gemini"), known_models("google"));
     }
 
     #[test]

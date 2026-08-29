@@ -863,6 +863,58 @@ fn known_cli_default(binary_name: &str) -> CliDefaults {
     }
 }
 
+/// Well-known model identifiers offered as a pick-list when editing a CLI row's
+/// model, mirroring `config::known_models` for the API side. Kept next to
+/// `known_cli_default` so both stay about the same set of known binaries. `llm` is
+/// deliberately absent — it is a plugin-based wrapper with no fixed model set, so a
+/// hardcoded list would either be wrong or perpetually stale — and so is any binary
+/// not in `known_cli_default`'s match, including hand-configured `local_binaries`
+/// entries: the model editor falls back to free-text entry for those, exactly as it
+/// did before this list existed.
+pub(crate) fn known_cli_models(binary_name: &str) -> &'static [&'static str] {
+    match binary_name {
+        "claude" => &[
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-5",
+            "claude-haiku-4-5",
+        ],
+        // `agy` is a gateway CLI that serves Gemini, Claude and gpt-oss models
+        // alike (see `cli_vendor_id`), so its list spans vendors rather than
+        // sticking to Google's.
+        "agy" => &[
+            "gemini-3-pro",
+            "gemini-3.1-pro",
+            "gemini-2.5-pro",
+            "claude-opus-5",
+            "gpt-5.4",
+        ],
+        "copilot" => &[
+            "claude-sonnet-5",
+            "claude-opus-4.8",
+            "claude-opus-4.7",
+            "claude-sonnet-4.6",
+            "claude-opus-4.6",
+            "claude-sonnet-4.5",
+            "claude-opus-4.5",
+            "claude-haiku-4.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "gpt-5-mini",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.1-pro-preview",
+        ],
+        "codex" => &["gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5-mini"],
+        _ => &[],
+    }
+}
+
 /// Every CLI tool this build can act as a provider for: whatever the user configured
 /// explicitly in `local_binaries` (which always wins), plus anything from the known
 /// list found on `PATH`.
@@ -3268,6 +3320,26 @@ mod tests {
         // An unknown binary handed an unknown flag would just fail to start.
         assert!(defaults.workspace_arg.is_none());
         assert!(defaults.model_arg.is_none());
+    }
+
+    #[test]
+    fn every_cli_with_a_model_flag_offers_a_known_model_list() {
+        // `llm` deliberately keeps `model_arg` (it does take `--model`) but has no
+        // fixed catalog, so it is excluded here and pinned empty separately below.
+        for binary in ["claude", "agy", "copilot", "codex"] {
+            assert!(
+                !known_cli_models(binary).is_empty(),
+                "expected a non-empty known-model list for {binary}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_cli_models_is_empty_for_llm_and_unknown_binaries() {
+        // `llm` is a plugin-based wrapper with no fixed model set — hardcoding a
+        // list for it would just go stale — so it keeps the free-text fallback.
+        assert!(known_cli_models("llm").is_empty());
+        assert!(known_cli_models("some-random-cli").is_empty());
     }
 
     #[test]

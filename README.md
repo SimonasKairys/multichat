@@ -57,15 +57,19 @@ In the picker, status dots show **● connected/ready**, **○ not connected**, 
 The same legend is used by `simon models` and `/commander`. These are discovery
 readiness states: `simon` never sends an automatic test prompt just to turn a dot
 green, because that could cost money or let an agentic CLI run tools.
-**Space** toggles a connection, **c** marks the highlighted row, **m** edits the exact
-model ID, **tab** cycles a candidate's transport, and **enter** connects — but only
+**Space** toggles a connection, **c** marks the highlighted row, **m** opens a model
+picker, **tab** cycles a candidate's transport, and **enter** connects — but only
 once a commander has been chosen; until then it just flashes a reminder to press
-**c**. Model editing works for every cloud API and for CLI providers with a model flag
-(all auto-detected CLIs); Ollama already exposes each installed model as its own row.
-For OpenRouter, enter an ID such as
-`anthropic/claude-sonnet-4`; submitting an empty model field restores the provider
-default. `simon chat -m <label>` skips the picker and picks the commander
-non-interactively instead.
+**c**. The model picker works for every cloud API and for CLI providers with a model
+flag (all auto-detected CLIs); Ollama already exposes each installed model as its own
+row, so **m** does not apply there. For a vendor or CLI `simon` ships a known-model
+list for, **m** shows it as a scrollable list — **↑/↓** move the highlight and
+**enter** confirms it, no typing required. Typing narrows the list to matching names,
+and — for OpenRouter's long tail, or any id not yet in a curated list — typed text
+that matches nothing is used verbatim, so it's still possible to enter one by hand
+(for example `anthropic/claude-sonnet-4`). Submitting an empty field without
+selecting anything restores the provider default. `simon chat -m <label>` skips the
+picker and picks the commander non-interactively instead.
 
 `chat` is the default subcommand, and its flags work without naming it: `simon --vault`
 and `simon chat --vault` are the same thing.

@@ -404,6 +404,14 @@ pub(crate) fn handle_picker_key(
                 state.cancel_model_entry();
                 PickerKeyOutcome::Continue
             }
+            KeyCode::Up => {
+                state.move_model_selection_up();
+                PickerKeyOutcome::Continue
+            }
+            KeyCode::Down => {
+                state.move_model_selection_down();
+                PickerKeyOutcome::Continue
+            }
             KeyCode::Backspace => {
                 state.backspace_model();
                 PickerKeyOutcome::Continue
@@ -662,6 +670,7 @@ fn draw_picker(frame: &mut ratatui::Frame, picker: Option<&PickerState>) {
 
     let (body, cursor_line) = match picker {
         None => ("Discovering connections…".to_string(), 0),
+        Some(picker) if picker.model_entry().is_some() => render_model_options_with_cursor(picker),
         Some(picker) => render_picker_body_with_cursor(picker),
     };
     let interior_height = chunks[0].height.saturating_sub(2) as usize;
@@ -684,10 +693,11 @@ fn draw_picker(frame: &mut ratatui::Frame, picker: Option<&PickerState>) {
             "API key for {id} (stored in OS keyring, never in config; enter confirms, esc cancels): {}",
             "•".repeat(len)
         )
-    } else if let Some((id, current, buffer)) = picker.and_then(|p| p.model_entry()) {
-        format!(
-            "Model for {id} (current: {current}; type exact id, empty = default; enter confirms, esc cancels): {buffer}"
-        )
+    } else if let Some((_, _, buffer)) = picker.and_then(|p| p.model_entry()) {
+        // The id/current model are shown in the body pane's pick-list heading
+        // instead (see `render_model_options_with_cursor`), so only the typed
+        // filter/override text needs to appear here.
+        format!("type to filter, ↑/↓ choose, empty enter = default, esc cancels: {buffer}")
     } else {
         picker
             .and_then(|p| p.flash.as_deref())
@@ -770,6 +780,43 @@ fn render_picker_body_with_cursor(picker: &PickerState) -> (String, usize) {
     if out.is_empty() {
         out.push_str("No candidate connections were found.\n");
     }
+    (out, cursor_line)
+}
+
+/// Renders the model pick-list that takes over the body pane while the model
+/// editor (`m`) is open, mirroring `render_picker_body_with_cursor`'s `>`-marker
+/// convention so `draw_picker`'s scroll-into-view logic keeps working unmodified.
+///
+/// Falls back to an explanatory line instead of a list when the row being edited
+/// has no known models (a custom endpoint, a hand-configured CLI, or a vendor this
+/// build simply has no curated list for) — typing remains the only way to set a
+/// model there, exactly as the editor behaved before this list existed.
+fn render_model_options_with_cursor(picker: &PickerState) -> (String, usize) {
+    let mut out = String::new();
+    let mut cursor_line = 0;
+
+    let Some((id, current, _buffer)) = picker.model_entry() else {
+        return (out, cursor_line);
+    };
+    out.push_str(&format!("Model for {id} (current: {current})\n\n"));
+    let mut current_line = 2;
+
+    let options = picker.model_options();
+    if options.is_empty() {
+        out.push_str("No known models for this connection — type the exact id below.\n");
+    } else {
+        for (name, is_selected) in options {
+            let cursor = if is_selected {
+                cursor_line = current_line;
+                ">"
+            } else {
+                " "
+            };
+            out.push_str(&format!("{cursor} {name}\n"));
+            current_line += 1;
+        }
+    }
+
     (out, cursor_line)
 }
 
@@ -1032,6 +1079,89 @@ mod tests {
         assert!(body.contains("○ idle"));
         assert!(body.contains("× broken"));
         assert!(body.contains("(daemon is down)"));
+    }
+
+    #[test]
+    fn render_model_options_with_cursor_marks_only_the_selected_row() {
+        use crate::config::Transport;
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+
+        let candidate = Candidate {
+            id: "anthropic".into(),
+            group: "ANTHROPIC".into(),
+            model: "claude-opus-5".into(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://api.anthropic.com".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        };
+        let mut picker = PickerState::new(
+            vec![candidate],
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+        );
+        picker.start_model_entry();
+        picker.move_model_selection_down();
+
+        let (body, cursor_line) = render_model_options_with_cursor(&picker);
+        let lines: Vec<&str> = body.lines().collect();
+        let marked: Vec<&&str> = lines.iter().filter(|l| l.starts_with('>')).collect();
+
+        assert_eq!(
+            marked.len(),
+            1,
+            "expected exactly one highlighted row: {lines:?}"
+        );
+        assert_eq!(lines[cursor_line], *marked[0]);
+        // The heading names the row being edited and its current model, since the
+        // hint line no longer repeats them (see `draw_picker`).
+        assert!(lines[0].contains("anthropic"));
+        assert!(lines[0].contains("claude-opus-5"));
+    }
+
+    #[test]
+    fn render_model_options_with_cursor_falls_back_to_a_message_when_the_row_has_no_known_list() {
+        use crate::config::Transport;
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+
+        // An Api-transport row (Ollama rows can't enter model-edit mode at all)
+        // whose id matches no curated vendor list.
+        let candidate = Candidate {
+            id: "custom-endpoint".into(),
+            group: "CUSTOM".into(),
+            model: "whatever-model".into(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://example.com/v1".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        };
+        let mut picker = PickerState::new(
+            vec![candidate],
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+        );
+        picker.start_model_entry();
+
+        let (body, _) = render_model_options_with_cursor(&picker);
+
+        assert!(
+            body.contains("No known models"),
+            "expected the no-known-models fallback message: {body}"
+        );
+        assert!(
+            !body.contains('>'),
+            "an empty list must not mark any row as selected: {body}"
+        );
     }
 
     #[test]
@@ -1466,6 +1596,56 @@ mod tests {
         picker.submit_model_entry();
 
         assert_eq!(picker.display_model(0, 0), "anthropic/claude-sonnet-4");
+    }
+
+    #[test]
+    fn handle_picker_key_up_and_down_move_the_model_highlight_while_editing() {
+        use crate::config::Transport;
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+
+        let candidate = Candidate {
+            id: "anthropic".into(),
+            group: "ANTHROPIC".into(),
+            model: "claude-opus-5".into(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://api.anthropic.com".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        };
+        let mut picker = PickerState::new(
+            vec![candidate],
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+        );
+        handle_picker_key(&mut picker, KeyCode::Char('m'), KeyModifiers::NONE);
+        let selected = |p: &PickerState| {
+            p.model_options()
+                .iter()
+                .position(|(_, is_selected)| *is_selected)
+                .unwrap()
+        };
+        let start = selected(&picker);
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert_eq!(
+            selected(&picker),
+            start + 1,
+            "Down must move the highlight forward by one"
+        );
+
+        let outcome = handle_picker_key(&mut picker, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(outcome, PickerKeyOutcome::Continue);
+        assert_eq!(
+            selected(&picker),
+            start,
+            "Up must move the highlight back to where it started"
+        );
     }
 
     #[test]

@@ -56,9 +56,11 @@ In the picker, status dots show **● connected/verified**, **◐ connected but
 authentication unverified**, **○ not connected**, and **× connected but
 unavailable** (with the reason shown on that row). The same legend is used by
 `simon models`, `/commander`, and the startup chat transcript. Cloud API keys are
-checked with a short, no-token authentication request; Ollama is verified through
-its live model list. A CLI executable remains **◐** until its first real request
-because an automatic test prompt could cost money or let an agentic CLI run tools.
+checked with a short, no-token authentication request; **●** means the provider's
+inference authentication accepted the key, not that credits or the selected model
+were exercised. Ollama is verified through its live model list. A CLI executable
+remains **◐** until its first real request because an automatic test prompt could
+cost money or let an agentic CLI run tools.
 **Space** toggles a connection, **c** marks the highlighted row, **m** opens a model
 picker, **tab** cycles a candidate's transport, and **enter** connects — but only
 once a commander has been chosen; until then it just flashes a reminder to press
@@ -106,9 +108,10 @@ policy, and what a crash costs you.
 | Provider | Transport | Discovery |
 |---|---|---|
 | `ollama` | local HTTP daemon | `GET /api/tags` at startup |
-| `anthropic` | `POST /v1/messages` | enabled when a key is stored |
-| `openai`, `openrouter`, `groq` | `POST /chat/completions` | enabled when a key is stored |
-| local CLI tools | subprocess (argv, no shell) | Copilot, Claude, Antigravity, Codex, and `llm` auto-detected; custom tools configured in `config.json` |
+| `anthropic` | `POST /v1/messages` | key checked with `GET /v1/models` |
+| `openai`, `google`, `groq` | `POST /chat/completions` | key checked with `GET /models` |
+| `openrouter` | `POST /chat/completions` | inference auth checked with an empty, non-generating request to the same endpoint |
+| local CLI tools | subprocess (argv, no shell) | executable auto-detected; authentication remains unverified until first use |
 
 Routing is per provider. A key stored for one vendor is only ever sent to that vendor's
 endpoint.

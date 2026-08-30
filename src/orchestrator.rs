@@ -1245,14 +1245,13 @@ pub async fn discover_candidates(settings: &Settings, classified: bool) -> Vec<C
     candidates
 }
 
-/// Returns the URL to probe and the auth style to use, without making a request.
-/// OpenRouter requires a dedicated `/auth/key` endpoint; everything else uses the
-/// standard `/models` list. Custom endpoint overrides are always treated as generic
-/// OpenAI-compatible regardless of the vendor id.
+/// Returns the URL to probe without making a request. OpenRouter is checked against
+/// its actual inference route: its key-management endpoint can accept a credential
+/// that chat generation still rejects. Other providers use their models list.
 fn probe_url_for(id: &str, endpoint: &crate::config::CloudEndpoint, is_builtin: bool) -> String {
     let base = endpoint.base_url.trim_end_matches('/');
     if is_builtin && id.eq_ignore_ascii_case("openrouter") {
-        return format!("{base}/auth/key");
+        return format!("{base}/chat/completions");
     }
     match endpoint.api {
         crate::config::Api::Anthropic => format!("{base}/v1/models"),
@@ -1270,25 +1269,54 @@ pub(crate) async fn probe_cloud_endpoint(
     client: &reqwest::Client,
 ) -> Availability {
     let url = probe_url_for(id, endpoint, is_builtin);
+    let probes_openrouter_chat = is_builtin && id.eq_ignore_ascii_case("openrouter");
 
-    let req = match endpoint.api {
-        crate::config::Api::Anthropic => client
-            .get(&url)
-            .header("x-api-key", key.expose_secret())
-            .header(
-                "anthropic-version",
-                crate::providers::cloud::ANTHROPIC_VERSION,
-            ),
-        crate::config::Api::OpenAiCompatible => client.get(&url).bearer_auth(key.expose_secret()),
+    let req = if probes_openrouter_chat {
+        // An empty JSON object cannot start a generation because OpenRouter requires
+        // either `messages` or `prompt`. Its documented response is 400/422 after
+        // successful authentication and 401 when inference credentials are invalid,
+        // so this exercises the same auth path as a real turn without spending tokens.
+        client
+            .post(&url)
+            .bearer_auth(key.expose_secret())
+            .json(&serde_json::json!({}))
+    } else {
+        match endpoint.api {
+            crate::config::Api::Anthropic => client
+                .get(&url)
+                .header("x-api-key", key.expose_secret())
+                .header(
+                    "anthropic-version",
+                    crate::providers::cloud::ANTHROPIC_VERSION,
+                ),
+            crate::config::Api::OpenAiCompatible => {
+                client.get(&url).bearer_auth(key.expose_secret())
+            }
+        }
     };
 
     match req.send().await {
         Ok(response) => {
             let status = response.status();
-            if status.is_success() {
+            let code = status.as_u16();
+            if status.is_success() || (probes_openrouter_chat && matches!(code, 400 | 422)) {
                 return Availability::Available;
             }
-            let code = status.as_u16();
+            if probes_openrouter_chat && code == 401 {
+                return Availability::Unavailable(
+                    "inference authentication rejected (401; check the key/account; management \
+                     keys cannot generate)"
+                        .into(),
+                );
+            }
+            if probes_openrouter_chat && code == 403 {
+                return Availability::Unavailable("generation access denied (403)".into());
+            }
+            if probes_openrouter_chat && code == 402 {
+                return Availability::Unavailable(
+                    "generation unavailable: insufficient credits (402)".into(),
+                );
+            }
             if code == 401 || code == 403 {
                 return Availability::Unavailable(format!("authentication rejected ({code})"));
             }
@@ -7388,20 +7416,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openrouter_builtin_probe_targets_auth_key_path() {
+    async fn openrouter_builtin_probe_uses_the_chat_auth_path_without_generating() {
+        for invalid_body_status in [400, 422] {
+            let (listener, base) = bind_probe_listener().await;
+            let served = tokio::spawn(serve_once_returning_request(listener, invalid_body_status));
+            let endpoint = openai_endpoint(&base);
+            let result = probe_cloud_endpoint(
+                "openrouter",
+                &endpoint,
+                true,
+                &test_key(),
+                &probe_test_client(),
+            )
+            .await;
+            let request = served.await.unwrap();
+
+            assert_eq!(result, Availability::Available);
+            assert!(
+                request.starts_with("POST /chat/completions "),
+                "OpenRouter must probe the same inference endpoint used for real turns: {request}"
+            );
+            assert!(
+                request.ends_with("\r\n\r\n{}"),
+                "the probe body must remain empty and non-generating: {request}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn openrouter_chat_probe_rejects_credentials_that_inference_rejects() {
         let (listener, base) = bind_probe_listener().await;
-        let served = tokio::spawn(serve_once_returning_path(listener, 200));
-        let endpoint = openai_endpoint(&base);
-        let _ = probe_cloud_endpoint(
+        tokio::spawn(serve_once_returning_path(listener, 401));
+
+        let result = probe_cloud_endpoint(
             "openrouter",
-            &endpoint,
-            true, // is_builtin = true → must use /auth/key
+            &openai_endpoint(&base),
+            true,
             &test_key(),
             &probe_test_client(),
         )
         .await;
-        let path = served.await.unwrap();
-        assert_eq!(path, "/auth/key", "openrouter builtin must probe /auth/key");
+
+        assert_eq!(
+            result,
+            Availability::Unavailable(
+                "inference authentication rejected (401; check the key/account; management keys \
+                 cannot generate)"
+                    .into()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_chat_probe_surfaces_generation_permission_failures() {
+        let (listener, base) = bind_probe_listener().await;
+        tokio::spawn(serve_once_returning_path(listener, 403));
+
+        let result = probe_cloud_endpoint(
+            "openrouter",
+            &openai_endpoint(&base),
+            true,
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Availability::Unavailable("generation access denied (403)".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn openrouter_chat_probe_surfaces_insufficient_credits() {
+        let (listener, base) = bind_probe_listener().await;
+        tokio::spawn(serve_once_returning_path(listener, 402));
+
+        let result = probe_cloud_endpoint(
+            "openrouter",
+            &openai_endpoint(&base),
+            true,
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Availability::Unavailable("generation unavailable: insufficient credits (402)".into())
+        );
     }
 
     #[tokio::test]

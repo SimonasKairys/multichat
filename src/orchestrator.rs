@@ -426,6 +426,8 @@ const DELEGATION_RETRY_BACKOFF: [Duration; MAX_DELEGATION_ATTEMPTS - 1] =
 ///   CLI, see `local_binary`); doing that twice more is not a recovery strategy;
 /// - a misconfigured binary (missing path, empty path) fails identically forever;
 /// - an invalid model or exhausted quota needs user/configuration action;
+/// - an authentication failure (HTTP 401/403) means the configured credentials are
+///   wrong or lack permission; retrying resends the same header and fails identically;
 /// - a `--classified` refusal is a policy decision, not a blip.
 fn is_retryable_delegation_error(error: &str) -> bool {
     // "timed out after", not bare "timed out": every timeout simon raises itself is
@@ -444,6 +446,16 @@ fn is_retryable_delegation_error(error: &str) -> bool {
         "insufficient_quota",
         "quota exceeded",
         "exceeded your current quota",
+        // Both `cloud.rs` and `ollama.rs` format a non-2xx response as
+        // "<provider> returned <status>: <detail>", where `<status>` is
+        // `reqwest::StatusCode`'s `Display` — always the numeric code followed by its
+        // fixed canonical reason phrase, never provider- or attacker-controlled text.
+        // An OpenRouter 401 ("openrouter returned 401 Unauthorized: {\"error\":...
+        // \"User not found.\"...}") was observed retried twice before failing, wasting
+        // ~11s: a bad or revoked API key answers every retry identically, so this
+        // belongs with the other configuration failures above, not the transient ones.
+        "401 unauthorized",
+        "403 forbidden",
         // Not bare "classified": every real refusal is worded "refused under
         // --classified" (see `discover_ollama`/`build_vendor_candidate`), and bare
         // "classified" also matches "unclassified", "declassified" and
@@ -5504,6 +5516,21 @@ mod tests {
             is_retryable_delegation_error("provider failed: rate limit exceeded"),
             "short-lived rate limiting should still use the bounded retry path"
         );
+    }
+
+    #[test]
+    fn an_authentication_failure_is_not_retried() {
+        // Captured verbatim from a live run: a bad OpenRouter key was retried twice
+        // (~11s wasted) before the delegation finally gave up, because nothing in
+        // `PERMANENT` recognized it. A 401/403 answers every retry identically — only
+        // fixing the credentials helps — so it belongs with the other
+        // configuration failures, not the transient ones.
+        assert!(!is_retryable_delegation_error(
+            r#"openrouter returned 401 Unauthorized: {"error":{"message":"User not found.","code":401}}"#
+        ));
+        assert!(!is_retryable_delegation_error(
+            "Ollama returned 403 Forbidden: access denied"
+        ));
     }
 
     #[test]

@@ -2353,7 +2353,13 @@ impl Orchestrator {
             })
             .await;
 
-            let system = self.system_prompt();
+            // A delegated task is intentionally isolated from the shared ledger.
+            // Besides matching the protocol's documented contract ("its prompt is
+            // all it gets"), this prevents a later worker in the same batch from
+            // copying an earlier worker's identity or result. The scoped prompt still
+            // carries the file-write protocol, the only sub-agent action executed
+            // below.
+            let system = SwarmLedger::subagent_system_prompt(&target_label);
             // Only what is sent is augmented; the ledger and the TUI keep the
             // commander's own wording, the same split `commander_preamble` uses.
             let effective_task = format!("{}{}", subagent_preamble(), delegation.prompt);
@@ -2919,6 +2925,39 @@ mod tests {
         async fn send(&self, _system: Option<&str>, _prompt: &str) -> Result<Reply> {
             Ok(Reply {
                 text: self.reply.clone(),
+                rate_limit: RateLimit::default(),
+                usage: TokenUsage::default(),
+            })
+        }
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+        fn provider_name(&self) -> &str {
+            &self.provider
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+    }
+
+    /// A provider that records the exact system/user context it receives, making
+    /// delegated prompt isolation observable without a live model call.
+    struct ContextCapturingProvider {
+        provider: String,
+        model: String,
+        calls: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl Provider for ContextCapturingProvider {
+        async fn send(&self, system: Option<&str>, prompt: &str) -> Result<Reply> {
+            self.calls.lock().unwrap().push((
+                self.label(),
+                system.unwrap_or_default().to_string(),
+                prompt.to_string(),
+            ));
+            Ok(Reply {
+                text: "done".into(),
                 rate_limit: RateLimit::default(),
                 usage: TokenUsage::default(),
             })
@@ -4132,6 +4171,95 @@ mod tests {
             delegated, 4,
             "a request for all four non-commander models must not stop after three"
         );
+    }
+
+    #[tokio::test]
+    async fn sequential_delegations_do_not_receive_the_shared_ledger_or_each_others_results() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for model in ["one", "two"] {
+            let provider = ContextCapturingProvider {
+                provider: "worker".into(),
+                model: model.into(),
+                calls: calls.clone(),
+            };
+            providers.insert(provider.label(), Arc::new(provider));
+        }
+        let registry = Registry {
+            providers,
+            primary: "primary:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut orch = Orchestrator {
+            registry,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![4u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+        orch.ledger
+            .record_commander_reply("COMMANDER-SECRET-MARKER and all delegation lines");
+
+        orch.run_delegations(
+            "primary:commander",
+            "ACTION: delegate_task(worker:one, FIRST-TASK-MARKER)\n\
+             ACTION: delegate_task(worker:two, SECOND-TASK-MARKER)",
+        )
+        .await;
+
+        // Drain the channel so a sender failure cannot hide behind an unread event.
+        while event_rx.try_recv().is_ok() {}
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        for (index, (label, system, prompt)) in calls.iter().enumerate() {
+            assert!(
+                system.contains(&format!("connected as `{label}`")),
+                "delegated model did not receive its own identity: {system}"
+            );
+            assert!(
+                system.contains("### File write protocol"),
+                "delegated model lost the only action protocol it may use: {system}"
+            );
+            assert!(
+                !system.contains("## SWARM LEDGER")
+                    && !system.contains("COMMANDER-SECRET-MARKER")
+                    && !system.contains("FIRST-TASK-MARKER")
+                    && !system.contains("SECOND-TASK-MARKER")
+                    && !system.contains("### Delegation protocol")
+                    && !system.contains("### Skills protocol")
+                    && !system.contains("### File read protocol"),
+                "delegated model received shared conversation/task context: {system}"
+            );
+            let own_marker = if index == 0 {
+                "FIRST-TASK-MARKER"
+            } else {
+                "SECOND-TASK-MARKER"
+            };
+            let other_marker = if index == 0 {
+                "SECOND-TASK-MARKER"
+            } else {
+                "FIRST-TASK-MARKER"
+            };
+            assert!(
+                prompt.contains(own_marker)
+                    && !prompt.contains(other_marker)
+                    && !prompt.contains("COMMANDER-SECRET-MARKER"),
+                "delegated model received another turn's user context: {prompt}"
+            );
+        }
     }
 
     #[tokio::test]

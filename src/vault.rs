@@ -2,10 +2,12 @@
 //!
 //! The only thing this stores is the TUI transcript (`App::transcript` in
 //! `src/app.rs`), opted into with `simon chat --vault`. It hands the *user* their
-//! history back across sessions; it is not conversation memory for a model —
-//! `Orchestrator::handle_prompt` still sends no message history on any turn, vault or
-//! not. See the "Security posture" section of `README.md` for the full picture,
-//! including the self-destruct policy as a data-loss property.
+//! history back across sessions; it does not replay that transcript to a model.
+//! `Orchestrator::handle_prompt` still sends no transport-level message history,
+//! vault or not. The commander's bounded previous reply is carried separately in the
+//! ledger, while delegated models receive isolated task prompts. See the "Security
+//! posture" section of `README.md` for the full picture, including the self-destruct
+//! policy as a data-loss property.
 //!
 //! File layout (all integers big-endian):
 //!

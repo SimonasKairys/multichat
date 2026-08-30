@@ -65,8 +65,10 @@ struct ChatArgs {
     model: Option<String>,
     /// Persist the TUI transcript across sessions in an encrypted, password-
     /// protected vault. Off by default, so behaviour is unchanged unless asked
-    /// for. This restores the user's own history — it does not give any model
-    /// conversation memory; every turn is still sent with no message history.
+    /// for. This restores the user's own history, not the full transcript to a
+    /// model: every transport call still has no message history. Only the
+    /// commander's bounded previous reply is carried in the ledger; delegated
+    /// models receive isolated task prompts.
     #[arg(long)]
     vault: bool,
     /// Write files without asking. By default every `write_file` a model proposes

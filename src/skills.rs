@@ -13,11 +13,10 @@ use std::path::{Component, Path, PathBuf};
 const MAX_SKILL_BYTES: u64 = 256 * 1024;
 
 /// Ceiling on how much of a skill file gets read while hunting for frontmatter.
-/// `list_with_descriptions` runs on every `system_prompt()` call — which is every
-/// prompt AND every delegation, per the orchestrator — so it must not read whole
-/// files (some may be up to `MAX_SKILL_BYTES`, i.e. 256KB, each). Frontmatter is a
-/// handful of lines at the very top of the file, so 1KB is generous headroom and
-/// keeps this cheap no matter how many skills or how large the files get.
+/// `list_with_descriptions` runs on every commander `system_prompt()` call, so it must
+/// not read whole files (some may be up to `MAX_SKILL_BYTES`, i.e. 256KB, each).
+/// Frontmatter is a handful of lines at the very top of the file, so 1KB is generous
+/// headroom and keeps this cheap no matter how many skills or how large the files get.
 const FRONTMATTER_HEAD_BYTES: usize = 1024;
 
 #[cfg(unix)]
@@ -225,9 +224,9 @@ impl SkillsDir {
         // symlink inside the root pointing outside it (exactly the threat this
         // module's doc comment names) reaches this function too. Without `resolve()`
         // here, that symlink's target would be read and its frontmatter rendered
-        // straight into the system prompt sent to every model, including remote
-        // ones — even though `read()` already refuses to serve the same file. Both
-        // paths must agree on what's inside the root.
+        // straight into the commander's system prompt, including when the commander
+        // is remote — even though `read()` already refuses to serve the same file.
+        // Both paths must agree on what's inside the root.
         let path = self.resolve(name).ok()?;
         let meta = fs::metadata(&path).ok()?;
         if !meta.is_file() || reject_multi_linked_regular_file(&path, &meta, name).is_err() {
@@ -431,8 +430,8 @@ mod tests {
     fn only_a_bounded_head_is_read_looking_for_frontmatter() {
         // A description far beyond FRONTMATTER_HEAD_BYTES must not be found — proves
         // the read is actually bounded, not just documented as such. This matters
-        // because `system_prompt()` calls into this on every prompt and every
-        // delegation; reading whole (up to 256KB) files that often would be wasteful.
+        // because `system_prompt()` calls into this on every commander prompt;
+        // reading whole (up to 256KB) files that often would be wasteful.
         let (_guard, s) = skills();
         let padding = "x".repeat(FRONTMATTER_HEAD_BYTES + 100);
         let content = format!("---\n{padding}\ndescription: too far in to be found\n---\n");
@@ -472,9 +471,9 @@ mod tests {
         // pointing outside it was still listed. `read_description` used to join
         // straight onto `self.root` instead of calling `resolve()`, so it happily
         // opened the escaping target and rendered its frontmatter description into
-        // the system prompt sent to every model — even though `read()` on the very
-        // same name already refused it. The two must agree: `description` here
-        // must be `None`, and `read()` must still be `Err`.
+        // the commander's system prompt — even when the commander was remote — though
+        // `read()` on the very same name already refused it. The two must agree:
+        // `description` here must be `None`, and `read()` must still be `Err`.
         let (guard, s) = skills();
         let outside = guard.path().join("secret.md");
         fs::write(

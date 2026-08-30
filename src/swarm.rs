@@ -1,4 +1,5 @@
-//! The shared "blackboard" every model sees, and the ReAct delegation protocol.
+//! The commander's shared "blackboard" across turns, and the ReAct delegation
+//! protocol. Delegated models receive an isolated, task-specific prompt instead.
 
 use std::collections::BTreeMap;
 
@@ -53,7 +54,7 @@ pub struct FileWrite {
 }
 
 /// Ceiling on a stored task result, in characters. The ledger is re-injected into
-/// *every* prompt for the rest of the session, so an unbounded sub-agent reply
+/// every commander prompt for the rest of the session, so an unbounded sub-agent reply
 /// (a full file dump, say) would make every subsequent turn's system prompt grow by
 /// that much. 2000 chars is enough for a useful summary or error message without
 /// letting one delegation dominate the token budget of every turn that follows.
@@ -63,27 +64,27 @@ const MAX_RESULT_CHARS: usize = 2000;
 ///
 /// Same bound-the-ledger reasoning as `MAX_RESULT_CHARS`, and the same size for the
 /// same reason: this is one turn's prose, not a document, and it is re-rendered into
-/// every prompt until it is replaced.
+/// every commander prompt until it is replaced.
 const MAX_PREVIOUS_TURN_CHARS: usize = 2000;
 
 /// How many of the most recent tasks get rendered in the system prompt. The ledger
 /// never forgets a task (older ones may still matter for the transcript), but
-/// rendering all of them into every prompt would make the system prompt grow without
-/// bound over a long session. Older tasks are elided rather than dropped — see
+/// rendering all of them into every commander prompt would make the system prompt grow
+/// without bound over a long session. Older tasks are elided rather than dropped — see
 /// `system_prompt`.
 const MAX_RENDERED_TASKS: usize = 20;
 
 /// How many skills may be loaded into the ledger at once. Same reasoning as
-/// `MAX_RESULT_CHARS`: the ledger is re-injected into every prompt for the rest of
-/// the session, so an unbounded number of loaded skills would make every subsequent
-/// turn's system prompt grow without bound. Loading a skill past this cap evicts the
-/// oldest — see `record_skill`.
+/// `MAX_RESULT_CHARS`: the ledger is re-injected into every commander prompt for the
+/// rest of the session, so an unbounded number of loaded skills would make every
+/// subsequent turn's system prompt grow without bound. Loading a skill past this cap
+/// evicts the oldest — see `record_skill`.
 const MAX_LOADED_SKILLS: usize = 3;
 
 /// Ceiling on a single loaded skill's content, in characters. Skill files may be up
-/// to 256KB (`skills::MAX_SKILL_BYTES`); injecting one in full into every prompt for
-/// the rest of the session would dominate the token budget of every turn that
-/// follows. 4000 chars is enough for a skill's actual instructions without that.
+/// to 256KB (`skills::MAX_SKILL_BYTES`); injecting one in full into every commander
+/// prompt for the rest of the session would dominate the token budget of every turn
+/// that follows. 4000 chars is enough for a skill's actual instructions without that.
 const MAX_SKILL_CONTENT_CHARS: usize = 4000;
 
 /// A skill a model has loaded into context via `ACTION: read_skill(...)`. Kept
@@ -97,10 +98,10 @@ pub struct LoadedSkill {
 
 /// How many `ACTION: write_file(...)` outcomes stay in the ledger. Same
 /// bound-the-ledger reasoning as `MAX_LOADED_SKILLS`: the ledger is re-injected into
-/// every prompt, so an unbounded history of writes would make every subsequent turn's
-/// system prompt grow without bound. Only name and status are ever stored here —
-/// never file content — so this is far cheaper per entry than a loaded skill, and the
-/// cap can afford to be generous.
+/// every commander prompt, so an unbounded history of writes would make every
+/// subsequent turn's system prompt grow without bound. Only name and status are ever
+/// stored here — never file content — so this is far cheaper per entry than a loaded
+/// skill, and the cap can afford to be generous.
 const MAX_RECORDED_WRITES: usize = 20;
 
 /// The recorded outcome of an `ACTION: write_file(...)` request: the path and either
@@ -116,16 +117,16 @@ pub struct WrittenFile {
 
 /// How many project files may be loaded into the ledger via `ACTION: read_file(...)`
 /// at once. Same reasoning as `MAX_LOADED_SKILLS`: the ledger is re-injected into
-/// every prompt for the rest of the session, so an unbounded number of loaded reads
-/// would make every subsequent turn's system prompt grow without bound. Loading a
-/// read past this cap evicts the oldest — see `record_file_read`.
+/// every commander prompt for the rest of the session, so an unbounded number of
+/// loaded reads would make every subsequent turn's system prompt grow without bound.
+/// Loading a read past this cap evicts the oldest — see `record_file_read`.
 const MAX_LOADED_READS: usize = 3;
 
 /// Ceiling on a single loaded project file's content, in characters. Same reasoning
 /// as `MAX_SKILL_CONTENT_CHARS`, applied to project files instead of skill files:
 /// `Workspace::read` already caps a single file at 256KB
 /// (`workspace::MAX_FILE_BYTES`), which is still far too much to inject into every
-/// prompt for the rest of the session.
+/// commander prompt for the rest of the session.
 const MAX_READ_CONTENT_CHARS: usize = 4000;
 
 /// A project file a model has loaded into context via `ACTION: read_file(...)`. Kept
@@ -151,9 +152,9 @@ const MAX_RECORDED_LISTS: usize = 20;
 /// `record_skill`, `record_file_read`) already caps its content the same way, but
 /// `record_file_list` stored `outcome` verbatim. `Workspace::list` allows up to
 /// `workspace::MAX_LIST_ENTRIES` (500) entries in one listing, which for a directory
-/// of long file names is still far too much to inject into every prompt for the rest
-/// of the session — `docs/AUDIT-2026-07-30.md` §3.2 named this section specifically
-/// as the one with no per-item content cap at all. Same size as
+/// of long file names is still far too much to inject into every commander prompt for
+/// the rest of the session — `docs/AUDIT-2026-07-30.md` §3.2 named this section
+/// specifically as the one with no per-item content cap at all. Same size as
 /// `MAX_READ_CONTENT_CHARS`: a listing is metadata rather than file content, but
 /// there is no reason its cap should be any looser than a loaded file's.
 const MAX_LIST_OUTCOME_CHARS: usize = 4000;
@@ -394,9 +395,9 @@ impl SwarmLedger {
 
     /// Records a delegation's outcome — the sub-agent's reply on success, or the
     /// error text on failure — so it becomes visible to the delegating model. The
-    /// ledger is only re-rendered into the *next* prompt sent to any model, so the
-    /// result does not reach the delegator within the same turn it was requested in;
-    /// see `system_prompt`'s protocol text.
+    /// ledger is only re-rendered into the commander's *next* prompt, so the result
+    /// does not reach the delegator within the same turn it was requested in; see
+    /// `system_prompt`'s protocol text.
     pub fn record_result(&mut self, id: usize, result: &str) {
         if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
             // Truncate on a char boundary, not a byte index — `result` may contain
@@ -677,6 +678,34 @@ impl SwarmLedger {
         out
     }
 
+    /// Builds the deliberately isolated system prompt for a delegated model.
+    ///
+    /// The commander protocol promises that a sub-agent sees only the self-contained
+    /// task written for it, not the conversation or shared ledger. Besides keeping
+    /// that contract honest, isolation prevents sequential delegations from copying
+    /// an earlier model's identity or answer. A sub-agent still needs the file-write
+    /// protocol because writes are the only `ACTION:` blocks its reply may execute.
+    pub fn subagent_system_prompt(model_label: &str) -> String {
+        let mut out = format!(
+            "## DELEGATED MODEL CONTEXT\n\n\
+             You are connected as `{model_label}`. This label is your identity for \
+             this task. When asked which model you are, use this exact label; do not \
+             claim to be another model.\n\
+             You are a sub-agent, not the swarm commander. Work only from the \
+             delegated task in the user message. You do not receive the shared \
+             ledger, the broader conversation, or other models' prompts or results, \
+             and must not infer or reproduce them.\n\
+             The file-write protocol below is the only swarm action recognized from \
+             your reply.\n"
+        );
+        out.push_str(Self::file_write_protocol());
+        out.push_str(
+            "A delegated model receives no automatic follow-up turn. Emit complete \
+             file contents in this reply and do not wait for a write outcome.\n",
+        );
+        out
+    }
+
     fn render_roster(&self) -> String {
         let mut out = String::from("### Available models\n");
         if self.roster.is_empty() {
@@ -791,9 +820,9 @@ impl SwarmLedger {
             return out;
         };
 
-        // Named for the commander rather than addressed to "you": every model reads
-        // this same ledger, and a sub-agent must not mistake the commander's plan for
-        // something it said itself.
+        // Named for the commander rather than addressed to "you" because the ledger
+        // is persistent state rendered back across otherwise stateless commander
+        // calls.
         push_structural(
             &mut out,
             note_budget,
@@ -1064,25 +1093,10 @@ impl SwarmLedger {
              another past the cap evicts the oldest loaded skill.\n",
         );
 
+        out.push_str(Self::file_write_protocol());
         out.push_str(
-            "\n### File write protocol\n\
-             Any model may create or overwrite files in the project folder, including \
-             a sub-agent running a delegated task — this is how work that produces \
-             files actually produces them. Emit exactly this form:\n\
-             `ACTION: write_file(<relative path>)`\n\
-             followed by the file's content, one line at a time, followed by a line of \
-             exactly `ACTION: end_file`. Paths are relative to the project root; \
-             subdirectories are created automatically. Files are capped at 256KB. \
-             Writes into `.git/` are refused — a bad write there can corrupt the \
-             repository. A line exactly `ACTION: end_file` cannot appear inside the \
-             content — it always closes the block there instead. `ACTION: \
-             delegate_task(...)`, `ACTION: read_skill(...)`, `ACTION: read_file(...)`, \
-             and `ACTION: list_files(...)` lines inside the content are treated as \
-             content, not executed, so you can safely write documentation about this \
-             protocol. Every write is shown to the user, who must approve it before \
-             it reaches disk; a refusal is recorded like any other outcome. Like a \
-             delegation result, the outcome is recorded in this ledger and becomes \
-             visible to you on your NEXT turn, not this one.\n",
+            "Like a delegation result, the outcome is recorded in this ledger and \
+             becomes visible to you on your NEXT turn, not this one.\n",
         );
 
         out.push_str(
@@ -1107,6 +1121,25 @@ impl SwarmLedger {
         out
     }
 
+    fn file_write_protocol() -> &'static str {
+        "\n### File write protocol\n\
+         Any model may create or overwrite files in the project folder, including \
+         a sub-agent running a delegated task — this is how work that produces \
+         files actually produces them. Emit exactly this form:\n\
+         `ACTION: write_file(<relative path>)`\n\
+         followed by the file's content, one line at a time, followed by a line of \
+         exactly `ACTION: end_file`. Paths are relative to the project root; \
+         subdirectories are created automatically. Files are capped at 256KB. \
+         Writes into `.git/` are refused — a bad write there can corrupt the \
+         repository. A line exactly `ACTION: end_file` cannot appear inside the \
+         content — it always closes the block there instead. `ACTION: \
+         delegate_task(...)`, `ACTION: read_skill(...)`, `ACTION: read_file(...)`, \
+         and `ACTION: list_files(...)` lines inside the content are treated as \
+         content, not executed, so you can safely write documentation about this \
+         protocol. Every write is shown to the user, who must approve it before \
+         it reaches disk; a refusal is recorded like any other outcome.\n"
+    }
+
     /// Extracts every `ACTION: delegate_task(target, prompt)` line from a reply.
     ///
     /// Splits on the *first* comma (so the target cannot contain one) and matches to the
@@ -1120,7 +1153,7 @@ impl SwarmLedger {
     /// explains it constantly — "you would write ACTION: delegate_task(model, task) in
     /// your reply" — and matching mid-line executed that sentence: a real sub-agent
     /// call, one of the three delegation slots for the turn, and a task written into
-    /// the shared ledger that every model afterwards reads as fact. A comment beside
+    /// the shared ledger that the commander afterwards reads as fact. A comment beside
     /// `parse_file_writes` used to justify the permissive siblings on the grounds that
     /// a stray match there "costs one ignored request"; it does not, and this is what
     /// it actually cost. `parse_file_writes` has required a whole-line match for a
@@ -1417,8 +1450,8 @@ mod tests {
     fn prose_that_merely_mentions_an_action_does_not_execute_it() {
         // The worst of this set. A model told to use the protocol explains it, and the
         // explanation used to run: a real sub-agent call, one of the three delegation
-        // slots for the turn, and a task written into the ledger every model then reads
-        // as fact. The same held for the other three actions.
+        // slots for the turn, and a task written into the ledger the commander then
+        // reads as fact. The same held for the other three actions.
         let prose = "To delegate work, you would write ACTION: delegate_task(ollama:llama3, \
                      summarize this) in your reply.";
         assert!(

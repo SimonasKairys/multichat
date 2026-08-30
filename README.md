@@ -164,7 +164,7 @@ whichever cloud provider is primary on the next turn. Delegating *to* a local mo
 not keep the answer local. Same mitigation, same caveat as skills above: `--classified`
 refuses every remote provider, and there is no narrower control.
 
-Every model receives a shared ledger in its system prompt listing the other reachable
+The commander receives a shared ledger in its system prompt listing the other reachable
 models, observed rate-limit budgets, and open tasks. A model delegates by emitting:
 
 ```
@@ -173,8 +173,11 @@ ACTION: delegate_task(ollama:mistral, summarise the attached diff)
 
 The orchestrator runs the sub-task and records the reply — or, on failure, the error —
 on that task in the ledger, tagged `[DONE]` or `[FAILED]`, where the delegating model
-sees it on its next turn. At most 3 delegations run per turn, and they run one after
-another, not concurrently.
+sees it on its next turn. Each sub-agent receives only its self-contained task, its own
+connection label, and the sub-agent/file-write instructions — not the shared ledger,
+conversation, or other models' prompts and results. This prevents sequential workers
+from copying one another's answers or identities. At most 10 delegations run per turn,
+and they run one after another, not concurrently.
 
 **The commander orients and proposes before it delegates.** Given anything more than a
 direct question it works in three steps: look at the project first (listing directories
@@ -281,8 +284,9 @@ At most 3 skills stay loaded at once, each size-capped; loading a fourth evicts 
 oldest. A successful load gets a transcript line naming the skill and its size.
 
 The skills directory stays **read-only** to models. A model that could write a skill
-file could inject its own content into the system prompt sent to every model for the
-rest of the session, so it is deliberately a separate tree from the project folder.
+file could inject its own content into the commander's system prompt for the rest of
+the session, including when the commander is remote, so it is deliberately a separate
+tree from the project folder.
 
 ### Project files
 
@@ -491,11 +495,13 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   (`App::transcript`: what you and the models said, nothing else) encrypted with
   AES-256-GCM under an Argon2id-derived key, opt-in and off by default. The salt lives
   in the file header and is bound as authenticated data, so tampering with it breaks
-  decryption. This is **user-visible history, not model memory** — no model ever
-  receives the transcript or any prior turn as context; every prompt is still sent
-  alone (see [Delegation](#delegation)). `simon vault status` reports the vault's path,
-  failed-attempt count, and where it stands in its idle window without ever asking for
-  a password (those two fields are plaintext header data — see
+  decryption. This is **user-visible history, not replayed model memory** — the full
+  transcript is never sent back to a model. Every transport call has no message
+  history; only the commander's bounded previous reply is carried through the ledger,
+  while sub-agents receive isolated task prompts (see [Delegation](#delegation)).
+  `simon vault status` reports the vault's path, failed-attempt count, and where it
+  stands in its idle window without ever asking for a password (those two fields are
+  plaintext header data — see
   [Known limits](#known-limits-of-what-is-implemented)). `simon vault destroy` deletes
   it after a typed `yes`.
 - **Path-traversal protection** on the read-only skills directory: `..`, absolute paths,
@@ -519,9 +525,10 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   have been observed writing files during a delegation `simon` recorded as failed. Note the scope of the check: it establishes that the *user*
   consented, not that the content is correct — nothing inspects what is being written. The skills directory
   itself remains read-only to models — a model that could write a skill file could
-  inject its own content into the system prompt sent to every model for the rest of
-  the session — so this is deliberately a separate tree, not a relaxation of that
-  guarantee. **This confinement is `simon`'s own protocol only** — it does not extend
+  inject its own content into the commander's system prompt for the rest of the
+  session, including when the commander is remote — so this is deliberately a
+  separate tree, not a relaxation of that guarantee. **This confinement is `simon`'s
+  own protocol only** — it does not extend
   to a spawned CLI provider (`claude`, `gemini`, `codex`, …), which merely *starts* in
   the project folder and is free to read or write anywhere its own shell/filesystem
   access reaches; see [Project files](#project-files) for the honest boundary.

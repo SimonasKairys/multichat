@@ -101,6 +101,8 @@ pub enum ActivityKind {
     /// user's point of view, either way `simon` is momentarily touching the
     /// filesystem on the model's behalf, not two meaningfully different waits.
     ReadingProject,
+    /// Running a user-approved proof command in an isolated task copy.
+    RunningCommand,
 }
 
 impl ActivityKind {
@@ -110,6 +112,7 @@ impl ActivityKind {
             ActivityKind::Delegating => "running delegated task",
             ActivityKind::ReadingSkill => "reading skill",
             ActivityKind::ReadingProject => "reading project files",
+            ActivityKind::RunningCommand => "running proof command",
         }
     }
 }
@@ -191,6 +194,10 @@ pub struct App {
     /// `handle_key` in `ui/mod.rs` — because answering it is the only thing that lets
     /// the turn continue.
     pub pending_write: Option<PendingWrite>,
+    /// Set while the commander is waiting for explicit permission to run one proof
+    /// command in an isolated task copy. Separate from `pending_write`: command
+    /// approval never has an "all" option and is not affected by `--auto-write`.
+    pub pending_run: Option<PendingRun>,
     pub should_quit: bool,
 }
 
@@ -216,6 +223,23 @@ impl PendingWrite {
                 self.author, self.path, self.bytes
             ),
         }
+    }
+}
+
+/// A task-copy command the user has been asked to allow.
+#[derive(Debug, Clone)]
+pub struct PendingRun {
+    pub author: String,
+    pub task_id: usize,
+    pub argv_display: String,
+}
+
+impl PendingRun {
+    pub fn question(&self) -> String {
+        format!(
+            "{} wants to RUN in task copy #{}: {}? [y]es  [n]o",
+            self.author, self.task_id, self.argv_display
+        )
     }
 }
 
@@ -263,6 +287,7 @@ impl App {
                 .collect(),
             usage: BTreeMap::new(),
             pending_write: None,
+            pending_run: None,
             should_quit: false,
         }
     }
@@ -420,6 +445,7 @@ impl App {
             Event::ActivityStarted { .. }
                 | Event::ActivityProgress { .. }
                 | Event::UsageUpdated { .. }
+                | Event::AutoContinuation { .. }
         ) {
             self.activity = None;
         }
@@ -517,6 +543,85 @@ impl App {
             Event::WriteDenied { author, path } => self.transcript.push(Line {
                 speaker: Speaker::System,
                 text: format!("refused {author}'s write: {path}"),
+            }),
+            Event::TaskCopyCreated {
+                task_id,
+                files,
+                bytes,
+                excluded,
+            } => self.transcript.push(Line {
+                speaker: Speaker::System,
+                text: format!(
+                    "created isolated task copy #{task_id} · {files} files · {bytes} bytes · {excluded} excluded"
+                ),
+            }),
+            Event::TaskCopyReleased {
+                task_id,
+                applied,
+            } => self.transcript.push(Line {
+                speaker: Speaker::System,
+                text: if applied {
+                    format!("applied and released task copy #{task_id}")
+                } else {
+                    format!("discarded task copy #{task_id}")
+                },
+            }),
+            Event::RunRequested {
+                author,
+                task_id,
+                argv_display,
+            } => {
+                self.transcript.push(Line {
+                    speaker: Speaker::System,
+                    text: format!(
+                        "--- {author} requests a proof run in task copy #{task_id} ---\n{argv_display}"
+                    ),
+                });
+                self.pending_run = Some(PendingRun {
+                    author,
+                    task_id,
+                    argv_display,
+                });
+            }
+            Event::RunDenied { author, task_id } => {
+                self.pending_run = None;
+                self.transcript.push(Line {
+                    speaker: Speaker::System,
+                    text: format!("refused {author}'s proof run in task copy #{task_id}"),
+                });
+            }
+            Event::RunCompleted {
+                author,
+                task_id,
+                outcome,
+                chars,
+                millis,
+            } => {
+                self.pending_run = None;
+                let status = match outcome {
+                    crate::swarm::RunOutcome::Exited(0) => "exit 0".to_string(),
+                    crate::swarm::RunOutcome::Exited(code) => {
+                        format!("FAILED, exit {code}")
+                    }
+                    crate::swarm::RunOutcome::TimedOut => "TIMED OUT".to_string(),
+                    crate::swarm::RunOutcome::Denied => "DENIED".to_string(),
+                    crate::swarm::RunOutcome::Rejected => "REJECTED".to_string(),
+                    crate::swarm::RunOutcome::SpawnFailed => "SPAWN FAILED".to_string(),
+                    crate::swarm::RunOutcome::ResourceLimit => {
+                        "RESOURCE LIMIT".to_string()
+                    }
+                };
+                self.transcript.push(Line {
+                    speaker: Speaker::System,
+                    text: format!(
+                        "{author} proof run in task copy #{task_id}: {status} · {chars} chars · {}",
+                        format_duration(millis)
+                    ),
+                });
+            }
+            Event::AutoContinuation { turn, max } => self.transcript.push(Line {
+                speaker: Speaker::System,
+                text: format!("automatically continuing · turn {turn} of {max}"),
             }),
             Event::SkillLoaded { name, chars } => self.transcript.push(Line {
                 speaker: Speaker::System,
@@ -684,6 +789,9 @@ impl App {
         // turn is blocked on this answer, so the status line must ask for it rather
         // than keep spinning as though it were still waiting on a model.
         if let Some(pending) = &self.pending_write {
+            return self.with_usage(&pending.author, pending.question());
+        }
+        if let Some(pending) = &self.pending_run {
             return self.with_usage(&pending.author, pending.question());
         }
         match &self.activity {
@@ -1345,6 +1453,48 @@ mod tests {
             app.transcript
                 .iter()
                 .any(|l| l.text.contains("fn main() {}"))
+        );
+    }
+
+    #[test]
+    fn a_pending_run_takes_over_the_status_line_and_has_no_approve_all() {
+        let mut app = app();
+        app.apply(Event::ActivityStarted {
+            label: "commander".into(),
+            kind: ActivityKind::Primary,
+        });
+        app.apply(Event::RunRequested {
+            author: "commander".into(),
+            task_id: 7,
+            argv_display: "cargo test -- parser::regression".into(),
+        });
+
+        let line = app.status_line_at(Instant::now());
+        assert!(line.contains("RUN in task copy #7"));
+        assert!(line.contains("cargo test"));
+        assert!(line.contains("[y]es"));
+        assert!(line.contains("[n]o"));
+        assert!(!line.contains("[a]ll"));
+        assert!(!line.contains("awaiting reply"));
+        assert!(app.pending_run.is_some());
+    }
+
+    #[test]
+    fn automatic_continuation_keeps_activity_and_busy_state() {
+        let mut app = app();
+        app.busy = true;
+        app.apply(Event::ActivityStarted {
+            label: "commander".into(),
+            kind: ActivityKind::Primary,
+        });
+        app.apply(Event::AutoContinuation { turn: 1, max: 5 });
+
+        assert!(app.busy);
+        assert!(app.activity.is_some());
+        assert!(
+            app.transcript
+                .iter()
+                .any(|line| line.text.contains("automatically continuing"))
         );
     }
 

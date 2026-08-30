@@ -22,6 +22,8 @@ use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::isolation::{ApplyPlan, CopyQuota, IsolationBroker, SnapshotSummary};
+
 /// Largest file a single read or write may move. Mirrors `skills::MAX_SKILL_BYTES` in
 /// spirit — a bound on how much a single filesystem operation can move — but this
 /// caps arbitrary project content, not something curated for a prompt, so the number
@@ -72,6 +74,7 @@ fn reject_multi_linked_regular_file(
 
 pub struct Workspace {
     root: PathBuf,
+    task_copies: Option<IsolationBroker>,
 }
 
 impl Workspace {
@@ -97,11 +100,95 @@ impl Workspace {
         }
         let root = fs::canonicalize(&root)
             .with_context(|| format!("failed to resolve {}", root.display()))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            task_copies: None,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Enables bounded per-task snapshots under Simon's private data directory.
+    ///
+    /// Kept on `Workspace` rather than `Orchestrator` so existing orchestrator test
+    /// fixtures that construct the latter with struct literals do not need a second
+    /// filesystem authority field. Temporary `Workspace` values opened for one copy
+    /// keep this disabled.
+    pub fn enable_task_copies(&mut self, data_dir: &Path) -> Result<()> {
+        self.task_copies = Some(IsolationBroker::new(data_dir)?);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_task_copies_with_limits(
+        &mut self,
+        data_dir: &Path,
+        limits: crate::isolation::IsolationLimits,
+    ) -> Result<()> {
+        self.task_copies = Some(IsolationBroker::new_with_limits(data_dir, limits)?);
+        Ok(())
+    }
+
+    pub fn create_task_copy(&mut self, task_id: usize) -> Result<SnapshotSummary> {
+        let root = self.root.clone();
+        self.task_copies
+            .as_mut()
+            .ok_or_else(|| anyhow!("isolated task copies are not available"))?
+            .create_copy(&task_id.to_string(), &root)
+    }
+
+    pub fn task_copy_root(&self, task_id: usize) -> Option<PathBuf> {
+        self.task_copies
+            .as_ref()
+            .and_then(|copies| copies.workspace_root(&task_id.to_string()))
+    }
+
+    pub fn has_task_copy(&self, task_id: usize) -> bool {
+        self.task_copies
+            .as_ref()
+            .is_some_and(|copies| copies.contains(&task_id.to_string()))
+    }
+
+    pub fn task_copy_quota(&self, task_id: usize) -> Result<CopyQuota> {
+        self.task_copies
+            .as_ref()
+            .ok_or_else(|| anyhow!("isolated task copies are not available"))?
+            .copy_quota(&task_id.to_string())
+    }
+
+    pub fn validate_task_copy(&self, task_id: usize) -> Result<()> {
+        self.task_copies
+            .as_ref()
+            .ok_or_else(|| anyhow!("isolated task copies are not available"))?
+            .validate_copy(&task_id.to_string())
+    }
+
+    pub fn precheck_task_copy_write(
+        &self,
+        task_id: usize,
+        path: &str,
+        content_len: usize,
+    ) -> Result<()> {
+        self.task_copies
+            .as_ref()
+            .ok_or_else(|| anyhow!("isolated task copies are not available"))?
+            .precheck_write(&task_id.to_string(), Path::new(path), content_len as u64)
+    }
+
+    pub fn plan_task_copy_apply(&self, task_id: usize) -> Result<ApplyPlan> {
+        self.task_copies
+            .as_ref()
+            .ok_or_else(|| anyhow!("isolated task copies are not available"))?
+            .plan_apply(&task_id.to_string(), &self.root)
+    }
+
+    pub fn release_task_copy(&mut self, task_id: usize) -> Result<()> {
+        self.task_copies
+            .as_mut()
+            .ok_or_else(|| anyhow!("isolated task copies are not available"))?
+            .release(&task_id.to_string())
     }
 
     /// Lexical component check shared by every entry point that accepts a
@@ -256,14 +343,61 @@ impl Workspace {
             ));
         }
         self.reject_git_writes(requested, candidate)?;
+        self.reject_non_directory_parent(requested, candidate)?;
         let path = self.root.join(candidate);
         if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "project path `{requested}` is a symlink, refusing to write through it"
+                ));
+            }
             if meta.is_dir() {
                 return Err(anyhow!("project path `{requested}` is a directory"));
+            }
+            if !meta.is_file() {
+                return Err(anyhow!("project path `{requested}` is not a regular file"));
             }
             reject_multi_linked_regular_file(&path, &meta, requested, "write")?;
         }
         Ok(())
+    }
+
+    fn reject_non_directory_parent(&self, requested: &str, candidate: &Path) -> Result<()> {
+        let joined = self.root.join(candidate);
+        let Some(mut ancestor) = joined.parent() else {
+            return Err(anyhow!("project path `{requested}` has no parent"));
+        };
+        loop {
+            match fs::symlink_metadata(ancestor) {
+                Ok(_) => {
+                    let metadata = fs::metadata(ancestor).with_context(|| {
+                        format!("project path `{requested}` has an unusable existing parent")
+                    })?;
+                    if !metadata.is_dir() {
+                        return Err(anyhow!(
+                            "project path `{requested}` has a parent that is not a directory"
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    let Some(parent) = ancestor.parent() else {
+                        return Err(anyhow!("project path `{requested}` has no existing parent"));
+                    };
+                    ancestor = parent;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to inspect a parent of project path `{requested}`")
+                    });
+                }
+            }
+        }
     }
     /// Refuses any write whose path passes through a `.git` component.
     ///
@@ -456,6 +590,9 @@ impl Workspace {
             }
             if meta.is_dir() {
                 return Err(anyhow!("project path `{requested}` is a directory"));
+            }
+            if !meta.is_file() {
+                return Err(anyhow!("project path `{requested}` is not a regular file"));
             }
             reject_multi_linked_regular_file(&resolved, &meta, requested, "write")?;
         }
@@ -1032,5 +1169,20 @@ mod tests {
             err.contains("is a directory"),
             "expected error containing 'is a directory', got: {err}"
         );
+    }
+
+    #[test]
+    fn precheck_rejects_a_file_where_a_parent_directory_is_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = Workspace::new(dir.path().to_path_buf()).unwrap();
+        fs::write(dir.path().join("blocked"), "not a directory").unwrap();
+
+        let error = w
+            .precheck("blocked/nested/file.txt", 5)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("parent that is not a directory"), "{error}");
+        assert!(!dir.path().join("blocked/nested").exists());
     }
 }

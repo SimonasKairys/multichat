@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::app::ActivityKind;
 use crate::audit::AuditLogger;
+use crate::command_runner::{COMMAND_TIMEOUT, execute_command, validate_command};
 use crate::config::{ConnectionSpec, Credentials, Paths, Settings, Transport};
 use crate::providers::{
     ProgressSink, Provider, RateLimit, TokenUsage,
@@ -26,7 +27,7 @@ use crate::providers::{
     ollama::OllamaProvider,
 };
 use crate::skills::SkillsDir;
-use crate::swarm::SwarmLedger;
+use crate::swarm::{CopyDisposition, Delegation, RunOutcome, RunRequest, SwarmLedger, TaskStatus};
 use crate::workspace::Workspace;
 
 /// Delegations honoured per user turn, so a model cannot spin the swarm forever.
@@ -49,6 +50,104 @@ const MAX_READ_ACTIONS_PER_TURN: usize = 3;
 /// manifest is already four — and the user, not this number, is the real limit on how
 /// much lands.
 const MAX_WRITES_PER_TURN: usize = 10;
+const MAX_RUN_ACTIONS_PER_TURN: usize = 2;
+const MAX_COPY_ACTIONS_PER_TURN: usize = 5;
+const MAX_APPLY_FILES: usize = 500;
+
+/// Automatic commander follow-ups per user message. Together with the initial call,
+/// this permits six bounded reasoning/action rounds before the workflow is stopped.
+const MAX_AUTO_CONTINUATION_TURNS: u8 = 5;
+
+/// Total protocol actions that one user message may trigger across every automatic
+/// round. Per-action-type caps still apply inside each round.
+const MAX_ACTIONS_PER_WORKFLOW: usize = 48;
+
+const CONTINUATION_PROMPT: &str = "[automatic continuation] This is not a new user turn. Action results are now recorded in the ledger. Continue the already-authorized workflow without re-proposing it or asking the user to type `continue`; when the work is complete, give the final answer with no ACTION lines.";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ActionKey {
+    Delegation {
+        target: String,
+        prompt_hash: u64,
+        workspace_task: Option<usize>,
+    },
+    SkillRead(String),
+    FileRead(String),
+    FileList(String),
+    FileWrite {
+        path: String,
+        content_hash: u64,
+    },
+    Run {
+        task_id: usize,
+        argv_hash: u64,
+    },
+    ApplyCopy(usize),
+    DiscardCopy(usize),
+}
+
+#[derive(Debug)]
+struct TurnOutcome {
+    commander_failed: bool,
+    action_fingerprint: Vec<ActionKey>,
+    state_fingerprint: u64,
+    action_limit: Option<ActionLimit>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionLimit {
+    PerTurn,
+    Workflow,
+}
+
+fn hash_action_str(value: &str) -> u64 {
+    const OFFSET: u64 = 14_695_981_039_346_656_037;
+    const PRIME: u64 = 1_099_511_628_211;
+    value.bytes().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+    })
+}
+
+fn take_action_budget<T>(
+    requests: Vec<T>,
+    per_turn_limit: usize,
+    remaining: &mut usize,
+) -> (Vec<T>, bool, bool) {
+    let total_requested = requests.len();
+    let requested = requests.len().min(per_turn_limit);
+    let allowed = requested.min(*remaining);
+    *remaining -= allowed;
+    (
+        requests.into_iter().take(allowed).collect(),
+        requested < total_requested,
+        allowed < requested,
+    )
+}
+
+fn display_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| format!("{arg:?}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summarize_paths(paths: &[String]) -> String {
+    const SHOWN: usize = 10;
+    let mut summary = paths
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if paths.len() > SHOWN {
+        summary.push_str(&format!(", ... and {} more", paths.len() - SHOWN));
+    }
+    summary
+}
+
+fn continuation_prompt(original_prompt: &str) -> String {
+    format!("{CONTINUATION_PROMPT}\n\n--- original user request ---\n{original_prompt}")
+}
 
 /// The commander directive prepended to the user's own prompt, or `None` when the
 /// commander is the only model connected and there is therefore nobody to delegate to.
@@ -96,8 +195,9 @@ fn commander_preamble(primary: &str, roster: &[String]) -> Option<String> {
          and is never recorded, so from where they sit it changed by itself. Every \
          file you write goes out as a write block in your reply, exactly like a \
          sub-agent's, and the user approves it before it lands. Do not run the \
-         project's code either; that is the author's job to arrange, not a side \
-         effect of your inspection.\n\
+         project's code with your own shell or tools. Proof commands are available \
+         only through Simon's explicit `ACTION: run_command(...)` protocol and only \
+         inside an isolated delegated-task copy, where the user approves each run.\n\
          2. PROPOSE, and stop. Say what you found, what you intend to do, any real \
          alternative worth weighing and why you prefer yours, and exactly which \
          tasks you would give to which model and why that model. Then stop and let \
@@ -107,14 +207,21 @@ fn commander_preamble(primary: &str, roster: &[String]) -> Option<String> {
          capable model with `ACTION: delegate_task(<label>, <self-contained \
          prompt>)`, then stop and say what you delegated; results reach you on your \
          NEXT turn. Use `ACTION: delegate_file_task(<label>, <self-contained prompt>)` \
-         instead when the task must create or edit project files; only that explicit \
-         form gives the worker the file-write protocol and permits its write blocks \
-         to execute. Tell it exactly which files to write and what each must contain. \
-         Give one file, or one coherent group of files, per delegation. Keep only \
-         judgement and synthesis for yourself.\n\
+         instead when the task must create or edit project files; that creates a \
+         bounded isolated copy and only that explicit form gives the worker the \
+         file-write protocol. Its writes stay in the copy, never the user's project. \
+         Use `ACTION: delegate_in_copy(<task id>, <label>, <prompt>)` to continue the \
+         same RED → fix → GREEN investigation. Tell it exactly what evidence or files \
+         to produce. Keep judgement, proof review, and synthesis for yourself.\n\
          If the user asks to hear from every connected model, emit every required \
-         delegation in this reply (up to the 10-delegation safety cap). There is no \
-         automatic continuation turn, so never promise to query omitted models later.\n\
+         delegation in this reply (up to the 10-delegation safety cap). After any \
+         ACTION requests finish, their results are fed back to you automatically on \
+         a bounded continuation turn; do not ask the user to type `continue`.\n\
+         For defect work, do not accept an agent's claim as proof. Have it name an \
+         exact argv-only proof, run that command yourself in its task copy, inspect \
+         that RED failed for the claimed reason rather than a malformed test, then \
+         continue the same copy for the fix and rerun GREEN plus relevant regressions. \
+         Apply or discard the copy explicitly; there is no automatic merge.\n\
          If the user has already told you what to do, or already approved a plan, \
          treat step 2 as done and get on with it — do not re-propose what has been \
          settled.\n\
@@ -219,6 +326,35 @@ pub enum Event {
     },
     /// The user refused a write. Distinct from `Error`: nothing went wrong.
     WriteDenied { author: String, path: String },
+    /// A bounded snapshot was created for a file-producing delegated task.
+    TaskCopyCreated {
+        task_id: usize,
+        files: usize,
+        bytes: u64,
+        excluded: usize,
+    },
+    /// A task copy was explicitly applied or discarded and then removed.
+    TaskCopyReleased { task_id: usize, applied: bool },
+    /// A validated task-copy command is waiting for explicit user approval.
+    RunRequested {
+        author: String,
+        task_id: usize,
+        argv_display: String,
+    },
+    /// The user refused a proof command. Nothing was spawned.
+    RunDenied { author: String, task_id: usize },
+    /// A proof command finished. Nonzero and timeout outcomes are evidence, not
+    /// orchestration errors, so both travel through this event.
+    RunCompleted {
+        author: String,
+        task_id: usize,
+        outcome: RunOutcome,
+        chars: usize,
+        millis: u64,
+    },
+    /// Action results were recorded and the commander is being called again without
+    /// requiring the user to type "continue".
+    AutoContinuation { turn: u8, max: u8 },
     /// A skill was read successfully. A failed read still goes through `Event::Error`
     /// (unchanged), which is enough on its own to clear the activity indicator.
     SkillLoaded { name: String, chars: usize },
@@ -2234,9 +2370,9 @@ pub struct Orchestrator {
     /// — with the same project root the session started with, without re-reading it
     /// from anywhere else.
     project_root: PathBuf,
-    /// Answers to `Event::WriteRequested`, from the UI. `None` when the session was
-    /// started with writes pre-approved (`--auto-write`), which is also what test and
-    /// non-interactive callers pass.
+    /// Answers to write and proof-run approval events from the UI. Production keeps
+    /// this connected even under `--auto-write`, because that flag skips file
+    /// approvals only; tests and non-interactive callers may pass `None`.
     decisions: Option<mpsc::Receiver<WriteDecision>>,
     /// Set by a `WriteDecision::ApproveAll`; skips the prompt for the rest of the
     /// session. Never persisted — see `WriteDecision`.
@@ -2251,21 +2387,24 @@ impl Orchestrator {
         classified: bool,
         events: mpsc::Sender<Event>,
         decisions: Option<mpsc::Receiver<WriteDecision>>,
+        auto_write: bool,
     ) -> Result<Self> {
         let mut ledger = SwarmLedger::new();
         ledger.set_roster(registry.labels());
+        let mut workspace = Workspace::new(project_root.clone())?;
+        workspace.enable_task_copies(&paths.data_dir)?;
 
         Ok(Self {
             registry,
             ledger,
             audit: AuditLogger::open(paths.audit_log.clone())?,
             skills: SkillsDir::new(paths.skills_dir.clone())?,
-            workspace: Workspace::new(project_root.clone())?,
+            workspace,
             events,
             classified,
             project_root,
             decisions,
-            approve_all: false,
+            approve_all: auto_write,
         })
     }
 
@@ -2353,7 +2492,77 @@ impl Orchestrator {
             match command {
                 Command::Shutdown => break,
                 Command::Prompt(prompt) => {
-                    self.handle_prompt(&prompt).await;
+                    let mut remaining_actions = MAX_ACTIONS_PER_WORKFLOW;
+                    let mut continuation_turn = 0u8;
+                    let mut previous_progress: Option<(Vec<ActionKey>, u64)> = None;
+                    let continuation_prompt = continuation_prompt(&prompt);
+                    let mut outcome = self
+                        .handle_prompt_round(&prompt, false, &mut remaining_actions)
+                        .await;
+
+                    loop {
+                        if outcome.commander_failed {
+                            break;
+                        }
+                        if let Some(limit) = outcome.action_limit {
+                            let (message, kind) = match limit {
+                                ActionLimit::Workflow => (
+                                    format!(
+                                        "auto-continuation stopped: workflow action limit ({MAX_ACTIONS_PER_WORKFLOW}) reached"
+                                    ),
+                                    "workflow_actions",
+                                ),
+                                ActionLimit::PerTurn => (
+                                    "auto-continuation stopped: a per-turn action limit was exceeded"
+                                        .into(),
+                                    "per_turn_actions",
+                                ),
+                            };
+                            let _ = self
+                                .audit
+                                .log("continuation.capped", &format!("kind={kind}"));
+                            self.emit(Event::Error(message)).await;
+                            break;
+                        }
+                        if outcome.action_fingerprint.is_empty() {
+                            break;
+                        }
+                        if previous_progress.as_ref()
+                            == Some(&(
+                                outcome.action_fingerprint.clone(),
+                                outcome.state_fingerprint,
+                            ))
+                        {
+                            let _ = self.audit.log("continuation.stalled", "repeated_actions");
+                            self.emit(Event::Error(
+                                "auto-continuation stopped: the commander repeated the same actions with the same results"
+                                    .into(),
+                            ))
+                            .await;
+                            break;
+                        }
+                        if continuation_turn >= MAX_AUTO_CONTINUATION_TURNS {
+                            let _ = self.audit.log("continuation.capped", "kind=turns");
+                            self.emit(Event::Error(format!(
+                                "auto-continuation stopped: turn limit ({MAX_AUTO_CONTINUATION_TURNS}) reached"
+                            )))
+                            .await;
+                            break;
+                        }
+
+                        previous_progress =
+                            Some((outcome.action_fingerprint, outcome.state_fingerprint));
+                        continuation_turn += 1;
+                        self.emit(Event::AutoContinuation {
+                            turn: continuation_turn,
+                            max: MAX_AUTO_CONTINUATION_TURNS,
+                        })
+                        .await;
+                        outcome = self
+                            .handle_prompt_round(&continuation_prompt, true, &mut remaining_actions)
+                            .await;
+                    }
+
                     self.emit(Event::TurnComplete).await;
                 }
                 Command::Reconfigure(settings) => {
@@ -2464,17 +2673,38 @@ impl Orchestrator {
         .await;
     }
 
-    async fn handle_prompt(&mut self, prompt: &str) {
+    #[cfg(test)]
+    async fn handle_prompt(&mut self, prompt: &str) -> TurnOutcome {
+        let mut remaining_actions = MAX_ACTIONS_PER_WORKFLOW;
+        self.handle_prompt_round(prompt, false, &mut remaining_actions)
+            .await
+    }
+
+    async fn handle_prompt_round(
+        &mut self,
+        prompt: &str,
+        is_continuation: bool,
+        remaining_actions: &mut usize,
+    ) -> TurnOutcome {
         let primary_label = self.registry.primary().to_string();
         let _ = self.audit.log(
-            "prompt.sent",
+            if is_continuation {
+                "prompt.continuation"
+            } else {
+                "prompt.sent"
+            },
             &format!("model={primary_label} chars={}", prompt.chars().count()),
         );
 
         let Some(provider) = self.registry.get(&primary_label) else {
             self.emit(Event::Error(format!("model `{primary_label}` disappeared")))
                 .await;
-            return;
+            return TurnOutcome {
+                commander_failed: true,
+                action_fingerprint: Vec::new(),
+                state_fingerprint: self.ledger.state_fingerprint(),
+                action_limit: None,
+            };
         };
 
         self.emit(Event::ActivityStarted {
@@ -2504,7 +2734,12 @@ impl Orchestrator {
                 );
                 self.emit(Event::Error(format!("{primary_label}: {e}")))
                     .await;
-                return;
+                return TurnOutcome {
+                    commander_failed: true,
+                    action_fingerprint: Vec::new(),
+                    state_fingerprint: self.ledger.state_fingerprint(),
+                    action_limit: None,
+                };
             }
         };
         // Drops the sink, closing the forwarding task's channel — see
@@ -2542,37 +2777,153 @@ impl Orchestrator {
         // reads run on the stripped text; writes run last, keeping the existing
         // execution order (delegations, then skill reads) unchanged for the two
         // actions that already existed.
-        let (writes, stripped) = SwarmLedger::parse_file_writes(&reply.text);
+        let (raw_writes, stripped) = SwarmLedger::parse_file_writes(&reply.text);
 
         // Recorded before the actions run, so a plan the commander just proposed is in
         // the ledger regardless of what any of them do.
         self.ledger.record_commander_reply(&stripped);
 
-        self.run_delegations(&primary_label, &stripped).await;
-        self.run_skill_reads(&primary_label, &stripped).await;
-        self.run_file_reads(&primary_label, &stripped).await;
-        self.run_file_lists(&primary_label, &stripped).await;
+        let (delegations, delegation_per_turn, delegation_workflow) = take_action_budget(
+            SwarmLedger::parse_delegations(&stripped),
+            MAX_DELEGATIONS_PER_TURN,
+            remaining_actions,
+        );
+        let (skill_reads, skill_per_turn, skill_workflow) = take_action_budget(
+            SwarmLedger::parse_read_skill(&stripped),
+            MAX_READ_ACTIONS_PER_TURN,
+            remaining_actions,
+        );
+        let (file_reads, file_read_per_turn, file_read_workflow) = take_action_budget(
+            SwarmLedger::parse_read_files(&stripped),
+            MAX_READ_ACTIONS_PER_TURN,
+            remaining_actions,
+        );
+        let (file_lists, file_list_per_turn, file_list_workflow) = take_action_budget(
+            SwarmLedger::parse_list_files(&stripped),
+            MAX_READ_ACTIONS_PER_TURN,
+            remaining_actions,
+        );
+        let (writes, write_per_turn, write_workflow) =
+            take_action_budget(raw_writes, MAX_WRITES_PER_TURN, remaining_actions);
+        let (run_requests, run_per_turn, run_workflow) = take_action_budget(
+            SwarmLedger::parse_run_requests(&stripped),
+            MAX_RUN_ACTIONS_PER_TURN,
+            remaining_actions,
+        );
+        let (copy_dispositions, copy_per_turn, copy_workflow) = take_action_budget(
+            SwarmLedger::parse_copy_dispositions(&stripped),
+            MAX_COPY_ACTIONS_PER_TURN,
+            remaining_actions,
+        );
+
+        let mut action_fingerprint = Vec::new();
+        action_fingerprint.extend(delegations.iter().map(|delegation| ActionKey::Delegation {
+            target: delegation.target.clone(),
+            prompt_hash: hash_action_str(&delegation.prompt),
+            workspace_task: delegation.workspace_task,
+        }));
+        action_fingerprint.extend(skill_reads.iter().cloned().map(ActionKey::SkillRead));
+        action_fingerprint.extend(file_reads.iter().cloned().map(ActionKey::FileRead));
+        action_fingerprint.extend(file_lists.iter().cloned().map(ActionKey::FileList));
+        action_fingerprint.extend(writes.iter().map(|write| ActionKey::FileWrite {
+            path: write.path.clone(),
+            content_hash: hash_action_str(&write.content),
+        }));
+        action_fingerprint.extend(run_requests.iter().map(|request| ActionKey::Run {
+            task_id: request.task_id,
+            argv_hash: hash_action_str(&request.argv.join("\0")),
+        }));
+        action_fingerprint.extend(
+            copy_dispositions
+                .iter()
+                .map(|disposition| match disposition {
+                    CopyDisposition::Apply(task_id) => ActionKey::ApplyCopy(*task_id),
+                    CopyDisposition::Discard(task_id) => ActionKey::DiscardCopy(*task_id),
+                }),
+        );
+        action_fingerprint.sort();
+        action_fingerprint.dedup();
+
+        let delegation_execution_limit = self
+            .run_delegation_requests(&primary_label, delegations, remaining_actions)
+            .await;
+        self.run_skill_read_requests(&primary_label, skill_reads)
+            .await;
+        self.run_file_read_requests(&primary_label, file_reads)
+            .await;
+        self.run_file_list_requests(&primary_label, file_lists)
+            .await;
         self.run_file_writes(&primary_label, writes).await;
+        let ran_commands = !run_requests.is_empty();
+        self.run_command_requests(&primary_label, run_requests)
+            .await;
+        self.run_copy_disposition_requests(&primary_label, copy_dispositions, ran_commands)
+            .await;
+
+        TurnOutcome {
+            commander_failed: false,
+            action_fingerprint,
+            state_fingerprint: self.ledger.state_fingerprint(),
+            action_limit: if delegation_execution_limit == Some(ActionLimit::Workflow)
+                || delegation_workflow
+                || skill_workflow
+                || file_read_workflow
+                || file_list_workflow
+                || write_workflow
+                || run_workflow
+                || copy_workflow
+            {
+                Some(ActionLimit::Workflow)
+            } else if delegation_execution_limit == Some(ActionLimit::PerTurn)
+                || delegation_per_turn
+                || skill_per_turn
+                || file_read_per_turn
+                || file_list_per_turn
+                || write_per_turn
+                || run_per_turn
+                || copy_per_turn
+            {
+                Some(ActionLimit::PerTurn)
+            } else {
+                None
+            },
+        }
     }
 
     /// Executes any `delegate_task` or `delegate_file_task` lines the primary emitted.
     ///
     /// Sub-agent replies are not themselves scanned for delegations, so the swarm
     /// cannot recurse indefinitely.
+    #[cfg(test)]
     async fn run_delegations(&mut self, from: &str, reply_text: &str) {
-        let delegations = SwarmLedger::parse_delegations(reply_text);
+        let mut remaining_actions = MAX_ACTIONS_PER_WORKFLOW;
+        let (delegations, _, _) = take_action_budget(
+            SwarmLedger::parse_delegations(reply_text),
+            MAX_DELEGATIONS_PER_TURN,
+            &mut remaining_actions,
+        );
+        self.run_delegation_requests(from, delegations, &mut remaining_actions)
+            .await;
+    }
+
+    async fn run_delegation_requests(
+        &mut self,
+        from: &str,
+        delegations: Vec<Delegation>,
+        remaining_actions: &mut usize,
+    ) -> Option<ActionLimit> {
         if delegations.is_empty() {
-            return;
+            return None;
         }
 
-        for delegation in delegations.into_iter().take(MAX_DELEGATIONS_PER_TURN) {
+        let mut action_limit = None;
+        for delegation in delegations {
             let Some(target) = self.registry.get(&delegation.target) else {
                 let err_msg = format!("cannot delegate to unknown model `{}`", delegation.target);
                 let task_id = self.ledger.add_task(&delegation.prompt);
                 self.ledger.assign_task(task_id, &delegation.target);
                 self.ledger.record_result(task_id, &err_msg);
-                self.ledger
-                    .update_status(task_id, crate::swarm::TaskStatus::Failed);
+                self.ledger.update_status(task_id, TaskStatus::Failed);
                 let _ = self.audit.log(
                     "task.failed",
                     &format!("task={task_id} kind=not_found detail=withheld"),
@@ -2591,6 +2942,128 @@ impl Orchestrator {
 
             let task_id = self.ledger.add_task(&delegation.prompt);
             self.ledger.assign_task(task_id, &target_label);
+            let mut created_workspace = None;
+            let workspace_id = if let Some(source_task_id) = delegation.workspace_task {
+                match self.ledger.resolve_live_workspace_id(source_task_id) {
+                    Some(workspace_id) if self.workspace.has_task_copy(workspace_id) => {
+                        self.ledger.associate_workspace(
+                            task_id,
+                            workspace_id,
+                            Some(&format!("continued from task {source_task_id}")),
+                        );
+                        Some(workspace_id)
+                    }
+                    _ => {
+                        let error = format!("task {source_task_id} has no live isolated copy");
+                        self.ledger.record_result(task_id, &error);
+                        self.ledger.update_status(task_id, TaskStatus::Failed);
+                        let _ = self.audit.log(
+                            "task.failed",
+                            &format!("task={task_id} kind=workspace_unavailable detail=withheld"),
+                        );
+                        self.emit(Event::DelegationFinished {
+                            to: target_label.clone(),
+                            ok: false,
+                            chars: 0,
+                            millis: 0,
+                        })
+                        .await;
+                        self.emit(Event::Error(format!(
+                            "cannot continue task {source_task_id}: {error}"
+                        )))
+                        .await;
+                        continue;
+                    }
+                }
+            } else if delegation.allow_writes {
+                match self.workspace.create_task_copy(task_id) {
+                    Ok(summary) => {
+                        let workspace_id = task_id;
+                        let mut note = format!(
+                            "{} files, {} bytes, {} excluded",
+                            summary.files, summary.bytes, summary.excluded_total
+                        );
+                        if !summary.excluded.is_empty() {
+                            note.push_str("; sample: ");
+                            note.push_str(&truncate_chars(
+                                &sanitize_transcript_detail(&summary.excluded.join("; ")),
+                                500,
+                            ));
+                        }
+                        self.ledger
+                            .associate_workspace(task_id, workspace_id, Some(&note));
+                        created_workspace = Some(workspace_id);
+                        let _ = self.audit.log(
+                            "copy.created",
+                            &format!(
+                                "task={task_id} workspace={workspace_id} files={} bytes={} excluded={}",
+                                summary.files, summary.bytes, summary.excluded_total
+                            ),
+                        );
+                        self.emit(Event::TaskCopyCreated {
+                            task_id,
+                            files: summary.files,
+                            bytes: summary.bytes,
+                            excluded: summary.excluded_total,
+                        })
+                        .await;
+                        Some(workspace_id)
+                    }
+                    Err(error) => {
+                        self.ledger.record_result(task_id, &error.to_string());
+                        self.ledger.update_status(task_id, TaskStatus::Failed);
+                        let _ = self.audit.log(
+                            "task.failed",
+                            &format!("task={task_id} kind=copy_failed detail=withheld"),
+                        );
+                        self.emit(Event::DelegationFinished {
+                            to: target_label.clone(),
+                            ok: false,
+                            chars: 0,
+                            millis: 0,
+                        })
+                        .await;
+                        self.emit(Event::Error(format!(
+                            "could not create isolated copy for task {task_id}: {error}"
+                        )))
+                        .await;
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+
+            let workspace_root = match workspace_id {
+                Some(workspace_id) => match self.workspace.task_copy_root(workspace_id) {
+                    Some(path) => Some(path),
+                    None => {
+                        let error = anyhow!("isolated copy {workspace_id} is unavailable");
+                        self.ledger.record_result(task_id, &error.to_string());
+                        self.ledger.update_status(task_id, TaskStatus::Failed);
+                        self.emit(Event::Error(format!(
+                            "task {task_id} copy is unavailable: {error}"
+                        )))
+                        .await;
+                        if created_workspace.is_some() {
+                            self.release_task_copy(
+                                workspace_id,
+                                false,
+                                format!("task {task_id} setup failed"),
+                            )
+                            .await;
+                        }
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let rerooted_target = workspace_root
+                .as_deref()
+                .and_then(|root| target.with_project_root(root));
+            let monitor_provider_copy = rerooted_target.is_some();
+            let target = rerooted_target.unwrap_or(target);
+
             let _ = self.audit.log(
                 "task.delegated",
                 &format!("from={from} to={target_label} task={task_id}"),
@@ -2624,34 +3097,66 @@ impl Orchestrator {
             let effective_task = format!("{preamble}{}", delegation.prompt);
             let started = Instant::now();
             let mut attempts = 1;
+            let mut copy_quota_failed = false;
             let outcome = loop {
                 let progress = self.spawn_progress_forwarder(target_label.clone());
-                let result = target
-                    .send_with_progress(Some(&system), &effective_task, &progress)
-                    .await
-                    .and_then(|reply| {
-                        if reply.text.trim().is_empty() {
-                            Err(anyhow!("{target_label} produced no output"))
-                        } else {
-                            let (parsed_writes, sub_text) =
-                                SwarmLedger::parse_file_writes(&reply.text);
-                            let sub_writes = if delegation.allow_writes {
-                                parsed_writes
-                            } else {
-                                Vec::new()
-                            };
-                            if sub_text.trim().is_empty() && sub_writes.is_empty() {
-                                // A malformed unterminated write block is removed by
-                                // the parser so its swallowed content cannot execute
-                                // as another action. Validate the usable result, not
-                                // only the raw response, or that safe removal turns a
-                                // non-empty model reply into a blank "success".
-                                Err(anyhow!("{target_label} produced no usable output"))
-                            } else {
-                                Ok((reply, sub_writes, sub_text))
+                let mut provider_result = if monitor_provider_copy
+                    && let (Some(workspace_id), Some(root)) =
+                        (workspace_id, workspace_root.as_deref())
+                {
+                    match self.workspace.task_copy_quota(workspace_id) {
+                        Ok(quota) => {
+                            tokio::select! {
+                                result = target.send_with_progress(
+                                    Some(&system),
+                                    &effective_task,
+                                    &progress,
+                                ) => result,
+                                error = crate::isolation::wait_for_copy_quota_violation(root, quota) => {
+                                    copy_quota_failed = true;
+                                    Err(error.context("delegated CLI exceeded the task-copy storage quota"))
+                                }
                             }
                         }
-                    });
+                        Err(error) => {
+                            copy_quota_failed = true;
+                            Err(error)
+                        }
+                    }
+                } else {
+                    target
+                        .send_with_progress(Some(&system), &effective_task, &progress)
+                        .await
+                };
+                if let Some(workspace_id) = workspace_id
+                    && let Err(error) = self.workspace.validate_task_copy(workspace_id)
+                {
+                    copy_quota_failed = true;
+                    provider_result =
+                        Err(error.context("delegated task exceeded its storage quota"));
+                }
+                let result = provider_result.and_then(|reply| {
+                    if reply.text.trim().is_empty() {
+                        Err(anyhow!("{target_label} produced no output"))
+                    } else {
+                        let (parsed_writes, sub_text) = SwarmLedger::parse_file_writes(&reply.text);
+                        let sub_writes = if delegation.allow_writes {
+                            parsed_writes
+                        } else {
+                            Vec::new()
+                        };
+                        if sub_text.trim().is_empty() && sub_writes.is_empty() {
+                            // A malformed unterminated write block is removed by
+                            // the parser so its swallowed content cannot execute
+                            // as another action. Validate the usable result, not
+                            // only the raw response, or that safe removal turns a
+                            // non-empty model reply into a blank "success".
+                            Err(anyhow!("{target_label} produced no usable output"))
+                        } else {
+                            Ok((reply, sub_writes, sub_text))
+                        }
+                    }
+                });
                 // Drops the sink, closing the forwarding task's channel — see
                 // `spawn_progress_forwarder`'s doc comment. Inside the loop because a
                 // retry needs a fresh sink; the old one's task has already ended.
@@ -2661,7 +3166,10 @@ impl Orchestrator {
                     break result;
                 };
                 let reason = error.to_string();
-                if attempts >= MAX_DELEGATION_ATTEMPTS || !is_retryable_delegation_error(&reason) {
+                if copy_quota_failed
+                    || attempts >= MAX_DELEGATION_ATTEMPTS
+                    || !is_retryable_delegation_error(&reason)
+                {
                     break Err(error);
                 }
 
@@ -2713,15 +3221,82 @@ impl Orchestrator {
                     // gates a commander's does: `Workspace`'s path hardening, and the
                     // user's explicit approval, which now names the sub-agent as the
                     // one asking.
+                    let requested_write_count = sub_writes.len();
+                    let (sub_writes, per_turn_capped, workflow_capped) =
+                        take_action_budget(sub_writes, MAX_WRITES_PER_TURN, remaining_actions);
+                    if workflow_capped {
+                        action_limit = Some(ActionLimit::Workflow);
+                    } else if per_turn_capped && action_limit.is_none() {
+                        action_limit = Some(ActionLimit::PerTurn);
+                    }
                     let write_count = sub_writes.len();
-                    self.run_file_writes(&target_label, sub_writes).await;
-                    let sub_text = if sub_text.trim().is_empty() {
+                    let (mut writes_ok, write_errors) =
+                        if let (Some(workspace_id), Some(workspace_root)) =
+                            (workspace_id, workspace_root.as_deref())
+                        {
+                            self.run_file_writes_in_workspace(
+                                &target_label,
+                                sub_writes,
+                                workspace_root,
+                                Some(workspace_id),
+                            )
+                            .await
+                        } else if sub_writes.is_empty() {
+                            (true, Vec::new())
+                        } else {
+                            let message = format!(
+                                "{target_label} attempted file writes without an isolated copy"
+                            );
+                            self.emit(Event::Error(message.clone())).await;
+                            (false, vec![message])
+                        };
+                    let quota_error = workspace_id.and_then(|workspace_id| {
+                        self.workspace
+                            .validate_task_copy(workspace_id)
+                            .err()
+                            .map(|error| (workspace_id, error))
+                    });
+                    let quota_message = if let Some((workspace_id, error)) = quota_error {
+                        writes_ok = false;
+                        let message =
+                            format!("task copy {workspace_id} exceeded its storage quota: {error}");
+                        self.emit(Event::Error(message.clone())).await;
+                        self.release_task_copy(
+                            workspace_id,
+                            false,
+                            "delegated writes exceeded the task-copy storage quota".into(),
+                        )
+                        .await;
+                        Some(message)
+                    } else {
+                        None
+                    };
+                    let mut sub_text = if sub_text.trim().is_empty() {
                         format!(
                             "Submitted {write_count} file write request{}.",
                             if write_count == 1 { "" } else { "s" }
                         )
                     } else {
                         sub_text
+                    };
+                    if let Some(message) = quota_message {
+                        sub_text.push_str("\n\n");
+                        sub_text.push_str(&message);
+                    }
+                    for error in write_errors {
+                        sub_text.push_str("\n\n");
+                        sub_text.push_str(&error);
+                    }
+                    let writes_ok = if requested_write_count > write_count {
+                        let message = format!(
+                            "Only {write_count} of {requested_write_count} worker write actions were accepted before an action limit was reached."
+                        );
+                        sub_text.push_str("\n\n");
+                        sub_text.push_str(&message);
+                        self.emit(Event::Error(message)).await;
+                        false
+                    } else {
+                        writes_ok
                     };
 
                     // Record the reply on the task before flipping it to Done, so the
@@ -2731,15 +3306,25 @@ impl Orchestrator {
                     // future prompt is exactly the ledger growth `MAX_RESULT_CHARS`
                     // exists to prevent.
                     self.ledger.record_result(task_id, &sub_text);
-                    self.ledger
-                        .update_status(task_id, crate::swarm::TaskStatus::Done);
+                    self.ledger.update_status(
+                        task_id,
+                        if writes_ok {
+                            TaskStatus::Done
+                        } else {
+                            TaskStatus::Failed
+                        },
+                    );
                     let _ = self.audit.log(
-                        "task.completed",
+                        if writes_ok {
+                            "task.completed"
+                        } else {
+                            "task.write_failed"
+                        },
                         &format!("task={task_id} model={target_label}"),
                     );
                     self.emit(Event::DelegationFinished {
                         to: target_label.clone(),
-                        ok: true,
+                        ok: writes_ok,
                         chars: sub_text.chars().count(),
                         millis,
                     })
@@ -2764,8 +3349,17 @@ impl Orchestrator {
                     // WHY it failed and decide whether to retry — a failure with no
                     // explanation is useless to whoever has to act on it.
                     self.ledger.record_result(task_id, &e.to_string());
-                    self.ledger
-                        .update_status(task_id, crate::swarm::TaskStatus::Failed);
+                    self.ledger.update_status(task_id, TaskStatus::Failed);
+                    if let Some(workspace_id) = workspace_id
+                        && (created_workspace.is_some() || copy_quota_failed)
+                    {
+                        self.release_task_copy(
+                            workspace_id,
+                            false,
+                            format!("task {task_id} provider failed"),
+                        )
+                        .await;
+                    }
                     self.emit(Event::DelegationFinished {
                         to: target_label.clone(),
                         ok: false,
@@ -2778,6 +3372,7 @@ impl Orchestrator {
                 }
             }
         }
+        action_limit
     }
 
     /// Executes any `read_skill` lines the primary emitted, mirroring
@@ -2789,16 +3384,20 @@ impl Orchestrator {
     /// non-recursion guarantee holds here too. `primary_label` is who the read is on
     /// behalf of; it is what `Event::ActivityStarted` names, since a skill read is
     /// not a provider call and so has no sub-agent label of its own to report.
+    #[cfg(test)]
     async fn run_skill_reads(&mut self, primary_label: &str, reply_text: &str) {
-        let requests = SwarmLedger::parse_read_skill(reply_text);
+        self.run_skill_read_requests(primary_label, SwarmLedger::parse_read_skill(reply_text))
+            .await;
+    }
 
+    async fn run_skill_read_requests(&mut self, primary_label: &str, requests: Vec<String>) {
         // Mirrors `run_delegations`' bounded-effort rule, but keeps its own smaller
         // filesystem-action limit: the
         // ledger already caps how many skills stay loaded (`MAX_LOADED_SKILLS`), but
         // that caps storage, not effort per turn — without this, a reply with
         // hundreds of `read_skill` lines would still trigger hundreds of filesystem
         // reads, just to have all but the last few evicted immediately after.
-        for name in requests.into_iter().take(MAX_READ_ACTIONS_PER_TURN) {
+        for name in requests {
             self.emit(Event::ActivityStarted {
                 label: primary_label.to_string(),
                 kind: ActivityKind::ReadingSkill,
@@ -2854,10 +3453,9 @@ impl Orchestrator {
     /// `run_skill_reads` in structure: resolve each request and never let one bad
     /// write take down the turn.
     ///
-    /// Only the primary's own reply is ever scanned for write blocks — `writes` here
-    /// comes from `parse_file_writes(&reply.text)` in `handle_prompt`, never from a
-    /// sub-agent's delegation reply — so the same non-recursion guarantee that holds
-    /// for delegations and skill reads holds here too.
+    /// Worker write blocks reach the same helper only for explicit
+    /// `delegate_file_task`/`delegate_in_copy` actions. They cannot recursively
+    /// delegate, read, or execute commands.
     /// Asks the user to allow one write, returning whether it may proceed.
     ///
     /// Returns `true` without asking when the session pre-approved writes
@@ -2868,7 +3466,12 @@ impl Orchestrator {
     /// closed is the only defensible choice for a gate whose entire purpose is that
     /// nothing reaches disk unseen: if there is nobody left to ask, there is nobody to
     /// have consented.
-    async fn confirm_write(&mut self, author: &str, write: &crate::swarm::FileWrite) -> bool {
+    async fn confirm_write(
+        &mut self,
+        author: &str,
+        write: &crate::swarm::FileWrite,
+        target: &Workspace,
+    ) -> bool {
         if self.approve_all {
             return true;
         }
@@ -2879,8 +3482,7 @@ impl Orchestrator {
         // Read the existing file's size before asking, not after: "overwrites 4KB" and
         // "creates a new file" are different questions, and the user is being asked to
         // answer one of them.
-        let overwrites = self
-            .workspace
+        let overwrites = target
             .metadata(&write.path)
             .ok()
             .filter(|m| m.is_file())
@@ -2910,13 +3512,52 @@ impl Orchestrator {
         }
     }
 
-    async fn run_file_writes(&mut self, author: &str, writes: Vec<crate::swarm::FileWrite>) {
-        for write in writes.into_iter().take(MAX_WRITES_PER_TURN) {
+    async fn run_file_writes(
+        &mut self,
+        author: &str,
+        writes: Vec<crate::swarm::FileWrite>,
+    ) -> bool {
+        let root = self.workspace.root().to_path_buf();
+        self.run_file_writes_in_workspace(
+            author,
+            writes.into_iter().take(MAX_WRITES_PER_TURN).collect(),
+            &root,
+            None,
+        )
+        .await
+        .0
+    }
+
+    async fn run_file_writes_in_workspace(
+        &mut self,
+        author: &str,
+        writes: Vec<crate::swarm::FileWrite>,
+        root: &Path,
+        workspace_id: Option<usize>,
+    ) -> (bool, Vec<String>) {
+        let target = match Workspace::new(root.to_path_buf()) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = self.audit.log(
+                    "file.write_failed",
+                    &format!("kind=workspace_unavailable {}", safe_error_detail(&error)),
+                );
+                self.emit(Event::Error(format!(
+                    "cannot open write target {}: {error}",
+                    root.display()
+                )))
+                .await;
+                return (false, vec![error.to_string()]);
+            }
+        };
+        let mut all_ok = true;
+        let mut errors = Vec::new();
+        for write in writes {
             // Before the user is asked anything: a write that `Workspace` will refuse
             // regardless must not be put to them for approval. Asking about a doomed
             // write teaches that the answer does not matter, and makes the refusal
             // that follows a "yes" look like a consequence of approving it.
-            if let Err(e) = self.workspace.precheck(&write.path, write.content.len()) {
+            if let Err(e) = target.precheck(&write.path, write.content.len()) {
                 let outcome = format!("failed: {e}");
                 let _ = self.audit.log(
                     "file.write_failed",
@@ -2925,9 +3566,30 @@ impl Orchestrator {
                 self.ledger.record_file_write(&write.path, &outcome);
                 self.emit(Event::Error(format!("write `{}`: {e}", write.path)))
                     .await;
+                errors.push(format!("write `{}` failed: {e}", write.path));
+                all_ok = false;
                 continue;
             }
-            if !self.confirm_write(author, &write).await {
+            if let Some(workspace_id) = workspace_id
+                && let Err(e) = self.workspace.precheck_task_copy_write(
+                    workspace_id,
+                    &write.path,
+                    write.content.len(),
+                )
+            {
+                let outcome = format!("failed: {e}");
+                let _ = self.audit.log(
+                    "file.write_failed",
+                    &format!("path={} kind=copy_quota detail=withheld", write.path),
+                );
+                self.ledger.record_file_write(&write.path, &outcome);
+                self.emit(Event::Error(format!("write `{}`: {e}", write.path)))
+                    .await;
+                errors.push(format!("write `{}` failed: {e}", write.path));
+                all_ok = false;
+                continue;
+            }
+            if !self.confirm_write(author, &write, &target).await {
                 let _ = self
                     .audit
                     .log("file.write_denied", &format!("path={}", write.path));
@@ -2942,9 +3604,11 @@ impl Orchestrator {
                     path: write.path.clone(),
                 })
                 .await;
+                errors.push(format!("write `{}` was denied by the user", write.path));
+                all_ok = false;
                 continue;
             }
-            match self.workspace.write(&write.path, &write.content) {
+            match target.write(&write.path, &write.content) {
                 Ok(_) => {
                     let outcome = format!("ok ({} bytes)", write.content.len());
                     let _ = self.audit.log(
@@ -2970,9 +3634,122 @@ impl Orchestrator {
                     self.ledger.record_file_write(&write.path, &e.to_string());
                     self.emit(Event::Error(format!("write `{}`: {e}", write.path)))
                         .await;
+                    errors.push(format!("write `{}` failed: {e}", write.path));
+                    all_ok = false;
                 }
             }
         }
+        (all_ok, errors)
+    }
+
+    async fn approve_write_batch(
+        &mut self,
+        author: &str,
+        writes: &[crate::swarm::FileWrite],
+        root: &Path,
+    ) -> bool {
+        let target = match Workspace::new(root.to_path_buf()) {
+            Ok(target) => target,
+            Err(error) => {
+                self.emit(Event::Error(format!(
+                    "cannot open write target {}: {error}",
+                    root.display()
+                )))
+                .await;
+                return false;
+            }
+        };
+
+        for write in writes {
+            if let Err(error) = target.precheck(&write.path, write.content.len()) {
+                let _ = self.audit.log(
+                    "file.write_failed",
+                    &format!("path={} {}", write.path, safe_error_detail(&error)),
+                );
+                self.ledger
+                    .record_file_write(&write.path, &format!("failed: {error}"));
+                self.emit(Event::Error(format!("write `{}`: {error}", write.path)))
+                    .await;
+                return false;
+            }
+        }
+        for write in writes {
+            if !self.confirm_write(author, write, &target).await {
+                let _ = self
+                    .audit
+                    .log("file.write_denied", &format!("path={}", write.path));
+                self.ledger
+                    .record_file_write(&write.path, "denied by the user");
+                self.emit(Event::WriteDenied {
+                    author: author.to_string(),
+                    path: write.path.clone(),
+                })
+                .await;
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn write_preapproved_batch(
+        &mut self,
+        author: &str,
+        writes: Vec<crate::swarm::FileWrite>,
+        root: &Path,
+    ) -> bool {
+        let target = match Workspace::new(root.to_path_buf()) {
+            Ok(target) => target,
+            Err(error) => {
+                self.emit(Event::Error(format!(
+                    "cannot open write target {}: {error}",
+                    root.display()
+                )))
+                .await;
+                return false;
+            }
+        };
+        let mut all_ok = true;
+        let mut writes = writes.into_iter();
+        while let Some(write) = writes.next() {
+            match target.write(&write.path, &write.content) {
+                Ok(_) => {
+                    let outcome = format!("ok ({} bytes)", write.content.len());
+                    let _ = self.audit.log(
+                        "file.written",
+                        &format!(
+                            "path={} chars={}",
+                            write.path,
+                            write.content.chars().count()
+                        ),
+                    );
+                    self.ledger.record_file_write(&write.path, &outcome);
+                    self.emit(Event::FileWritten {
+                        author: author.to_string(),
+                        path: write.path,
+                    })
+                    .await;
+                }
+                Err(error) => {
+                    let _ = self.audit.log(
+                        "file.write_failed",
+                        &format!("path={} {}", write.path, safe_error_detail(&error)),
+                    );
+                    self.ledger
+                        .record_file_write(&write.path, &error.to_string());
+                    self.emit(Event::Error(format!("write `{}`: {error}", write.path)))
+                        .await;
+                    all_ok = false;
+                    for pending in writes {
+                        self.ledger.record_file_write(
+                            &pending.path,
+                            "not attempted after an earlier apply failure",
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        all_ok
     }
 
     /// Executes any `read_file` lines the primary emitted, mirroring
@@ -2985,13 +3762,17 @@ impl Orchestrator {
     /// non-recursion/non-injection guarantee as `run_skill_reads` and
     /// `run_file_writes`. Only the primary's own reply is ever scanned; a sub-agent's
     /// delegation reply is not.
+    #[cfg(test)]
     async fn run_file_reads(&mut self, primary_label: &str, reply_text: &str) {
-        let requests = SwarmLedger::parse_read_files(reply_text);
+        self.run_file_read_requests(primary_label, SwarmLedger::parse_read_files(reply_text))
+            .await;
+    }
 
+    async fn run_file_read_requests(&mut self, primary_label: &str, requests: Vec<String>) {
         // Mirrors `run_skill_reads` capping to `MAX_READ_ACTIONS_PER_TURN`: bounds how
         // much filesystem effort a single turn can trigger, independent of how many
         // of the results the ledger ends up keeping (`MAX_LOADED_READS`).
-        for path in requests.into_iter().take(MAX_READ_ACTIONS_PER_TURN) {
+        for path in requests {
             self.emit(Event::ActivityStarted {
                 label: primary_label.to_string(),
                 kind: ActivityKind::ReadingProject,
@@ -3033,10 +3814,14 @@ impl Orchestrator {
     /// Executes any `list_files` lines the primary emitted, mirroring
     /// `run_file_reads` in structure and sharing the same stripped-text and
     /// non-recursion guarantees.
+    #[cfg(test)]
     async fn run_file_lists(&mut self, primary_label: &str, reply_text: &str) {
-        let requests = SwarmLedger::parse_list_files(reply_text);
+        self.run_file_list_requests(primary_label, SwarmLedger::parse_list_files(reply_text))
+            .await;
+    }
 
-        for path in requests.into_iter().take(MAX_READ_ACTIONS_PER_TURN) {
+    async fn run_file_list_requests(&mut self, primary_label: &str, requests: Vec<String>) {
+        for path in requests {
             self.emit(Event::ActivityStarted {
                 label: primary_label.to_string(),
                 kind: ActivityKind::ReadingProject,
@@ -3068,6 +3853,445 @@ impl Orchestrator {
                     self.ledger.record_file_list(&path, &format!("failed: {e}"));
                     self.emit(Event::Error(format!("list `{path}`: {e}"))).await;
                 }
+            }
+        }
+    }
+
+    async fn confirm_run(&mut self, author: &str, task_id: usize, command: &str) -> bool {
+        self.emit(Event::RunRequested {
+            author: author.to_string(),
+            task_id,
+            argv_display: command.to_string(),
+        })
+        .await;
+
+        let Some(decisions) = self.decisions.as_mut() else {
+            return false;
+        };
+        matches!(decisions.recv().await, Some(WriteDecision::Approve))
+    }
+
+    async fn run_command_requests(&mut self, requester: &str, requests: Vec<RunRequest>) {
+        for request in requests {
+            let command = display_argv(&request.argv);
+            if self.classified {
+                self.finish_run(
+                    requester,
+                    request.task_id,
+                    &request.argv,
+                    RunOutcome::Rejected,
+                    0,
+                    "proof commands are disabled in classified mode".into(),
+                )
+                .await;
+                continue;
+            }
+
+            let Some(workspace_id) = self.ledger.resolve_live_workspace_id(request.task_id) else {
+                self.finish_run(
+                    requester,
+                    request.task_id,
+                    &request.argv,
+                    RunOutcome::Rejected,
+                    0,
+                    format!("task {} has no live isolated copy", request.task_id),
+                )
+                .await;
+                continue;
+            };
+            let Some(workspace_root) = self.workspace.task_copy_root(workspace_id) else {
+                self.ledger.release_workspace(workspace_id);
+                self.finish_run(
+                    requester,
+                    request.task_id,
+                    &request.argv,
+                    RunOutcome::Rejected,
+                    0,
+                    format!("isolated copy {workspace_id} is unavailable"),
+                )
+                .await;
+                continue;
+            };
+            let validated =
+                match validate_command(&request.argv, &workspace_root, &self.project_root) {
+                    Ok(validated) => validated,
+                    Err(error) => {
+                        self.finish_run(
+                            requester,
+                            request.task_id,
+                            &request.argv,
+                            RunOutcome::Rejected,
+                            0,
+                            error.to_string(),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+            let quota = match self.workspace.task_copy_quota(workspace_id) {
+                Ok(quota) => quota,
+                Err(error) => {
+                    self.finish_run(
+                        requester,
+                        request.task_id,
+                        &request.argv,
+                        RunOutcome::ResourceLimit,
+                        0,
+                        error.to_string(),
+                    )
+                    .await;
+                    self.release_task_copy(
+                        workspace_id,
+                        false,
+                        "task copy exceeded its storage quota".into(),
+                    )
+                    .await;
+                    continue;
+                }
+            };
+
+            let _ = self.audit.log(
+                "command.requested",
+                &format!(
+                    "by={requester} task={} workspace={} argc={}",
+                    request.task_id,
+                    workspace_id,
+                    request.argv.len()
+                ),
+            );
+            if !self.confirm_run(requester, request.task_id, &command).await {
+                self.ledger.record_run(
+                    request.task_id,
+                    &request.argv,
+                    RunOutcome::Denied,
+                    "denied by the user",
+                    0,
+                );
+                let _ = self.audit.log(
+                    "command.denied",
+                    &format!("task={} workspace={workspace_id}", request.task_id),
+                );
+                self.emit(Event::RunDenied {
+                    author: requester.to_string(),
+                    task_id: request.task_id,
+                })
+                .await;
+                continue;
+            }
+
+            self.emit(Event::ActivityStarted {
+                label: requester.to_string(),
+                kind: ActivityKind::RunningCommand,
+            })
+            .await;
+            let _ = self.audit.log(
+                "command.started",
+                &format!("task={} workspace={workspace_id}", request.task_id),
+            );
+            let started = Instant::now();
+            match execute_command(&validated, &workspace_root, COMMAND_TIMEOUT, quota).await {
+                Ok(result) => {
+                    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let resource_limited = result.resource_limit.is_some();
+                    let outcome = if resource_limited {
+                        RunOutcome::ResourceLimit
+                    } else {
+                        match result.exit_code {
+                            Some(code) => RunOutcome::Exited(code),
+                            None => RunOutcome::TimedOut,
+                        }
+                    };
+                    self.finish_run(
+                        requester,
+                        request.task_id,
+                        &request.argv,
+                        outcome,
+                        millis,
+                        result.output,
+                    )
+                    .await;
+                    if resource_limited {
+                        self.release_task_copy(
+                            workspace_id,
+                            false,
+                            "proof command exceeded the task-copy storage quota".into(),
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => {
+                    let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    self.finish_run(
+                        requester,
+                        request.task_id,
+                        &request.argv,
+                        RunOutcome::SpawnFailed,
+                        millis,
+                        error.to_string(),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    async fn finish_run(
+        &mut self,
+        author: &str,
+        task_id: usize,
+        argv: &[String],
+        outcome: RunOutcome,
+        millis: u64,
+        output: String,
+    ) {
+        self.ledger
+            .record_run(task_id, argv, outcome.clone(), &output, millis);
+        let audit_outcome = match &outcome {
+            RunOutcome::Exited(code) => format!("exit_{code}"),
+            RunOutcome::TimedOut => "timeout".into(),
+            RunOutcome::Denied => "denied".into(),
+            RunOutcome::Rejected => "rejected".into(),
+            RunOutcome::SpawnFailed => "spawn_failed".into(),
+            RunOutcome::ResourceLimit => "resource_limit".into(),
+        };
+        let _ = self.audit.log(
+            "command.completed",
+            &format!(
+                "task={task_id} outcome={audit_outcome} millis={millis} chars={}",
+                output.chars().count()
+            ),
+        );
+        let visible_error = matches!(
+            outcome,
+            RunOutcome::Rejected | RunOutcome::SpawnFailed | RunOutcome::ResourceLimit
+        )
+        .then(|| {
+            format!(
+                "proof command for task {task_id}: {}",
+                truncate_chars(&sanitize_transcript_detail(&output), 1000)
+            )
+        });
+        self.emit(Event::RunCompleted {
+            author: author.to_string(),
+            task_id,
+            outcome,
+            chars: output.chars().count(),
+            millis,
+        })
+        .await;
+        if let Some(message) = visible_error {
+            self.emit(Event::Error(message)).await;
+        }
+    }
+
+    async fn run_copy_disposition_requests(
+        &mut self,
+        requester: &str,
+        dispositions: Vec<CopyDisposition>,
+        ran_commands_this_turn: bool,
+    ) {
+        for disposition in dispositions {
+            let task_id = match disposition {
+                CopyDisposition::Apply(task_id) | CopyDisposition::Discard(task_id) => task_id,
+            };
+            let Some(workspace_id) = self.ledger.resolve_live_workspace_id(task_id) else {
+                let message = format!("task {task_id} has no live isolated copy");
+                if self.ledger.task(task_id).is_some() {
+                    self.ledger.append_result(task_id, &message);
+                }
+                self.emit(Event::Error(message)).await;
+                continue;
+            };
+            if ran_commands_this_turn {
+                let message = "copy disposition refused: review this turn's proof output first, then apply or discard on the next commander turn";
+                self.ledger.append_result(task_id, message);
+                let _ = self.audit.log(
+                    "copy.disposition_refused",
+                    &format!("task={task_id} workspace={workspace_id} kind=same_turn_run"),
+                );
+                self.emit(Event::Error(message.into())).await;
+                continue;
+            }
+
+            match disposition {
+                CopyDisposition::Discard(_) => {
+                    if self
+                        .release_task_copy(workspace_id, false, format!("discarded by {requester}"))
+                        .await
+                    {
+                        self.ledger
+                            .append_result(task_id, "isolated copy discarded");
+                    }
+                }
+                CopyDisposition::Apply(_) => {
+                    if let Err(error) = self.workspace.validate_task_copy(workspace_id) {
+                        let message = format!(
+                            "apply_copy refused: task copy exceeded its storage quota: {error}"
+                        );
+                        self.ledger.append_result(task_id, &message);
+                        self.emit(Event::Error(message)).await;
+                        self.release_task_copy(
+                            workspace_id,
+                            false,
+                            "task copy exceeded its storage quota".into(),
+                        )
+                        .await;
+                        continue;
+                    }
+                    let plan = match self.workspace.plan_task_copy_apply(workspace_id) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            let message = format!("apply_copy failed: {error}");
+                            self.ledger.append_result(task_id, &message);
+                            let _ = self.audit.log(
+                                "copy.apply_failed",
+                                &format!(
+                                    "task={task_id} workspace={workspace_id} {}",
+                                    safe_error_detail(&error)
+                                ),
+                            );
+                            self.emit(Event::Error(message)).await;
+                            continue;
+                        }
+                    };
+                    if !plan.conflicts.is_empty() || !plan.deleted.is_empty() {
+                        let message = format!(
+                            "apply_copy refused: {} conflict(s) [{}]; {} deletion(s) [{}]. Resolve these explicitly; the main project was not overwritten.",
+                            plan.conflicts.len(),
+                            summarize_paths(&plan.conflicts),
+                            plan.deleted.len(),
+                            summarize_paths(&plan.deleted),
+                        );
+                        self.ledger.append_result(task_id, &message);
+                        let _ = self.audit.log(
+                            "copy.apply_refused",
+                            &format!(
+                                "task={task_id} workspace={workspace_id} conflicts={} deletions={}",
+                                plan.conflicts.len(),
+                                plan.deleted.len()
+                            ),
+                        );
+                        self.emit(Event::Error(message)).await;
+                        continue;
+                    }
+                    if plan.writes.len() > MAX_APPLY_FILES {
+                        let message = format!(
+                            "apply_copy refused: {} changed files exceed the {MAX_APPLY_FILES}-file apply limit",
+                            plan.writes.len()
+                        );
+                        self.ledger.append_result(task_id, &message);
+                        self.emit(Event::Error(message)).await;
+                        continue;
+                    }
+
+                    let write_count = plan.writes.len();
+                    let author = format!("{requester} applying copy {workspace_id}");
+                    let main_root = self.workspace.root().to_path_buf();
+                    let applied = if write_count == 0 {
+                        true
+                    } else if !self
+                        .approve_write_batch(&author, &plan.writes, &main_root)
+                        .await
+                    {
+                        false
+                    } else {
+                        let refreshed = self.workspace.plan_task_copy_apply(workspace_id);
+                        match refreshed {
+                            Ok(refreshed)
+                                if refreshed.conflicts.is_empty()
+                                    && refreshed.deleted.is_empty()
+                                    && refreshed.writes == plan.writes =>
+                            {
+                                self.write_preapproved_batch(&author, plan.writes, &main_root)
+                                    .await
+                            }
+                            Ok(_) => {
+                                let message = "apply_copy refused: the main project or task copy changed while approval was pending";
+                                self.ledger.append_result(task_id, message);
+                                let _ = self.audit.log(
+                                    "copy.apply_refused",
+                                    &format!(
+                                        "task={task_id} workspace={workspace_id} kind=changed_during_approval"
+                                    ),
+                                );
+                                self.emit(Event::Error(message.into())).await;
+                                false
+                            }
+                            Err(error) => {
+                                let message =
+                                    format!("apply_copy failed while rechecking changes: {error}");
+                                self.ledger.append_result(task_id, &message);
+                                let _ = self.audit.log(
+                                    "copy.apply_failed",
+                                    &format!(
+                                        "task={task_id} workspace={workspace_id} {}",
+                                        safe_error_detail(&error)
+                                    ),
+                                );
+                                self.emit(Event::Error(message)).await;
+                                false
+                            }
+                        }
+                    };
+                    if !applied {
+                        let message = "apply_copy incomplete: one or more writes were denied or failed; the copy was retained";
+                        self.ledger.append_result(task_id, message);
+                        self.emit(Event::Error(message.into())).await;
+                        continue;
+                    }
+
+                    self.ledger.append_result(
+                        task_id,
+                        &format!("isolated copy applied ({write_count} file(s))"),
+                    );
+                    let _ = self.audit.log(
+                        "copy.applied",
+                        &format!("task={task_id} workspace={workspace_id} files={write_count}"),
+                    );
+                    self.release_task_copy(
+                        workspace_id,
+                        true,
+                        format!("applied {write_count} file(s)"),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    async fn release_task_copy(
+        &mut self,
+        workspace_id: usize,
+        applied: bool,
+        reason: String,
+    ) -> bool {
+        match self.workspace.release_task_copy(workspace_id) {
+            Ok(()) => {
+                self.ledger.release_workspace(workspace_id);
+                let _ = self.audit.log(
+                    "copy.released",
+                    &format!(
+                        "workspace={workspace_id} reason={}",
+                        sanitize_transcript_detail(&reason)
+                    ),
+                );
+                self.emit(Event::TaskCopyReleased {
+                    task_id: workspace_id,
+                    applied,
+                })
+                .await;
+                true
+            }
+            Err(error) => {
+                let _ = self.audit.log(
+                    "copy.release_failed",
+                    &format!("workspace={workspace_id} {}", safe_error_detail(&error)),
+                );
+                self.emit(Event::Error(format!(
+                    "could not release isolated copy {workspace_id}: {error}"
+                )))
+                .await;
+                false
             }
         }
     }
@@ -3163,6 +4387,7 @@ mod tests {
         assert!(!detail.contains('ą'), "detail echoed the error text");
     }
     use super::*;
+    use crate::isolation::IsolationLimits;
     use crate::providers::{RateLimit, Reply};
     use async_trait::async_trait;
 
@@ -3219,6 +4444,215 @@ mod tests {
         }
         fn is_remote(&self) -> bool {
             false
+        }
+    }
+
+    #[derive(Clone)]
+    struct QuotaWritingProvider {
+        provider: String,
+        model: String,
+        project_root: Option<PathBuf>,
+        bytes: usize,
+    }
+
+    #[async_trait]
+    impl Provider for QuotaWritingProvider {
+        async fn send(&self, _system: Option<&str>, _prompt: &str) -> Result<Reply> {
+            let project_root = self
+                .project_root
+                .as_ref()
+                .ok_or_else(|| anyhow!("quota-writing provider was not rerooted"))?;
+            std::fs::write(
+                project_root.join("provider-output.bin"),
+                vec![0u8; self.bytes],
+            )?;
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(Reply {
+                text: "finished".into(),
+                rate_limit: RateLimit::default(),
+                usage: TokenUsage::default(),
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+
+        fn provider_name(&self) -> &str {
+            &self.provider
+        }
+
+        fn is_remote(&self) -> bool {
+            false
+        }
+
+        fn with_project_root(&self, project_root: &Path) -> Option<Arc<dyn Provider>> {
+            let mut rerooted = self.clone();
+            rerooted.project_root = Some(project_root.to_path_buf());
+            Some(Arc::new(rerooted))
+        }
+    }
+
+    type CapturedCalls = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    struct SequenceProvider {
+        provider: String,
+        model: String,
+        replies: std::sync::Mutex<std::collections::VecDeque<String>>,
+        calls: CapturedCalls,
+    }
+
+    #[async_trait]
+    impl Provider for SequenceProvider {
+        async fn send(&self, system: Option<&str>, prompt: &str) -> Result<Reply> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((system.unwrap_or_default().to_string(), prompt.to_string()));
+            let text =
+                self.replies.lock().unwrap().pop_front().ok_or_else(|| {
+                    anyhow!("scripted provider received an unexpected extra call")
+                })?;
+            Ok(Reply {
+                text,
+                rate_limit: RateLimit::default(),
+                usage: TokenUsage::default(),
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+
+        fn provider_name(&self) -> &str {
+            &self.provider
+        }
+
+        fn is_remote(&self) -> bool {
+            false
+        }
+
+        fn requires_subagent_tool_guardrails(&self) -> bool {
+            false
+        }
+    }
+
+    fn sequence_provider(
+        provider: &str,
+        model: &str,
+        replies: Vec<String>,
+    ) -> (Arc<SequenceProvider>, CapturedCalls) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Arc::new(SequenceProvider {
+                provider: provider.into(),
+                model: model.into(),
+                replies: std::sync::Mutex::new(replies.into()),
+                calls: calls.clone(),
+            }),
+            calls,
+        )
+    }
+
+    async fn run_prompt_to_completion(
+        orchestrator: Orchestrator,
+        mut events: mpsc::Receiver<Event>,
+        prompt: &str,
+    ) -> Vec<Event> {
+        let (commands_tx, commands_rx) = mpsc::channel(4);
+        let runner = tokio::spawn(orchestrator.run(commands_rx));
+        commands_tx
+            .send(Command::Prompt(prompt.to_string()))
+            .await
+            .unwrap();
+
+        let mut collected = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(60), events.recv())
+                .await
+                .expect("workflow timed out")
+                .expect("orchestrator event channel closed before TurnComplete");
+            let complete = matches!(event, Event::TurnComplete);
+            collected.push(event);
+            if complete {
+                break;
+            }
+        }
+
+        commands_tx.send(Command::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), runner)
+            .await
+            .expect("orchestrator did not shut down")
+            .unwrap();
+        collected
+    }
+
+    #[test]
+    fn action_budget_distinguishes_per_turn_and_workflow_caps() {
+        let mut remaining = MAX_ACTIONS_PER_WORKFLOW;
+        let (accepted, per_turn, workflow) =
+            take_action_budget((0..11).collect(), 10, &mut remaining);
+        assert_eq!(accepted.len(), 10);
+        assert!(per_turn);
+        assert!(!workflow);
+
+        let mut remaining = 3;
+        let (accepted, per_turn, workflow) =
+            take_action_budget((0..5).collect(), 10, &mut remaining);
+        assert_eq!(accepted.len(), 3);
+        assert!(!per_turn);
+        assert!(workflow);
+    }
+
+    fn workflow_orchestrator(
+        registry: Registry,
+        paths: &Paths,
+        project_root: PathBuf,
+        classified: bool,
+        events: mpsc::Sender<Event>,
+        decisions: Option<mpsc::Receiver<WriteDecision>>,
+        auto_write: bool,
+    ) -> Orchestrator {
+        let mut workspace = Workspace::new(project_root.clone()).unwrap();
+        workspace.enable_task_copies(&paths.data_dir).unwrap();
+        Orchestrator {
+            registry,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![11u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace,
+            events,
+            classified,
+            project_root,
+            decisions,
+            approve_all: auto_write,
+        }
+    }
+
+    fn workflow_orchestrator_with_limits(
+        registry: Registry,
+        paths: &Paths,
+        project_root: PathBuf,
+        events: mpsc::Sender<Event>,
+        decisions: Option<mpsc::Receiver<WriteDecision>>,
+        auto_write: bool,
+        limits: IsolationLimits,
+    ) -> Orchestrator {
+        let mut workspace = Workspace::new(project_root.clone()).unwrap();
+        workspace
+            .enable_task_copies_with_limits(&paths.data_dir, limits)
+            .unwrap();
+        Orchestrator {
+            registry,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![11u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace,
+            events,
+            classified: false,
+            project_root,
+            decisions,
+            approve_all: auto_write,
         }
     }
 
@@ -3360,6 +4794,1135 @@ mod tests {
             applied: BTreeMap::new(),
             connection_ids: BTreeMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_plain_commander_reply_finishes_without_auto_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let (commander, calls) =
+            sequence_provider("test", "commander", vec!["final answer".into()]);
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert("test:commander".into(), commander);
+        let registry = Registry {
+            providers,
+            primary: "test:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, event_rx) = mpsc::channel(64);
+        let orchestrator =
+            workflow_orchestrator(registry, &paths, project, false, event_tx, None, false);
+
+        let events = run_prompt_to_completion(orchestrator, event_rx, "hello").await;
+
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::AutoContinuation { .. }))
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::TurnComplete))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_action_and_result_state_stops_auto_continuation() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let (commander, calls) = sequence_provider(
+            "test",
+            "commander",
+            vec!["ACTION: list_files()".into(), "ACTION: list_files()".into()],
+        );
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert("test:commander".into(), commander);
+        let registry = Registry {
+            providers,
+            primary: "test:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, event_rx) = mpsc::channel(128);
+        let orchestrator =
+            workflow_orchestrator(registry, &paths, project, false, event_tx, None, false);
+
+        let events = run_prompt_to_completion(orchestrator, event_rx, "inspect").await;
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].1.contains("--- original user request ---"));
+        assert!(calls[1].1.contains("inspect"));
+        drop(calls);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::AutoContinuation { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Error(message) if message.contains("repeated the same actions")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn automatic_continuation_stops_at_the_turn_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut replies = Vec::new();
+        for index in 0..=usize::from(MAX_AUTO_CONTINUATION_TURNS) {
+            let directory = format!("dir-{index}");
+            std::fs::create_dir(project.join(&directory)).unwrap();
+            replies.push(format!("ACTION: list_files({directory})"));
+        }
+        let (commander, calls) = sequence_provider("test", "commander", replies);
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert("test:commander".into(), commander);
+        let registry = Registry {
+            providers,
+            primary: "test:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, event_rx) = mpsc::channel(256);
+        let orchestrator =
+            workflow_orchestrator(registry, &paths, project, false, event_tx, None, false);
+
+        let events = run_prompt_to_completion(orchestrator, event_rx, "keep inspecting").await;
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            usize::from(MAX_AUTO_CONTINUATION_TURNS) + 1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::AutoContinuation { .. }))
+                .count(),
+            usize::from(MAX_AUTO_CONTINUATION_TURNS)
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Error(message) if message.contains("turn limit")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn automatic_continuation_enforces_the_global_action_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+
+        let mut next_task = 0usize;
+        let mut replies = Vec::new();
+        for count in [10usize, 10, 10, 10, 8] {
+            let mut reply = String::new();
+            for _ in 0..count {
+                next_task += 1;
+                reply.push_str(&format!(
+                    "ACTION: delegate_task(test:worker, task-{next_task})\n"
+                ));
+            }
+            replies.push(reply);
+        }
+        replies.push("ACTION: delegate_task(test:worker, over-budget)".into());
+
+        let (commander, calls) = sequence_provider("test", "commander", replies);
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert("test:commander".into(), commander);
+        providers.insert(
+            "test:worker".into(),
+            Arc::new(ScriptedProvider {
+                provider: "test".into(),
+                model: "worker".into(),
+                reply: "done".into(),
+            }),
+        );
+        let registry = Registry {
+            providers,
+            primary: "test:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, event_rx) = mpsc::channel(2048);
+        let orchestrator =
+            workflow_orchestrator(registry, &paths, project, false, event_tx, None, false);
+
+        let events = run_prompt_to_completion(orchestrator, event_rx, "delegate everything").await;
+
+        assert_eq!(calls.lock().unwrap().len(), 6);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::DelegationFinished { ok: true, .. }))
+                .count(),
+            MAX_ACTIONS_PER_WORKFLOW
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Error(message) if message.contains("workflow action limit")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn automatic_workflow_reruns_red_and_green_in_one_copy_then_applies_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"proof-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "pub fn add(left: i32, right: i32) -> i32 { left - right }\n",
+        )
+        .unwrap();
+
+        let (commander, commander_calls) = sequence_provider(
+            "test",
+            "commander",
+            vec![
+                "ACTION: delegate_file_task(test:worker, Add only a deterministic regression test for add.)".into(),
+                "ACTION: run_test(1)".into(),
+                "ACTION: delegate_in_copy(1, test:worker, Fix add so the accepted regression passes.)".into(),
+                "ACTION: run_test(1)".into(),
+                "ACTION: apply_copy(1)".into(),
+                "The regression failed before the fix, passed after it, and the isolated changes were applied.".into(),
+            ],
+        );
+        let (worker, worker_calls) = sequence_provider(
+            "test",
+            "worker",
+            vec![
+                "Added the regression only.\n\
+                 ACTION: write_file(tests/regression.rs)\n\
+                 use proof_fixture::add;\n\
+                 #[test]\n\
+                 fn addition_works() { assert_eq!(add(2, 3), 5); }\n\
+                 ACTION: end_file"
+                    .into(),
+                "Fixed the implementation.\n\
+                 ACTION: write_file(src/lib.rs)\n\
+                 pub fn add(left: i32, right: i32) -> i32 { left + right }\n\
+                 ACTION: end_file"
+                    .into(),
+            ],
+        );
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert("test:commander".into(), commander);
+        providers.insert("test:worker".into(), worker);
+        let registry = Registry {
+            providers,
+            primary: "test:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (decision_tx, decision_rx) = mpsc::channel(2);
+        decision_tx.send(WriteDecision::Approve).await.unwrap();
+        decision_tx.send(WriteDecision::Approve).await.unwrap();
+        let (event_tx, event_rx) = mpsc::channel(512);
+        let orchestrator = workflow_orchestrator(
+            registry,
+            &paths,
+            project.clone(),
+            false,
+            event_tx,
+            Some(decision_rx),
+            true,
+        );
+
+        let events =
+            run_prompt_to_completion(orchestrator, event_rx, "Find and fix the add defect.").await;
+
+        let outcomes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::RunCompleted { outcome, .. } => Some(outcome.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 2);
+        assert!(matches!(outcomes[0], RunOutcome::Exited(code) if code != 0));
+        assert_eq!(outcomes[1], RunOutcome::Exited(0));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::RunRequested { .. }))
+                .count(),
+            2,
+            "proof runs must still ask under --auto-write"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::TaskCopyReleased {
+                task_id: 1,
+                applied: true
+            }
+        )));
+        assert_eq!(commander_calls.lock().unwrap().len(), 6);
+        assert_eq!(worker_calls.lock().unwrap().len(), 2);
+        let final_system = &commander_calls.lock().unwrap()[5].0;
+        assert!(final_system.contains("outcome: Exited("));
+        assert!(final_system.contains("outcome: Exited(0)"));
+        assert_eq!(
+            std::fs::read_to_string(project.join("src/lib.rs")).unwrap(),
+            "pub fn add(left: i32, right: i32) -> i32 { left + right }"
+        );
+        assert!(project.join("tests/regression.rs").is_file());
+        assert_eq!(
+            std::fs::read_dir(paths.data_dir.join("task-copies"))
+                .unwrap()
+                .count(),
+            0,
+            "the applied copy and its session directory must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn projected_worker_write_over_quota_is_rejected_without_releasing_the_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("base.txt"), "base\n").unwrap();
+
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "test:worker".into(),
+            Arc::new(ScriptedProvider {
+                provider: "test".into(),
+                model: "worker".into(),
+                reply: format!(
+                    "Attempted a large write.\nACTION: write_file(too-large.txt)\n{}\nACTION: end_file",
+                    "x".repeat(40)
+                ),
+            }),
+        );
+        let registry = Registry {
+            providers,
+            primary: "test:worker".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let limits = IsolationLimits {
+            max_regular_file_bytes: 128,
+            max_copied_bytes: 32,
+            max_entries: 64,
+            max_total_live_bytes: 64,
+            max_excluded_paths: 20,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut orchestrator = workflow_orchestrator_with_limits(
+            registry,
+            &paths,
+            project.clone(),
+            event_tx,
+            None,
+            true,
+            limits,
+        );
+
+        orchestrator
+            .run_delegations(
+                "test:worker",
+                "ACTION: delegate_file_task(test:worker, write a large file)",
+            )
+            .await;
+
+        let task = &orchestrator.ledger.tasks()[0];
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(task.workspace_live);
+        assert!(
+            task.result
+                .as_deref()
+                .is_some_and(|result| result.contains("copy byte limit")),
+            "{:?}",
+            task.result
+        );
+        let copy_root = orchestrator.workspace.task_copy_root(task.id).unwrap();
+        assert!(!copy_root.join("too-large.txt").exists());
+        assert!(!project.join("too-large.txt").exists());
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| {
+            matches!(event, Event::Error(message) if message.contains("copy byte limit"))
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::TaskCopyReleased { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn rerooted_provider_over_quota_is_cancelled_and_its_copy_is_released() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("base.txt"), "base\n").unwrap();
+
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "test:writer".into(),
+            Arc::new(QuotaWritingProvider {
+                provider: "test".into(),
+                model: "writer".into(),
+                project_root: None,
+                bytes: 64,
+            }),
+        );
+        let registry = Registry {
+            providers,
+            primary: "test:writer".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let limits = IsolationLimits {
+            max_regular_file_bytes: 128,
+            max_copied_bytes: 32,
+            max_entries: 64,
+            max_total_live_bytes: 64,
+            max_excluded_paths: 20,
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let mut orchestrator = workflow_orchestrator_with_limits(
+            registry,
+            &paths,
+            project.clone(),
+            event_tx,
+            None,
+            true,
+            limits,
+        );
+
+        orchestrator
+            .run_delegations(
+                "test:writer",
+                "ACTION: delegate_file_task(test:writer, create output)",
+            )
+            .await;
+
+        let task = &orchestrator.ledger.tasks()[0];
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(!task.workspace_live);
+        assert!(
+            task.result
+                .as_deref()
+                .is_some_and(|result| result.contains("storage quota")),
+            "{:?}",
+            task.result
+        );
+        assert!(!orchestrator.workspace.has_task_copy(task.id));
+        assert!(!project.join("provider-output.bin").exists());
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::TaskCopyReleased {
+                    task_id: 1,
+                    applied: false
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn proof_command_over_quota_records_resource_limit_and_releases_the_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"quota-proof\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
+
+        let registry = registry_with(vec![("test", "commander", false)], "test:commander");
+        let limits = IsolationLimits {
+            max_regular_file_bytes: 4 * 1024,
+            max_copied_bytes: 2 * 1024,
+            max_entries: 1_000,
+            max_total_live_bytes: 4 * 1024,
+            max_excluded_paths: 20,
+        };
+        let (decision_tx, decision_rx) = mpsc::channel(1);
+        decision_tx.send(WriteDecision::Approve).await.unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let mut orchestrator = workflow_orchestrator_with_limits(
+            registry,
+            &paths,
+            project,
+            event_tx,
+            Some(decision_rx),
+            false,
+            limits,
+        );
+        let task_id = orchestrator.ledger.add_task("run proof");
+        orchestrator.ledger.assign_task(task_id, "test:commander");
+        orchestrator.workspace.create_task_copy(task_id).unwrap();
+        orchestrator
+            .ledger
+            .associate_workspace(task_id, task_id, Some("test copy"));
+
+        orchestrator
+            .run_command_requests(
+                "test:commander",
+                vec![RunRequest {
+                    task_id,
+                    argv: vec!["cargo".into(), "test".into(), "--quiet".into()],
+                }],
+            )
+            .await;
+
+        assert_eq!(orchestrator.ledger.run_records().len(), 1);
+        assert_eq!(
+            orchestrator.ledger.run_records()[0].outcome,
+            RunOutcome::ResourceLimit
+        );
+        assert!(!orchestrator.workspace.has_task_copy(task_id));
+        assert!(!orchestrator.ledger.tasks()[0].workspace_live);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::RunCompleted {
+                    outcome: RunOutcome::ResourceLimit,
+                    ..
+                }
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::TaskCopyReleased {
+                    task_id: 1,
+                    applied: false
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn fresh_file_delegations_use_distinct_copies_and_never_write_main() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let (worker, _) = sequence_provider(
+            "test",
+            "worker",
+            vec![
+                "ACTION: write_file(first.txt)\none\nACTION: end_file".into(),
+                "ACTION: write_file(second.txt)\ntwo\nACTION: end_file".into(),
+            ],
+        );
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "test:commander".into(),
+            Arc::new(StubProvider {
+                provider: "test".into(),
+                model: "commander".into(),
+                remote: false,
+            }),
+        );
+        providers.insert("test:worker".into(), worker);
+        let registry = Registry {
+            providers,
+            primary: "test:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut orchestrator = workflow_orchestrator(
+            registry,
+            &paths,
+            project.clone(),
+            false,
+            event_tx,
+            None,
+            true,
+        );
+
+        orchestrator
+            .run_delegations(
+                "test:commander",
+                "ACTION: delegate_file_task(test:worker, first)\n\
+                 ACTION: delegate_file_task(test:worker, second)",
+            )
+            .await;
+
+        let first_root = orchestrator.workspace.task_copy_root(1).unwrap();
+        let second_root = orchestrator.workspace.task_copy_root(2).unwrap();
+        assert_ne!(first_root, second_root);
+        assert_eq!(
+            std::fs::read_to_string(first_root.join("first.txt")).unwrap(),
+            "one"
+        );
+        assert!(!first_root.join("second.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(second_root.join("second.txt")).unwrap(),
+            "two"
+        );
+        assert!(
+            !second_root.join("first.txt").exists(),
+            "the second fresh copy must come from main, not from the first task copy"
+        );
+        assert!(!project.join("first.txt").exists());
+        assert!(!project.join("second.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn worker_write_actions_are_bounded_and_counted() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let mut reply = String::new();
+        for index in 0..11 {
+            reply.push_str(&format!(
+                "ACTION: write_file(file-{index}.txt)\n{index}\nACTION: end_file\n"
+            ));
+        }
+        let (worker, _) = sequence_provider("test", "worker", vec![reply]);
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "test:commander".into(),
+            Arc::new(StubProvider {
+                provider: "test".into(),
+                model: "commander".into(),
+                remote: false,
+            }),
+        );
+        providers.insert("test:worker".into(), worker);
+        let registry = Registry {
+            providers,
+            primary: "test:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let mut orchestrator =
+            workflow_orchestrator(registry, &paths, project, false, event_tx, None, true);
+
+        orchestrator
+            .run_delegations(
+                "test:commander",
+                "ACTION: delegate_file_task(test:worker, write too many files)",
+            )
+            .await;
+
+        let copy_root = orchestrator.workspace.task_copy_root(1).unwrap();
+        assert_eq!(
+            (0..11)
+                .filter(|index| copy_root.join(format!("file-{index}.txt")).exists())
+                .count(),
+            MAX_WRITES_PER_TURN
+        );
+        assert_eq!(orchestrator.ledger.tasks()[0].status, TaskStatus::Failed);
+        assert!(
+            orchestrator.ledger.tasks()[0]
+                .result
+                .as_deref()
+                .unwrap()
+                .contains("action limit")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_write_never_auto_approves_a_proof_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let registry = registry_with(vec![("test", "commander", false)], "test:commander");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (_decision_tx, decision_rx) = mpsc::channel(1);
+        let mut orchestrator = workflow_orchestrator(
+            registry,
+            &paths,
+            project,
+            false,
+            event_tx,
+            Some(decision_rx),
+            true,
+        );
+        let task_id = orchestrator.ledger.add_task("proof");
+        orchestrator.ledger.assign_task(task_id, "test:commander");
+        orchestrator.workspace.create_task_copy(task_id).unwrap();
+        orchestrator
+            .ledger
+            .associate_workspace(task_id, task_id, Some("test copy"));
+
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(50),
+            orchestrator.run_command_requests(
+                "test:commander",
+                vec![RunRequest {
+                    task_id,
+                    argv: vec!["cargo".into(), "test".into()],
+                }],
+            ),
+        )
+        .await;
+
+        assert!(
+            waiting.is_err(),
+            "the command should still be waiting for an explicit decision"
+        );
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            Event::RunRequested { task_id: id, .. } if id == task_id
+        ));
+        assert!(orchestrator.ledger.run_records().is_empty());
+    }
+
+    #[tokio::test]
+    async fn classified_mode_rejects_proof_commands_before_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let registry = registry_with(vec![("test", "commander", false)], "test:commander");
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (_decision_tx, decision_rx) = mpsc::channel(1);
+        let mut orchestrator = workflow_orchestrator(
+            registry,
+            &paths,
+            project,
+            true,
+            event_tx,
+            Some(decision_rx),
+            false,
+        );
+        let task_id = orchestrator.ledger.add_task("proof");
+        orchestrator.ledger.assign_task(task_id, "test:commander");
+        orchestrator.workspace.create_task_copy(task_id).unwrap();
+        orchestrator
+            .ledger
+            .associate_workspace(task_id, task_id, Some("test copy"));
+
+        orchestrator
+            .run_command_requests(
+                "test:commander",
+                vec![RunRequest {
+                    task_id,
+                    argv: vec!["cargo".into(), "test".into()],
+                }],
+            )
+            .await;
+
+        assert_eq!(
+            orchestrator.ledger.run_records()[0].outcome,
+            RunOutcome::Rejected
+        );
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::RunRequested { .. }))
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::RunCompleted {
+                outcome: RunOutcome::Rejected,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn proof_commands_reject_text_only_and_released_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let registry = registry_with(vec![("test", "commander", false)], "test:commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut orchestrator =
+            workflow_orchestrator(registry, &paths, project, false, event_tx, None, false);
+
+        let text_task = orchestrator.ledger.add_task("text only");
+        orchestrator.ledger.assign_task(text_task, "test:commander");
+        let released_task = orchestrator.ledger.add_task("released copy");
+        orchestrator
+            .ledger
+            .assign_task(released_task, "test:commander");
+        orchestrator
+            .workspace
+            .create_task_copy(released_task)
+            .unwrap();
+        orchestrator
+            .ledger
+            .associate_workspace(released_task, released_task, Some("test copy"));
+        orchestrator
+            .workspace
+            .release_task_copy(released_task)
+            .unwrap();
+        orchestrator.ledger.release_workspace(released_task);
+
+        orchestrator
+            .run_command_requests(
+                "test:commander",
+                vec![
+                    RunRequest {
+                        task_id: text_task,
+                        argv: vec!["cargo".into(), "test".into()],
+                    },
+                    RunRequest {
+                        task_id: released_task,
+                        argv: vec!["cargo".into(), "test".into()],
+                    },
+                ],
+            )
+            .await;
+
+        assert_eq!(orchestrator.ledger.run_records().len(), 2);
+        assert!(
+            orchestrator
+                .ledger
+                .run_records()
+                .iter()
+                .all(|record| record.outcome == RunOutcome::Rejected)
+        );
+        assert!(
+            std::iter::from_fn(|| event_rx.try_recv().ok())
+                .all(|event| !matches!(event, Event::RunRequested { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_copy_refuses_main_drift_and_deletions_without_partial_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("drift.txt"), "baseline").unwrap();
+        std::fs::write(project.join("deleted.txt"), "keep").unwrap();
+        let registry = registry_with(vec![("test", "commander", false)], "test:commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut orchestrator = workflow_orchestrator(
+            registry,
+            &paths,
+            project.clone(),
+            false,
+            event_tx,
+            None,
+            true,
+        );
+        let task_id = orchestrator.ledger.add_task("changes");
+        orchestrator.ledger.assign_task(task_id, "test:commander");
+        orchestrator.workspace.create_task_copy(task_id).unwrap();
+        orchestrator
+            .ledger
+            .associate_workspace(task_id, task_id, Some("test copy"));
+        let copy_root = orchestrator.workspace.task_copy_root(task_id).unwrap();
+        std::fs::write(copy_root.join("drift.txt"), "agent change").unwrap();
+        std::fs::remove_file(copy_root.join("deleted.txt")).unwrap();
+        std::fs::write(project.join("drift.txt"), "user change").unwrap();
+
+        orchestrator
+            .run_copy_disposition_requests(
+                "test:commander",
+                vec![CopyDisposition::Apply(task_id)],
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            std::fs::read_to_string(project.join("drift.txt")).unwrap(),
+            "user change"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("deleted.txt")).unwrap(),
+            "keep"
+        );
+        assert!(orchestrator.workspace.has_task_copy(task_id));
+        assert!(orchestrator.ledger.tasks()[0].workspace_live);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Error(message)
+                    if message.contains("conflict") && message.contains("deletion")
+            )
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::TaskCopyReleased { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_copy_refuses_parent_file_conflict_without_partial_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("ok.txt"), "baseline").unwrap();
+        let registry = registry_with(vec![("test", "commander", false)], "test:commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut orchestrator = workflow_orchestrator(
+            registry,
+            &paths,
+            project.clone(),
+            false,
+            event_tx,
+            None,
+            true,
+        );
+        let task_id = orchestrator.ledger.add_task("changes");
+        orchestrator.ledger.assign_task(task_id, "test:commander");
+        orchestrator.workspace.create_task_copy(task_id).unwrap();
+        orchestrator
+            .ledger
+            .associate_workspace(task_id, task_id, Some("test copy"));
+        let copy_root = orchestrator.workspace.task_copy_root(task_id).unwrap();
+        std::fs::write(copy_root.join("ok.txt"), "agent change").unwrap();
+        std::fs::create_dir(copy_root.join("blocked")).unwrap();
+        std::fs::write(copy_root.join("blocked/nested.txt"), "new file").unwrap();
+        std::fs::write(project.join("blocked"), "not a directory").unwrap();
+
+        orchestrator
+            .run_copy_disposition_requests(
+                "test:commander",
+                vec![CopyDisposition::Apply(task_id)],
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            std::fs::read_to_string(project.join("ok.txt")).unwrap(),
+            "baseline"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("blocked")).unwrap(),
+            "not a directory"
+        );
+        assert!(orchestrator.workspace.has_task_copy(task_id));
+        assert!(orchestrator.ledger.tasks()[0].workspace_live);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::Error(message)
+                    if message.contains("conflict") && message.contains("blocked/nested.txt")
+            )
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::FileWritten { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_copy_retries_only_files_not_already_written_from_the_copy() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("first.txt"), "first base").unwrap();
+        std::fs::write(project.join("second.txt"), "second base").unwrap();
+        let registry = registry_with(vec![("test", "commander", false)], "test:commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut orchestrator = workflow_orchestrator(
+            registry,
+            &paths,
+            project.clone(),
+            false,
+            event_tx,
+            None,
+            true,
+        );
+        let task_id = orchestrator.ledger.add_task("changes");
+        orchestrator.ledger.assign_task(task_id, "test:commander");
+        orchestrator.workspace.create_task_copy(task_id).unwrap();
+        orchestrator
+            .ledger
+            .associate_workspace(task_id, task_id, Some("test copy"));
+        let copy_root = orchestrator.workspace.task_copy_root(task_id).unwrap();
+        std::fs::write(copy_root.join("first.txt"), "first changed").unwrap();
+        std::fs::write(copy_root.join("second.txt"), "second changed").unwrap();
+        std::fs::write(copy_root.join("new.txt"), "new content").unwrap();
+
+        // Model the durable prefix left by an earlier OS-level batch failure.
+        std::fs::write(project.join("first.txt"), "first changed").unwrap();
+        std::fs::write(project.join("new.txt"), "new content").unwrap();
+
+        orchestrator
+            .run_copy_disposition_requests(
+                "test:commander",
+                vec![CopyDisposition::Apply(task_id)],
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            std::fs::read_to_string(project.join("first.txt")).unwrap(),
+            "first changed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("second.txt")).unwrap(),
+            "second changed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("new.txt")).unwrap(),
+            "new content"
+        );
+        assert!(!orchestrator.workspace.has_task_copy(task_id));
+        assert!(!orchestrator.ledger.tasks()[0].workspace_live);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::FileWritten { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::TaskCopyReleased {
+                    task_id: 1,
+                    applied: true
+                }
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn preapproved_apply_batch_stops_after_the_first_write_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join("blocked"), "not a directory").unwrap();
+        let registry = registry_with(vec![("test", "commander", false)], "test:commander");
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        let mut orchestrator = workflow_orchestrator(
+            registry,
+            &paths,
+            project.clone(),
+            false,
+            event_tx,
+            None,
+            true,
+        );
+
+        let complete = orchestrator
+            .write_preapproved_batch(
+                "test:commander",
+                vec![
+                    crate::swarm::FileWrite {
+                        path: "first.txt".into(),
+                        content: "first".into(),
+                    },
+                    crate::swarm::FileWrite {
+                        path: "blocked/nested.txt".into(),
+                        content: "fails".into(),
+                    },
+                    crate::swarm::FileWrite {
+                        path: "third.txt".into(),
+                        content: "must not run".into(),
+                    },
+                ],
+                &project,
+            )
+            .await;
+
+        assert!(!complete);
+        assert_eq!(
+            std::fs::read_to_string(project.join("first.txt")).unwrap(),
+            "first"
+        );
+        assert!(!project.join("third.txt").exists());
+        assert!(orchestrator.ledger.written_files().iter().any(|record| {
+            record.path == "third.txt"
+                && record.outcome == "not attempted after an earlier apply failure"
+        }));
+    }
+
+    #[tokio::test]
+    async fn denied_apply_keeps_the_copy_and_leaves_main_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(temp.path().join("data")).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let registry = registry_with(vec![("test", "commander", false)], "test:commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (decision_tx, decision_rx) = mpsc::channel(2);
+        decision_tx.send(WriteDecision::Approve).await.unwrap();
+        decision_tx.send(WriteDecision::Deny).await.unwrap();
+        let mut orchestrator = workflow_orchestrator(
+            registry,
+            &paths,
+            project.clone(),
+            false,
+            event_tx,
+            Some(decision_rx),
+            false,
+        );
+        let task_id = orchestrator.ledger.add_task("changes");
+        orchestrator.ledger.assign_task(task_id, "test:commander");
+        orchestrator.workspace.create_task_copy(task_id).unwrap();
+        orchestrator
+            .ledger
+            .associate_workspace(task_id, task_id, Some("test copy"));
+        let copy_root = orchestrator.workspace.task_copy_root(task_id).unwrap();
+        std::fs::write(copy_root.join("first.txt"), "first change").unwrap();
+        std::fs::write(copy_root.join("second.txt"), "second change").unwrap();
+
+        orchestrator
+            .run_copy_disposition_requests(
+                "test:commander",
+                vec![CopyDisposition::Apply(task_id)],
+                false,
+            )
+            .await;
+
+        assert!(!project.join("first.txt").exists());
+        assert!(!project.join("second.txt").exists());
+        assert!(copy_root.join("first.txt").exists());
+        assert!(copy_root.join("second.txt").exists());
+        assert!(orchestrator.workspace.has_task_copy(task_id));
+        assert!(orchestrator.ledger.tasks()[0].workspace_live);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::WriteDenied { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::TaskCopyReleased { .. }))
+        );
     }
 
     #[test]
@@ -5010,17 +7573,20 @@ mod tests {
             decisions: None,
             approve_all: true,
         };
-
+        orch.workspace.enable_task_copies(&paths.data_dir).unwrap();
         orch.run_delegations(
             "primary:commander",
             "ACTION: delegate_file_task(worker:builder, create greeting.txt)",
         )
         .await;
 
+        let workspace_id = orch.ledger.tasks()[0].workspace_id.unwrap();
+        let copy_root = orch.workspace.task_copy_root(workspace_id).unwrap();
         assert_eq!(
-            std::fs::read_to_string(project_dir.path().join("greeting.txt")).unwrap(),
+            std::fs::read_to_string(copy_root.join("greeting.txt")).unwrap(),
             "hello"
         );
+        assert!(!project_dir.path().join("greeting.txt").exists());
         let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
         assert!(events.iter().any(|event| matches!(
             event,
@@ -5698,7 +8264,6 @@ mod tests {
             decisions: None,
             approve_all: false,
         };
-
         orch.run_delegations(
             "ollama:llama3",
             "ACTION: delegate_task(ollama:helper, summarise the diff)",
@@ -6029,6 +8594,7 @@ mod tests {
             decisions: None,
             approve_all: false,
         };
+        orch.workspace.enable_task_copies(&paths.data_dir).unwrap();
 
         orch.run_delegations(
             "ollama:llama3",
@@ -6036,11 +8602,14 @@ mod tests {
         )
         .await;
 
-        // The write landed, attributed to the sub-agent.
+        // The write landed only in the isolated copy, attributed to the sub-agent.
+        let workspace_id = orch.ledger.tasks()[0].workspace_id.unwrap();
+        let copy_root = orch.workspace.task_copy_root(workspace_id).unwrap();
         assert_eq!(
-            std::fs::read_to_string(project.path().join("made.txt")).unwrap(),
+            std::fs::read_to_string(copy_root.join("made.txt")).unwrap(),
             "from the sub-agent"
         );
+        assert!(!project.path().join("made.txt").exists());
         let mut author = None;
         let mut saw_read = false;
         let mut delegated_to = Vec::new();
@@ -6360,8 +8929,8 @@ mod tests {
         .unwrap();
         assert!(preamble.contains("every connected model"));
         assert!(preamble.contains("emit every required delegation in this reply"));
-        assert!(preamble.contains("There is no automatic continuation turn"));
-        assert!(preamble.contains("never promise to query omitted models later"));
+        assert!(preamble.contains("fed back to you automatically"));
+        assert!(preamble.contains("do not ask the user to type `continue`"));
     }
 
     #[test]

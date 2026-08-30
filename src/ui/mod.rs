@@ -119,7 +119,7 @@ pub async fn run(
             maybe_term = input.next() => {
                 match maybe_term {
                     Some(Ok(TermEvent::Key(key))) if key.kind == KeyEventKind::Press => {
-                        // `app.pending_write.is_some()` is checked here, BEFORE
+                        // Pending approval is checked here, BEFORE
                         // `is_reopen_picker`, not after: while a write-approval prompt
                         // is up, the orchestrator is blocked on `decisions.recv()`
                         // waiting for the answer. If Ctrl+O/F2 were still routed to
@@ -130,15 +130,25 @@ pub async fn run(
                         // ever sends a decision, since the key that would have gone to
                         // `handle_key`'s pending-write guard went to the picker
                         // instead. Both sides then wait on each other forever. Routing
-                        // every key to `handle_key` while a write is pending — the same
-                        // guard already used for approve/deny/approve-all — means
+                        // every key to `handle_key` while an approval is pending — the
+                        // same guard already used for approve/deny — means
                         // `is_reopen_picker` is simply never consulted during the
                         // prompt, so there is only one place that decides what a key
                         // does while `pending_write` is set.
-                        if app.pending_write.is_none() && is_reopen_picker(key.code, key.modifiers) {
+                        if app.pending_write.is_none()
+                            && app.pending_run.is_none()
+                            && is_reopen_picker(key.code, key.modifiers)
+                        {
                             reopen_picker(&mut guard, &mut input, &mut app, &commands, &mut settings, &paths, classified).await;
                         } else {
-                            handle_key(&mut app, key.code, key.modifiers, &commands, &decisions).await;
+                            handle_key(
+                                &mut app,
+                                key.code,
+                                key.modifiers,
+                                &commands,
+                                &decisions,
+                            )
+                            .await;
                         }
                     }
                     Some(Ok(TermEvent::Paste(mut text))) => {
@@ -543,9 +553,9 @@ fn for_each_pasted_char(text: &str, mut push: impl FnMut(char)) {
 }
 
 fn handle_chat_paste(app: &mut App, text: &str) {
-    // A write confirmation accepts only a deliberate y/n/a keypress. Clipboard
-    // contents must never approve or deny a filesystem change.
-    if app.pending_write.is_some() {
+    // Approval prompts accept only deliberate keypresses. Clipboard contents must
+    // never approve a filesystem change or subprocess.
+    if app.pending_write.is_some() || app.pending_run.is_some() {
         return;
     }
     for_each_pasted_char(text, |c| app.push_char(c));
@@ -583,6 +593,21 @@ async fn handle_key(
         };
         if let Some(decision) = decision {
             app.pending_write = None;
+            if decisions.send(decision).await.is_err() {
+                app.apply(Event::Error("orchestrator is not running".into()));
+            }
+        }
+        return;
+    }
+
+    if app.pending_run.is_some() {
+        let decision = match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(WriteDecision::Approve),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(WriteDecision::Deny),
+            _ => None,
+        };
+        if let Some(decision) = decision {
+            app.pending_run = None;
             if decisions.send(decision).await.is_err() {
                 app.apply(Event::Error("orchestrator is not running".into()));
             }
@@ -2032,6 +2057,23 @@ mod tests {
     }
 
     #[test]
+    fn chat_paste_cannot_answer_a_pending_run_confirmation() {
+        let mut app = App::new("ollama:llama3", &[], "/tmp".to_string());
+        app.push_char('k');
+        app.pending_run = Some(crate::app::PendingRun {
+            author: "commander".into(),
+            task_id: 3,
+            argv_display: "cargo test".into(),
+        });
+
+        handle_chat_paste(&mut app, "yes");
+
+        assert_eq!(app.input, "k");
+        assert_eq!(app.cursor, 1);
+        assert!(app.pending_run.is_some());
+    }
+
+    #[test]
     fn picker_paste_keeps_api_keys_masked_and_normalizes_separators() {
         let mut picker = key_entry_picker();
 
@@ -2121,6 +2163,40 @@ mod tests {
         handle_key(&mut app, KeyCode::Esc, KeyModifiers::NONE, &cmd_tx, &dec_tx).await;
 
         assert!(app.should_quit);
+    }
+
+    #[tokio::test]
+    async fn pending_run_accepts_only_one_explicit_yes_or_no_decision() {
+        let mut app = App::new("ollama:llama3", &[], "/tmp".to_string());
+        app.pending_run = Some(crate::app::PendingRun {
+            author: "commander".into(),
+            task_id: 2,
+            argv_display: "cargo test".into(),
+        });
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (decision_tx, mut decision_rx) = mpsc::channel(1);
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            &cmd_tx,
+            &decision_tx,
+        )
+        .await;
+        assert!(app.pending_run.is_some());
+        assert!(decision_rx.try_recv().is_err());
+
+        handle_key(
+            &mut app,
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            &cmd_tx,
+            &decision_tx,
+        )
+        .await;
+        assert!(app.pending_run.is_none());
+        assert_eq!(decision_rx.recv().await, Some(WriteDecision::Approve));
     }
 
     #[test]

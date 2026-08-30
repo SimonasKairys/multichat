@@ -2,8 +2,9 @@
 //! protocol. Delegated models receive an isolated, task-specific prompt instead.
 
 use std::collections::BTreeMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TaskStatus {
     Todo,
     InProgress,
@@ -32,6 +33,9 @@ pub struct Task {
     pub description: String,
     pub assigned_to: Option<String>,
     pub status: TaskStatus,
+    pub workspace_id: Option<usize>,
+    pub workspace_live: bool,
+    pub snapshot_note: Option<String>,
     /// The sub-agent's reply on success, or the error text on failure. `None` until
     /// the delegation resolves. Rendered in the ledger so the delegating model can see
     /// what came back — or, for a failure, why it failed and whether to retry.
@@ -43,9 +47,56 @@ pub struct Task {
 pub struct Delegation {
     pub target: String,
     pub prompt: String,
+    pub workspace_task: Option<usize>,
     /// Only explicit file-producing delegations receive the write protocol and may
     /// have write blocks executed. Ordinary delegated answers stay text-only.
     pub allow_writes: bool,
+}
+
+/// A commander proof-command request parsed from a whole `ACTION:` line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRequest {
+    pub task_id: usize,
+    pub argv: Vec<String>,
+}
+
+/// An explicit disposition for an isolated task copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyDisposition {
+    Apply(usize),
+    Discard(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RunOutcome {
+    Exited(i32),
+    TimedOut,
+    Denied,
+    Rejected,
+    SpawnFailed,
+    ResourceLimit,
+}
+
+impl RunOutcome {
+    fn label(&self) -> String {
+        match self {
+            RunOutcome::Exited(code) => format!("Exited({code})"),
+            RunOutcome::TimedOut => "TimedOut".to_string(),
+            RunOutcome::Denied => "Denied".to_string(),
+            RunOutcome::Rejected => "Rejected".to_string(),
+            RunOutcome::SpawnFailed => "SpawnFailed".to_string(),
+            RunOutcome::ResourceLimit => "ResourceLimit".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRecord {
+    pub task_id: usize,
+    pub argv: Vec<String>,
+    pub outcome: RunOutcome,
+    pub output: String,
+    pub millis: u64,
 }
 
 /// A file write request parsed out of a model's plain-text reply by
@@ -169,6 +220,35 @@ pub struct ListedFiles {
     pub path: String,
     pub outcome: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct TaskFingerprint {
+    description: String,
+    assigned_to: Option<String>,
+    status: TaskStatus,
+    workspace_live: bool,
+    snapshot_note: Option<String>,
+    result: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct RunFingerprint {
+    task: Option<TaskFingerprint>,
+    argv: Vec<String>,
+    outcome: RunOutcome,
+    output: String,
+}
+
+/// How many command-proof records stay in the ledger. Same bound-the-ledger
+/// reasoning as the other recorded histories: proof results are useful evidence for
+/// the commander's next turn, but an unbounded history would bloat every later
+/// prompt.
+const MAX_RUN_RECORDS: usize = 20;
+
+/// Ceiling on one stored proof command's output, in characters. Tail-truncated
+/// rather than head-truncated because the most useful evidence is usually at the
+/// end: the failing assertion, compiler error, or final summary line.
+const MAX_RUN_OUTPUT_CHARS: usize = 4000;
 
 /// A one-line cost/context hint for a roster label, or `None` when nothing useful is
 /// known about it.
@@ -311,6 +391,9 @@ pub struct SwarmLedger {
     /// Outcomes of `ACTION: list_files(...)` requests, oldest first. Capped at
     /// `MAX_RECORDED_LISTS`; see `record_file_list`.
     file_listings: Vec<ListedFiles>,
+    /// Outcomes of `ACTION: run_command(...)` / `ACTION: run_test(...)`, oldest
+    /// first. Capped at `MAX_RUN_RECORDS`; see `record_run`.
+    run_records: Vec<RunRecord>,
 }
 
 /// Trims a rendered section to `cap` characters on a whole-line boundary, appending a
@@ -357,6 +440,103 @@ fn indent_content(content: &str) -> String {
     content.replace('\n', "\n    ")
 }
 
+fn truncate_head_chars(content: &str, cap: usize) -> String {
+    match content.char_indices().nth(cap) {
+        Some((cut, _)) => format!("{}…", &content[..cut]),
+        None => content.to_string(),
+    }
+}
+
+fn truncate_tail_chars(content: &str, cap: usize) -> String {
+    let total = content.chars().count();
+    if total <= cap {
+        return content.to_string();
+    }
+    let start = content
+        .char_indices()
+        .nth(total - cap)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    format!("…{}", &content[start..])
+}
+
+/// Splits a `foo, bar, baz(qux, quux)`-style action argument list on top-level
+/// commas only, respecting quoted strings and nested parentheses. Returns `None`
+/// for malformed input (unterminated quote, unmatched parenthesis).
+fn split_top_level_fields(inner: &str) -> Option<Vec<String>> {
+    split_top_level_fields_limited(inner, usize::MAX)
+}
+
+fn split_top_level_fields_limited(inner: &str, max_fields: usize) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut in_quote: Option<char> = None;
+    let mut escaped = false;
+    let mut at_field_start = true;
+
+    for c in inner.chars() {
+        if let Some(quote) = in_quote {
+            current.push(c);
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if c == '\\' {
+                escaped = true;
+                continue;
+            }
+            if c == quote {
+                in_quote = None;
+            }
+            continue;
+        }
+
+        match c {
+            '"' | '\'' if at_field_start => {
+                in_quote = Some(c);
+                current.push(c);
+                at_field_start = false;
+            }
+            '(' => {
+                depth += 1;
+                current.push(c);
+                at_field_start = false;
+            }
+            ')' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                current.push(c);
+                at_field_start = false;
+            }
+            ',' if depth == 0 && fields.len() + 1 < max_fields => {
+                fields.push(current.trim().to_string());
+                current.clear();
+                at_field_start = true;
+            }
+            c => {
+                if !c.is_whitespace() {
+                    at_field_start = false;
+                }
+                current.push(c);
+            }
+        }
+    }
+
+    if in_quote.is_some() || depth != 0 {
+        return None;
+    }
+
+    fields.push(current.trim().to_string());
+    Some(fields)
+}
+
+fn normalize_action_field(field: &str) -> String {
+    field.trim().trim_matches(['"', '\'', '`']).to_string()
+}
+
 impl SwarmLedger {
     pub fn new() -> Self {
         Self {
@@ -385,13 +565,50 @@ impl SwarmLedger {
             description: description.to_string(),
             assigned_to: None,
             status: TaskStatus::Todo,
+            workspace_id: None,
+            workspace_live: false,
+            snapshot_note: None,
             result: None,
         });
         id
     }
 
+    pub fn task(&self, id: usize) -> Option<&Task> {
+        self.tasks.iter().find(|task| task.id == id)
+    }
+
+    pub fn task_mut(&mut self, id: usize) -> Option<&mut Task> {
+        self.tasks.iter_mut().find(|task| task.id == id)
+    }
+
+    pub fn associate_workspace(
+        &mut self,
+        task_id: usize,
+        workspace_id: usize,
+        snapshot_note: Option<&str>,
+    ) {
+        if let Some(task) = self.task_mut(task_id) {
+            task.workspace_id = Some(workspace_id);
+            task.workspace_live = true;
+            task.snapshot_note = snapshot_note.map(str::to_string);
+        }
+    }
+
+    pub fn resolve_live_workspace_id(&self, task_id: usize) -> Option<usize> {
+        self.task(task_id)
+            .and_then(|task| task.workspace_live.then_some(task.workspace_id).flatten())
+    }
+
+    pub fn release_workspace(&mut self, workspace_id: usize) {
+        for task in &mut self.tasks {
+            if task.workspace_id == Some(workspace_id) {
+                task.workspace_live = false;
+            }
+        }
+    }
+
     pub fn update_status(&mut self, id: usize, status: TaskStatus) {
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+        if let Some(task) = self.task_mut(id) {
             task.status = status;
         }
     }
@@ -402,15 +619,28 @@ impl SwarmLedger {
     /// does not reach the delegator within the same turn it was requested in; see
     /// `system_prompt`'s protocol text.
     pub fn record_result(&mut self, id: usize, result: &str) {
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
-            // Truncate on a char boundary, not a byte index — `result` may contain
-            // multi-byte UTF-8, and slicing mid-character panics. Mirrors
-            // `local_binary::summarize_stderr`.
-            let truncated = match result.char_indices().nth(MAX_RESULT_CHARS) {
-                Some((cut, _)) => format!("{}…", &result[..cut]),
-                None => result.to_string(),
-            };
+        if let Some(task) = self.task_mut(id) {
+            let truncated = truncate_head_chars(result, MAX_RESULT_CHARS);
             task.result = Some(truncated);
+        }
+    }
+
+    pub fn append_result(&mut self, id: usize, result: &str) {
+        if let Some(task) = self.task_mut(id) {
+            if task
+                .result
+                .as_deref()
+                .is_some_and(|existing| existing.split("\n\n").any(|part| part == result))
+            {
+                return;
+            }
+            let combined = match task.result.as_deref() {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{result}\n\n{existing}")
+                }
+                _ => result.to_string(),
+            };
+            task.result = Some(truncate_head_chars(&combined, MAX_RESULT_CHARS));
         }
     }
 
@@ -427,13 +657,7 @@ impl SwarmLedger {
     /// Otherwise, loading past `MAX_LOADED_SKILLS` evicts the oldest entry to make
     /// room, the same bound-the-ledger reasoning as `MAX_RENDERED_TASKS`.
     pub fn record_skill(&mut self, name: &str, content: &str) {
-        // Truncate on a char boundary, not a byte index — mirrors `record_result`
-        // and `local_binary::summarize_stderr`, for the same reason: `content` may
-        // contain multi-byte UTF-8, and slicing mid-character panics.
-        let truncated = match content.char_indices().nth(MAX_SKILL_CONTENT_CHARS) {
-            Some((cut, _)) => format!("{}…", &content[..cut]),
-            None => content.to_string(),
-        };
+        let truncated = truncate_head_chars(content, MAX_SKILL_CONTENT_CHARS);
 
         if let Some(existing) = self.loaded_skills.iter_mut().find(|s| s.name == name) {
             existing.content = truncated;
@@ -488,13 +712,7 @@ impl SwarmLedger {
     /// the path is the identity here, not the request. Otherwise, loading past
     /// `MAX_LOADED_READS` evicts the oldest entry to make room.
     pub fn record_file_read(&mut self, path: &str, content: &str) {
-        // Truncate on a char boundary, not a byte index — mirrors `record_skill`,
-        // for the same reason: `content` may contain multi-byte UTF-8, and slicing
-        // mid-character panics.
-        let truncated = match content.char_indices().nth(MAX_READ_CONTENT_CHARS) {
-            Some((cut, _)) => format!("{}…", &content[..cut]),
-            None => content.to_string(),
-        };
+        let truncated = truncate_head_chars(content, MAX_READ_CONTENT_CHARS);
 
         if let Some(existing) = self.loaded_reads.iter_mut().find(|r| r.path == path) {
             existing.content = truncated;
@@ -519,12 +737,7 @@ impl SwarmLedger {
             self.last_commander_reply = None;
             return;
         }
-        // Char boundary, not byte index: replies are arbitrary UTF-8 and slicing
-        // mid-character panics. Same rule as `record_skill` and `record_file_read`.
-        let capped = match trimmed.char_indices().nth(MAX_PREVIOUS_TURN_CHARS) {
-            Some((cut, _)) => format!("{}…", &trimmed[..cut]),
-            None => trimmed.to_string(),
-        };
+        let capped = truncate_head_chars(trimmed, MAX_PREVIOUS_TURN_CHARS);
         self.last_commander_reply = Some(capped);
     }
 
@@ -544,18 +757,7 @@ impl SwarmLedger {
     /// `record_file_write`'s in-place refresh. Otherwise, recording past
     /// `MAX_RECORDED_LISTS` evicts the oldest entry to make room.
     pub fn record_file_list(&mut self, path: &str, outcome: &str) {
-        // Truncate on a char boundary, not a byte index — mirrors `record_file_read`,
-        // for the same reason: `outcome` joins model-controlled file names and may
-        // contain multi-byte UTF-8, and slicing mid-character panics. `outcome` was
-        // previously stored verbatim with only `MAX_RECORDED_LISTS` bounding how many
-        // listings are kept, never how big one is — a listing has no per-item cap
-        // upstream either (`Workspace::list` allows up to `MAX_LIST_ENTRIES` entries),
-        // so a single directory with many long file names could dominate every
-        // subsequent prompt's budget on its own.
-        let truncated = match outcome.char_indices().nth(MAX_LIST_OUTCOME_CHARS) {
-            Some((cut, _)) => format!("{}…", &outcome[..cut]),
-            None => outcome.to_string(),
-        };
+        let truncated = truncate_head_chars(outcome, MAX_LIST_OUTCOME_CHARS);
 
         if let Some(existing) = self.file_listings.iter_mut().find(|l| l.path == path) {
             existing.outcome = truncated;
@@ -570,15 +772,43 @@ impl SwarmLedger {
         });
     }
 
+    pub fn run_records(&self) -> &[RunRecord] {
+        &self.run_records
+    }
+
+    /// Records a bounded proof-command result for the commander's later inspection.
+    /// Duplicate records are preserved in history, but `state_fingerprint` deduplicates
+    /// them semantically so repeated REDs do not look like forward progress.
+    pub fn record_run(
+        &mut self,
+        task_id: usize,
+        argv: &[String],
+        outcome: RunOutcome,
+        output: &str,
+        millis: u64,
+    ) {
+        if self.run_records.len() >= MAX_RUN_RECORDS {
+            self.run_records.remove(0);
+        }
+        self.run_records.push(RunRecord {
+            task_id,
+            argv: argv.to_vec(),
+            outcome,
+            output: truncate_tail_chars(output, MAX_RUN_OUTPUT_CHARS),
+            millis,
+        });
+    }
+
     /// Clears every *accumulated content* section — the escape hatch half of
     /// `docs/AUDIT-2026-07-30.md` §3.2, alongside the whole-prompt budget in
     /// `system_prompt`. The budget bounds any single turn; this is for a session that
     /// has run long enough that even the budgeted prompt is mostly stale content, with
     /// no other way to get back to a small prompt short of restarting.
     ///
-    /// What's dropped and why: `loaded_skills`, `written_files`, `loaded_reads`, and
-    /// `file_listings` are pure accumulation — nothing else in the app reads them
-    /// except `system_prompt`, so there is no cost to emptying them outright.
+    /// What's dropped and why: `loaded_skills`, `written_files`, `loaded_reads`,
+    /// `file_listings`, and `run_records` are pure accumulation — nothing else in
+    /// the app reads them except `system_prompt`, so there is no cost to emptying
+    /// them outright.
     /// `last_commander_reply` exists only to carry a plan across one turn boundary
     /// (see its field doc comment); once explicitly cleared there is no plan left to
     /// carry, and leaving a stale one in place would misrepresent what the commander
@@ -590,13 +820,14 @@ impl SwarmLedger {
     /// What survives and why: `roster` and `budgets` are not accumulated history —
     /// they describe what's reachable *right now* and are refreshed independently by
     /// `set_roster`/`update_budget`, so clearing them would just make the very next
-    /// prompt claim "no other models are reachable" until the next reconfigure, which
-    /// is not what "forget stale content" means. The tasks themselves (`id`,
-    /// `description`, `assigned_to`, `status`) survive too: a task list is the user's
-    /// to-do list for the session, cheap on its own (bounded by `MAX_RENDERED_TASKS` in
-    /// the prompt regardless of how many were ever added), and useful to keep looking
-    /// at across a clear — what needed clearing was the heavy replies riding along
-    /// with it, not the fact that the work happened.
+    /// prompt claim "no other models are reachable" until the next reconfigure,
+    /// which is not what "forget stale content" means. The tasks themselves (`id`,
+    /// `description`, `assigned_to`, `status`, and task-copy metadata) survive too:
+    /// a task list is the user's to-do list for the session, cheap on its own
+    /// (bounded by `MAX_RENDERED_TASKS` in the prompt regardless of how many were
+    /// ever added), and useful to keep looking at across a clear — what needed
+    /// clearing was the heavy replies riding along with it, not the fact that the
+    /// work happened.
     pub fn clear_content(&mut self) {
         for task in &mut self.tasks {
             task.result = None;
@@ -605,11 +836,80 @@ impl SwarmLedger {
         self.written_files.clear();
         self.loaded_reads.clear();
         self.file_listings.clear();
+        self.run_records.clear();
         self.last_commander_reply = None;
     }
 
+    /// A semantic fingerprint of the ledger state used for continuation-stall
+    /// detection. Ignores volatile commander prose and task numbering, and
+    /// deduplicates semantically identical task/run outcomes so repeating the same
+    /// action with the same result does not count as progress by itself.
+    pub fn state_fingerprint(&self) -> u64 {
+        fn canonicalize<T: Ord + Hash>(items: impl IntoIterator<Item = T>) -> Vec<T> {
+            let mut items: Vec<T> = items.into_iter().collect();
+            items.sort();
+            items.dedup();
+            items
+        }
+
+        let task_fingerprints: Vec<(usize, TaskFingerprint)> = self
+            .tasks
+            .iter()
+            .map(|task| {
+                (
+                    task.id,
+                    TaskFingerprint {
+                        description: task.description.clone(),
+                        assigned_to: task.assigned_to.clone(),
+                        status: task.status,
+                        workspace_live: task.workspace_live,
+                        snapshot_note: task.snapshot_note.clone(),
+                        result: task.result.clone(),
+                    },
+                )
+            })
+            .collect();
+        let task_by_id: BTreeMap<usize, TaskFingerprint> =
+            task_fingerprints.iter().cloned().collect();
+
+        let mut hasher = DefaultHasher::new();
+        canonicalize(task_fingerprints.into_iter().map(|(_, task)| task)).hash(&mut hasher);
+        canonicalize(
+            self.loaded_skills
+                .iter()
+                .map(|skill| (skill.name.clone(), skill.content.clone())),
+        )
+        .hash(&mut hasher);
+        canonicalize(
+            self.loaded_reads
+                .iter()
+                .map(|read| (read.path.clone(), read.content.clone())),
+        )
+        .hash(&mut hasher);
+        canonicalize(
+            self.file_listings
+                .iter()
+                .map(|listing| (listing.path.clone(), listing.outcome.clone())),
+        )
+        .hash(&mut hasher);
+        canonicalize(
+            self.written_files
+                .iter()
+                .map(|written| (written.path.clone(), written.outcome.clone())),
+        )
+        .hash(&mut hasher);
+        canonicalize(self.run_records.iter().map(|record| RunFingerprint {
+            task: task_by_id.get(&record.task_id).cloned(),
+            argv: record.argv.clone(),
+            outcome: record.outcome.clone(),
+            output: record.output.clone(),
+        }))
+        .hash(&mut hasher);
+        hasher.finish()
+    }
+
     pub fn assign_task(&mut self, id: usize, model_label: &str) {
-        if let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) {
+        if let Some(task) = self.task_mut(id) {
             task.assigned_to = Some(model_label.to_string());
             task.status = TaskStatus::InProgress;
         }
@@ -633,24 +933,28 @@ impl SwarmLedger {
     ///    cost/context information for. Their combined size is computed first and
     ///    subtracted from the total budget; whatever's left is the *content budget*
     ///    for tier 2.
-    /// 2. **Content**: tasks (with results), the commander's previous turn, loaded
-    ///    skills, loaded project-file reads, file listings, and written-file records —
-    ///    in that priority order, which is also the order they're rendered in. Each
-    ///    is capped per-item already (`MAX_RESULT_CHARS` and friends), but the audit
-    ///    this closes found that the caps compound: 20 tasks × 2000 chars alone is
-    ///    40,000. So each section here spends from a shared, shrinking content budget
+    /// 2. **Content**: tasks (with results and task-copy metadata), the commander's
+    ///    previous turn, loaded skills, loaded project-file reads, command proof
+    ///    results, file listings, and written-file records — in that priority order,
+    ///    which is also the order they're rendered in. Each is capped per-item
+    ///    already (`MAX_RESULT_CHARS` and friends), but the audit this closes found
+    ///    that the caps compound: 20 tasks × 2000 chars alone is 40,000. So each
+    ///    section here spends from a shared, shrinking content budget
     ///    (`fits`/`push_structural`, most-recent-first) and announces what it dropped
     ///    rather than silently vanishing — see each `render_*_section` below.
     ///
     /// Tasks lead the content tier because they carry the actual work product
     /// (delegation results) the commander needs to synthesise from; the previous turn
-    /// follows because losing it silently reproduces the exact bug `last_commander_reply`
-    /// exists to fix (see its field doc comment). Loaded skills/reads follow because
-    /// they're content a model explicitly asked to see. File listings and written-file
-    /// records are last: they're metadata about what happened, not content a model is
-    /// working from, and `docs/AUDIT-2026-07-30.md` §3.2 specifically flagged listings
-    /// as the section with no per-item content cap at all — most likely to blow the
-    /// budget on its own, least valuable per character when it does.
+    /// follows because losing it silently reproduces the exact bug
+    /// `last_commander_reply` exists to fix (see its field doc comment). Loaded
+    /// skills/reads follow because they're content a model explicitly asked to see.
+    /// Command proof results come next because they are strong evidence the commander
+    /// may need before deciding whether to apply or discard a task copy. File
+    /// listings and written-file records are last: they're metadata about what
+    /// happened, not content a model is working from, and
+    /// `docs/AUDIT-2026-07-30.md` §3.2 specifically flagged listings as the section
+    /// with no per-item content cap at all — most likely to blow the budget on its
+    /// own, least valuable per character when it does.
     pub fn system_prompt(&self) -> String {
         let mut out = String::from("## SWARM LEDGER (shared blackboard)\n\n");
         out.push_str(&cap_section(
@@ -674,6 +978,7 @@ impl SwarmLedger {
         out.push_str(&self.render_previous_turn_section(&mut budget, &mut note_budget));
         out.push_str(&self.render_loaded_skills_section(&mut budget, &mut note_budget));
         out.push_str(&self.render_loaded_reads_section(&mut budget, &mut note_budget));
+        out.push_str(&self.render_run_records_section(&mut budget, &mut note_budget));
         out.push_str(&self.render_file_listings_section(&mut budget, &mut note_budget));
         out.push_str(&self.render_written_files_section(&mut budget, &mut note_budget));
 
@@ -697,11 +1002,16 @@ impl SwarmLedger {
              You are a sub-agent, not the swarm commander. Work only from the \
              delegated task in the user message. You do not receive the shared \
              ledger, the broader conversation, or other models' prompts or results, \
-             and must not infer or reproduce them.\n"
+             and must not infer or reproduce them.\n\
+             If you believe you found a defect, report the evidence in prose and \
+             include an exact argv-only suggestion of this form: \
+             `PROOF: run_command(<program>, <arg1>, ...)`. Suggest it only; do not \
+             execute it yourself.\n"
         );
         if allow_writes {
             out.push_str(
-                "This delegation explicitly allows project-file writes. The \
+                "This delegation explicitly allows project-file writes inside an \
+                 isolated task copy. The \
                  file-write protocol below is the only swarm action recognized from \
                  your reply.\n",
             );
@@ -777,6 +1087,20 @@ impl SwarmLedger {
                     task.description,
                     assignee
                 );
+                if let Some(workspace_id) = task.workspace_id {
+                    let state = if task.workspace_live {
+                        "live"
+                    } else {
+                        "released"
+                    };
+                    entry.push_str(&format!("    workspace: copy #{workspace_id} ({state})\n"));
+                }
+                if let Some(snapshot_note) = &task.snapshot_note {
+                    entry.push_str(&format!(
+                        "    snapshot: {}\n",
+                        snapshot_note.replace('\n', "\n        ")
+                    ));
+                }
                 if let Some(result) = &task.result {
                     // Indent continuation lines so a multi-line result nests under
                     // its task instead of producing bare lines that read as separate
@@ -963,6 +1287,57 @@ impl SwarmLedger {
         out
     }
 
+    fn render_run_records_section(&self, budget: &mut usize, note_budget: &mut usize) -> String {
+        let mut out = String::new();
+        if self.run_records.is_empty() {
+            return out;
+        }
+        push_structural(&mut out, note_budget, "\n### Command proof results\n");
+
+        let entries: Vec<String> = self
+            .run_records
+            .iter()
+            .map(|record| {
+                let mut entry = format!("- Task #{}\n    argv:\n", record.task_id);
+                for (index, arg) in record.argv.iter().enumerate() {
+                    entry.push_str(&format!("      [{index}] {:?}\n", arg));
+                }
+                entry.push_str(&format!(
+                    "    outcome: {}\n    millis: {}\n",
+                    record.outcome.label(),
+                    record.millis
+                ));
+                if record.output.is_empty() {
+                    entry.push_str("    output: (empty)\n");
+                } else {
+                    let indented_output = record.output.replace('\n', "\n      ");
+                    entry.push_str(&format!("    output:\n      {indented_output}\n"));
+                }
+                entry
+            })
+            .collect();
+        let mut keep = vec![false; entries.len()];
+        for i in (0..entries.len()).rev() {
+            keep[i] = fits(budget, &entries[i]);
+        }
+        let dropped = keep.iter().filter(|k| !**k).count();
+        if dropped > 0 {
+            push_structural(
+                &mut out,
+                note_budget,
+                &format!(
+                    "(...{dropped} proof record(s) omitted from this prompt — system-prompt character budget exhausted...)\n"
+                ),
+            );
+        }
+        for (i, entry) in entries.iter().enumerate() {
+            if keep[i] {
+                out.push_str(entry);
+            }
+        }
+        out
+    }
+
     /// Renders directory listings within the shared content budget. Same whole-item
     /// treatment as the sections above. This is the section `docs/AUDIT-2026-07-30.md`
     /// §3.2 specifically flagged as having no per-item content cap at all (a listing's
@@ -1055,7 +1430,7 @@ impl SwarmLedger {
         out
     }
 
-    /// The four protocol sections, verbatim and unconditional — see `system_prompt`'s
+    /// The protocol sections, verbatim and unconditional — see `system_prompt`'s
     /// doc comment for why these never shrink.
     fn render_protocols() -> String {
         let mut out = String::new();
@@ -1072,10 +1447,15 @@ impl SwarmLedger {
              results into the final answer. Delegate everything else.\n\
              To hand text-only work to another model, emit a line of exactly this form:\n\
              `ACTION: delegate_task(<model label>, <prompt>)`\n\
-             If and only if the task must create or edit project files, use:\n\
+             If the task must create or edit project files in a fresh isolated task \
+             copy, use:\n\
              `ACTION: delegate_file_task(<model label>, <prompt>)`\n\
-             Only `delegate_file_task` gives the sub-agent the file-write protocol \
-             and permits write blocks from its reply to execute.\n\
+             To continue work in an existing isolated copy, use:\n\
+             `ACTION: delegate_in_copy(<workspace task id>, <model label>, <prompt>)`\n\
+             Only `delegate_file_task` and `delegate_in_copy` give the sub-agent the \
+             file-write protocol and permit write blocks from its reply to execute. \
+             Those writes stay inside the isolated copy and never write the main \
+             project directly.\n\
              Use a label from the \"Available models\" list above, which annotates each \
              model with what it costs and how much context it holds. Pick the CHEAPEST \
              model that can do the task, not the strongest one — a large-context, \
@@ -1091,10 +1471,11 @@ impl SwarmLedger {
              task and becomes visible to you on your NEXT turn — not this one, since \
              this reply is already on its way out when the sub-agent runs. So do not \
              promise the user an answer in the same turn you delegate: say what you \
-             have handed out, and deliver the synthesis next turn. There is no \
-             automatic continuation turn; when the user asks for every connected \
-             model, emit every required delegation now rather than promising to query \
-             omitted models later.\n",
+             have handed out, and deliver the synthesis next turn. After action \
+             results arrive, they are automatically fed back to you on bounded \
+             continuation turns. When the user asks for every connected model, emit \
+             every required delegation now rather than promising to query omitted \
+             models later.\n",
         );
 
         out.push_str(
@@ -1114,6 +1495,33 @@ impl SwarmLedger {
         out.push_str(
             "Like a delegation result, the outcome is recorded in this ledger and \
              becomes visible to you on your NEXT turn, not this one.\n",
+        );
+
+        out.push_str(
+            "\n### Command proof protocol\n\
+             Proof commands are commander actions, not worker actions. A worker may \
+             suggest one in prose, but only you may request it, and only against an \
+             isolated task copy. Emit either:\n\
+             `ACTION: run_command(<task id>, <program>, <arg1>, <arg2>, ...)`\n\
+             `ACTION: run_test(<task id>)`\n\
+             `ACTION: run_test(<task id>, <filter>)`\n\
+             `run_test(<task id>, <filter>)` expands to the argv \
+             `[\"cargo\", \"test\", \"--\", <filter>]`. Every requested command \
+             requires explicit user approval before it runs. Its output is recorded \
+             under \"Command proof results\" and becomes visible to you on your NEXT \
+             turn or bounded continuation turn.\n\
+             A nonzero exit or timeout is RED evidence, not verification by itself. \
+             Inspect that the RED failed for the claimed cause rather than a malformed \
+             command or unrelated crash, then reuse the same copy for the fix, rerun \
+             GREEN plus relevant regressions, and only then decide whether the copy is \
+             ready.\n\
+             Agent text alone never verifies a finding.\n\
+             When a task copy is ready to keep or throw away, emit exactly one of:\n\
+             `ACTION: apply_copy(<workspace task id>)`\n\
+             `ACTION: discard_copy(<workspace task id>)`\n\
+             Do not emit either disposition in the same reply as a proof command; \
+             first receive and inspect the proof result on the continuation turn. \
+             Applying or discarding is explicit; there is no automatic merge.\n",
         );
 
         out.push_str(
@@ -1140,30 +1548,34 @@ impl SwarmLedger {
 
     fn file_write_protocol() -> &'static str {
         "\n### File write protocol\n\
-         Any model may create or overwrite files in the project folder, including \
-         a sub-agent running a delegated task — this is how work that produces \
-         files actually produces them. Emit exactly this form:\n\
+         A commander's write block targets the main project and should be reserved \
+         for a direct, user-approved edit. A delegated worker's write block targets \
+         only its isolated task copy, which it receives when the commander used \
+         `delegate_file_task(...)` or `delegate_in_copy(...)`. Emit exactly this \
+         form:\n\
          `ACTION: write_file(<relative path>)`\n\
          followed by the file's content, one line at a time, followed by a line of \
-         exactly `ACTION: end_file`. Paths are relative to the project root; \
+         exactly `ACTION: end_file`. Paths are relative to the active target root; \
          subdirectories are created automatically. Files are capped at 256KB. \
          Writes into `.git/` are refused — a bad write there can corrupt the \
          repository. A line exactly `ACTION: end_file` cannot appear inside the \
          content — it always closes the block there instead. `ACTION: \
          delegate_task(...)`, `ACTION: delegate_file_task(...)`, `ACTION: \
-         read_skill(...)`, `ACTION: read_file(...)`, and `ACTION: list_files(...)` \
-         lines inside the content are treated as content, not executed, so you can \
-         safely write documentation about this protocol. Every write is shown to the \
-         user, who must approve it before it reaches disk; a refusal is recorded like \
-         any other outcome.\n"
+         delegate_in_copy(...)`, `ACTION: run_command(...)`, `ACTION: \
+         run_test(...)`, `ACTION: apply_copy(...)`, `ACTION: discard_copy(...)`, \
+         `ACTION: read_skill(...)`, `ACTION: read_file(...)`, and `ACTION: \
+         list_files(...)` lines inside the content are treated as content, not \
+         executed, so you can safely write documentation about this protocol. Every \
+         write is shown to the user, and applying the copy later is also explicit — \
+         there is no automatic merge.\n"
     }
 
-    /// Extracts every `ACTION: delegate_task(target, prompt)` and
-    /// `ACTION: delegate_file_task(target, prompt)` line from a reply.
+    /// Extracts every `ACTION: delegate_task(target, prompt)`,
+    /// `ACTION: delegate_file_task(target, prompt)`, and
+    /// `ACTION: delegate_in_copy(task_id, target, prompt)` line from a reply.
     ///
-    /// Splits on the *first* comma (so the target cannot contain one) and matches to the
-    /// *last* closing parenthesis on the line, so prompts may contain commas and nested
-    /// parentheses.
+    /// Uses a conservative top-level comma splitter, so quoted prompts and nested
+    /// parentheses may contain commas without creating extra fields.
     /// Extracts the argument text of `ACTION: name(...)` when `line` **is** that action.
     ///
     /// Two rules, both learned from a defect rather than chosen up front.
@@ -1264,33 +1676,58 @@ impl SwarmLedger {
     pub fn parse_delegations(reply: &str) -> Vec<Delegation> {
         const TEXT_MARKER: &str = "ACTION: delegate_task(";
         const FILE_MARKER: &str = "ACTION: delegate_file_task(";
+        const COPY_MARKER: &str = "ACTION: delegate_in_copy(";
         let mut found = Vec::new();
 
         for line in reply.lines() {
-            let parsed = [(FILE_MARKER, true), (TEXT_MARKER, false)]
-                .into_iter()
-                .find_map(|(marker, allow_writes)| {
-                    Self::action_argument(line, marker).map(|inner| (inner, allow_writes))
-                });
-            let Some((inner, allow_writes)) = parsed else {
+            let parsed = [
+                (COPY_MARKER, true, true),
+                (FILE_MARKER, true, false),
+                (TEXT_MARKER, false, false),
+            ]
+            .into_iter()
+            .find_map(|(marker, allow_writes, reuses_workspace)| {
+                Self::action_argument(line, marker)
+                    .map(|inner| (inner, allow_writes, reuses_workspace))
+            });
+            let Some((inner, allow_writes, reuses_workspace)) = parsed else {
                 continue;
             };
-            let Some((target, prompt)) = inner.split_once(',') else {
-                continue;
+            let (workspace_task, target, prompt) = if reuses_workspace {
+                let Some(fields) = split_top_level_fields_limited(inner, 3) else {
+                    continue;
+                };
+                if fields.len() != 3 {
+                    continue;
+                }
+                let Ok(workspace_task) = normalize_action_field(&fields[0]).parse::<usize>() else {
+                    continue;
+                };
+                (
+                    Some(workspace_task),
+                    normalize_action_field(&fields[1]),
+                    normalize_action_field(&fields[2]),
+                )
+            } else {
+                let Some(fields) = split_top_level_fields_limited(inner, 2) else {
+                    continue;
+                };
+                if fields.len() != 2 {
+                    continue;
+                }
+                (
+                    None,
+                    normalize_action_field(&fields[0]),
+                    normalize_action_field(&fields[1]),
+                )
             };
-
-            // Backticks are stripped from each argument, not just from the ends of the
-            // line: a model writing ACTION: delegate_task(`ollama:llama3`, …) produced a
-            // target with the backticks still attached, which matched no model in the
-            // roster and failed the dispatch for a purely cosmetic reason.
-            let target = target.trim().trim_matches(['"', '\'', '`']).to_string();
-            let prompt = prompt.trim().trim_matches(['"', '\'', '`']).to_string();
             if target.is_empty() || prompt.is_empty() {
                 continue;
             }
             found.push(Delegation {
                 target,
                 prompt,
+                workspace_task,
                 allow_writes,
             });
         }
@@ -1372,6 +1809,97 @@ impl SwarmLedger {
                 continue;
             };
             found.push(inner.trim().trim_matches(['"', '\'', '`']).to_string());
+        }
+
+        found
+    }
+
+    /// Extracts commander proof-command requests from whole `ACTION:` lines in
+    /// write-block-stripped text. Malformed or unterminated actions are ignored.
+    pub fn parse_run_requests(reply: &str) -> Vec<RunRequest> {
+        const COMMAND_MARKER: &str = "ACTION: run_command(";
+        const TEST_MARKER: &str = "ACTION: run_test(";
+        let mut found = Vec::new();
+
+        for line in reply.lines() {
+            if let Some(inner) = Self::action_argument(line, COMMAND_MARKER) {
+                let Some(fields) = split_top_level_fields(inner) else {
+                    continue;
+                };
+                if fields.len() < 2 {
+                    continue;
+                }
+                let Ok(task_id) = normalize_action_field(&fields[0]).parse::<usize>() else {
+                    continue;
+                };
+                let argv: Vec<String> = fields[1..]
+                    .iter()
+                    .map(|field| normalize_action_field(field))
+                    .collect();
+                if argv.iter().any(|field| field.is_empty()) {
+                    continue;
+                }
+                found.push(RunRequest { task_id, argv });
+                continue;
+            }
+
+            let Some(inner) = Self::action_argument(line, TEST_MARKER) else {
+                continue;
+            };
+            let Some(fields) = split_top_level_fields(inner) else {
+                continue;
+            };
+            if !(fields.len() == 1 || fields.len() == 2) {
+                continue;
+            }
+            let Ok(task_id) = normalize_action_field(&fields[0]).parse::<usize>() else {
+                continue;
+            };
+            let mut argv = vec!["cargo".to_string(), "test".to_string()];
+            if fields.len() == 2 {
+                let filter = normalize_action_field(&fields[1]);
+                if filter.is_empty() {
+                    continue;
+                }
+                argv.push("--".to_string());
+                argv.push(filter);
+            }
+            found.push(RunRequest { task_id, argv });
+        }
+
+        found
+    }
+
+    /// Extracts explicit isolated-copy dispositions from whole action lines in
+    /// write-block-stripped text.
+    pub fn parse_copy_dispositions(reply: &str) -> Vec<CopyDisposition> {
+        const APPLY_MARKER: &str = "ACTION: apply_copy(";
+        const DISCARD_MARKER: &str = "ACTION: discard_copy(";
+        let mut found = Vec::new();
+
+        for line in reply.lines() {
+            let parsed = [(APPLY_MARKER, true), (DISCARD_MARKER, false)]
+                .into_iter()
+                .find_map(|(marker, apply)| {
+                    Self::action_argument(line, marker).map(|inner| (inner, apply))
+                });
+            let Some((inner, apply)) = parsed else {
+                continue;
+            };
+            let Some(fields) = split_top_level_fields(inner) else {
+                continue;
+            };
+            if fields.len() != 1 {
+                continue;
+            }
+            let Ok(task_id) = normalize_action_field(&fields[0]).parse::<usize>() else {
+                continue;
+            };
+            found.push(if apply {
+                CopyDisposition::Apply(task_id)
+            } else {
+                CopyDisposition::Discard(task_id)
+            });
         }
 
         found
@@ -1639,6 +2167,9 @@ mod tests {
         assert!(text.contains("No active tasks."));
         assert!(text.contains("delegate_task"));
         assert!(text.contains("delegate_file_task"));
+        assert!(text.contains("delegate_in_copy"));
+        assert!(text.contains("run_command"));
+        assert!(text.contains("apply_copy"));
     }
 
     #[test]
@@ -1646,6 +2177,7 @@ mod tests {
         let text_only = SwarmLedger::subagent_system_prompt("ollama:llama3.2:3b", false);
         assert!(text_only.contains("connected as `ollama:llama3.2:3b`"));
         assert!(text_only.contains("text-only delegation"));
+        assert!(text_only.contains("PROOF: run_command"));
         assert!(!text_only.contains("### File write protocol"));
         assert!(!text_only.contains("## SWARM LEDGER"));
 
@@ -1653,6 +2185,7 @@ mod tests {
         assert!(file_task.contains("connected as `worker:builder`"));
         assert!(file_task.contains("### File write protocol"));
         assert!(file_task.contains("ACTION: write_file"));
+        assert!(file_task.contains("isolated task copy"));
         assert!(!file_task.contains("### Delegation protocol"));
         assert!(!file_task.contains("### File read protocol"));
     }
@@ -1669,6 +2202,24 @@ mod tests {
         let text = ledger.system_prompt();
         assert!(text.contains("[IN_PROGRESS] Task #1: first (assigned: ollama:llama3)"));
         assert!(text.contains("[DONE] Task #2: second"));
+    }
+
+    #[test]
+    fn task_workspace_metadata_can_be_associated_rendered_and_released() {
+        let mut ledger = SwarmLedger::new();
+        let task_id = ledger.add_task("fix the failing test");
+        ledger.assign_task(task_id, "worker");
+        ledger.associate_workspace(task_id, 9, Some("failing test red"));
+
+        assert_eq!(ledger.resolve_live_workspace_id(task_id), Some(9));
+        let text = ledger.system_prompt();
+        assert!(text.contains("workspace: copy #9 (live)"));
+        assert!(text.contains("snapshot: failing test red"));
+
+        ledger.release_workspace(9);
+        assert_eq!(ledger.resolve_live_workspace_id(task_id), None);
+        let released = ledger.system_prompt();
+        assert!(released.contains("workspace: copy #9 (released)"));
     }
 
     #[test]
@@ -1798,6 +2349,7 @@ mod tests {
             vec![Delegation {
                 target: "ollama:llama3".into(),
                 prompt: "summarise the file".into(),
+                workspace_task: None,
                 allow_writes: false,
             }]
         );
@@ -1811,12 +2363,26 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].target, "ollama:llama3");
         assert_eq!(found[0].prompt, "create src/main.rs");
+        assert_eq!(found[0].workspace_task, None);
         assert!(found[0].allow_writes);
 
         let text_only =
             SwarmLedger::parse_delegations("ACTION: delegate_task(ollama:llama3, review it)");
         assert_eq!(text_only.len(), 1);
+        assert_eq!(text_only[0].workspace_task, None);
         assert!(!text_only[0].allow_writes);
+    }
+
+    #[test]
+    fn copy_reuse_delegations_capture_the_workspace_task_id() {
+        let found = SwarmLedger::parse_delegations(
+            r#"ACTION: delegate_in_copy(7, ollama:llama3, "fix the red, then rerun green")"#,
+        );
+        assert_eq!(found.len(), 1, "got {found:?}");
+        assert_eq!(found[0].workspace_task, Some(7));
+        assert_eq!(found[0].target, "ollama:llama3");
+        assert_eq!(found[0].prompt, "fix the red, then rerun green");
+        assert!(found[0].allow_writes);
     }
 
     #[test]
@@ -2001,6 +2567,77 @@ mod tests {
     }
 
     #[test]
+    fn parses_run_command_with_top_level_commas_only() {
+        let found = SwarmLedger::parse_run_requests(
+            r#"ACTION: run_command(12, cargo, test, --, "suite(with, commas)")"#,
+        );
+        assert_eq!(
+            found,
+            vec![RunRequest {
+                task_id: 12,
+                argv: vec![
+                    "cargo".into(),
+                    "test".into(),
+                    "--".into(),
+                    "suite(with, commas)".into(),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_run_test_with_and_without_filter() {
+        assert_eq!(
+            SwarmLedger::parse_run_requests("ACTION: run_test(7)"),
+            vec![RunRequest {
+                task_id: 7,
+                argv: vec!["cargo".into(), "test".into()],
+            }]
+        );
+        assert_eq!(
+            SwarmLedger::parse_run_requests(r#"ACTION: run_test(7, "suite::name")"#),
+            vec![RunRequest {
+                task_id: 7,
+                argv: vec![
+                    "cargo".into(),
+                    "test".into(),
+                    "--".into(),
+                    "suite::name".into(),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_malformed_run_requests() {
+        assert!(SwarmLedger::parse_run_requests("ACTION: run_command()").is_empty());
+        assert!(SwarmLedger::parse_run_requests("ACTION: run_command(nope, cargo)").is_empty());
+        assert!(SwarmLedger::parse_run_requests("ACTION: run_test(4, )").is_empty());
+        assert!(SwarmLedger::parse_run_requests("ACTION: run_test(4, a, b)").is_empty());
+        assert!(
+            SwarmLedger::parse_run_requests("Mention ACTION: run_command(4, cargo) please.")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parses_copy_dispositions() {
+        assert_eq!(
+            SwarmLedger::parse_copy_dispositions("ACTION: apply_copy(5)"),
+            vec![CopyDisposition::Apply(5)]
+        );
+        assert_eq!(
+            SwarmLedger::parse_copy_dispositions("ACTION: discard_copy(8)"),
+            vec![CopyDisposition::Discard(8)]
+        );
+        assert!(SwarmLedger::parse_copy_dispositions("ACTION: apply_copy(nope)").is_empty());
+        assert!(
+            SwarmLedger::parse_copy_dispositions("Mention ACTION: discard_copy(1) only in prose.")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn a_loaded_read_is_rendered_in_the_loaded_project_files_section() {
         let mut ledger = SwarmLedger::new();
         ledger.record_file_read("notes.txt", "the plan is to ship on friday");
@@ -2156,6 +2793,21 @@ mod tests {
     }
 
     #[test]
+    fn proof_and_copy_actions_inside_file_content_remain_inert_after_stripping() {
+        let reply = "ACTION: write_file(README.md)\n\
+                     PROOF examples:\n\
+                     ACTION: run_command(3, cargo, test)\n\
+                     ACTION: apply_copy(3)\n\
+                     ACTION: end_file";
+        let (writes, stripped) = SwarmLedger::parse_file_writes(reply);
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].content.contains("ACTION: run_command"));
+        assert!(writes[0].content.contains("ACTION: apply_copy"));
+        assert!(SwarmLedger::parse_run_requests(&stripped).is_empty());
+        assert!(SwarmLedger::parse_copy_dispositions(&stripped).is_empty());
+    }
+
+    #[test]
     fn a_write_file_line_inside_a_block_is_content_not_a_new_block() {
         let reply = "ACTION: write_file(a.md)\n\
                       ACTION: write_file(b.md)\n\
@@ -2174,6 +2826,68 @@ mod tests {
         let text = ledger.system_prompt();
         assert!(text.contains("### Files you have written"));
         assert!(text.contains("secret_plan.md: ok (42 bytes)"));
+    }
+
+    #[test]
+    fn recorded_runs_render_as_indented_argv_not_action_lines() {
+        let mut ledger = SwarmLedger::new();
+        let task_id = ledger.add_task("reproduce the failure");
+        ledger.record_run(
+            task_id,
+            &[
+                "cargo".to_string(),
+                "test".to_string(),
+                "--".to_string(),
+                "suite::case".to_string(),
+            ],
+            RunOutcome::Exited(101),
+            "thread 'suite::case' panicked",
+            321,
+        );
+
+        let text = ledger.system_prompt();
+        assert!(text.contains("### Command proof results"));
+        assert!(text.contains("- Task #1"));
+        assert!(text.contains(r#"      [0] "cargo""#));
+        assert!(text.contains(r#"      [3] "suite::case""#));
+        assert!(text.contains("outcome: Exited(101)"));
+        assert!(text.contains("output:"));
+        assert!(!text.contains("ACTION: run_command(1, cargo, test"));
+    }
+
+    #[test]
+    fn run_output_is_tail_truncated_on_utf8_boundaries() {
+        let mut ledger = SwarmLedger::new();
+        let task_id = ledger.add_task("prove it");
+        let output = "é".repeat(MAX_RUN_OUTPUT_CHARS + 10);
+        ledger.record_run(
+            task_id,
+            &["cargo".into(), "test".into()],
+            RunOutcome::TimedOut,
+            &output,
+            1,
+        );
+
+        let stored = &ledger.run_records()[0].output;
+        assert!(stored.starts_with('…'));
+        assert_eq!(stored.chars().count(), MAX_RUN_OUTPUT_CHARS + 1);
+    }
+
+    #[test]
+    fn recording_runs_past_the_cap_evicts_the_oldest() {
+        let mut ledger = SwarmLedger::new();
+        let task_id = ledger.add_task("prove it");
+        for n in 0..(MAX_RUN_RECORDS + 1) {
+            ledger.record_run(
+                task_id,
+                &["cargo".into(), "test".into(), format!("case_{n}")],
+                RunOutcome::Exited(n as i32),
+                "",
+                n as u64,
+            );
+        }
+        assert_eq!(ledger.run_records().len(), MAX_RUN_RECORDS);
+        assert_eq!(ledger.run_records()[0].argv[2], "case_1");
     }
 
     #[test]
@@ -2210,6 +2924,19 @@ mod tests {
         assert!(text.contains("ACTION: write_file"));
         assert!(text.contains("ACTION: end_file"));
         assert!(text.contains("NEXT turn"));
+    }
+
+    #[test]
+    fn the_command_proof_protocol_describes_copy_only_runs_and_explicit_disposition() {
+        let text = SwarmLedger::new().system_prompt();
+        assert!(text.contains("### Command proof protocol"));
+        assert!(text.contains("ACTION: run_command"));
+        assert!(text.contains("ACTION: run_test"));
+        assert!(text.contains("explicit user approval"));
+        assert!(text.contains("RED evidence, not verification"));
+        assert!(text.contains("ACTION: apply_copy"));
+        assert!(text.contains("ACTION: discard_copy"));
+        assert!(text.contains("Agent text alone never verifies a finding"));
     }
 
     #[test]
@@ -2257,7 +2984,9 @@ mod tests {
         assert!(text.contains("DEFAULT, not a fallback"));
         assert!(text.contains("CHEAPEST"));
         assert!(text.contains("ACTION: delegate_task"));
+        assert!(text.contains("ACTION: delegate_in_copy"));
         assert!(text.contains("up to 10 delegation"));
+        assert!(text.contains("automatically fed back"));
     }
 
     #[test]
@@ -2312,15 +3041,17 @@ mod tests {
     }
 
     #[test]
-    fn the_file_write_protocol_text_names_the_project_folder_not_a_workspace() {
+    fn the_file_write_protocol_text_targets_an_isolated_copy_not_the_main_project() {
         let text = SwarmLedger::new().system_prompt();
-        assert!(text.contains("in the project folder"));
+        assert!(text.contains("isolated task copy"));
         assert!(text.contains("`.git/` are refused"));
         // Every action a model can emit must be listed as safe inside file content,
         // or a model writing docs about this protocol will avoid mentioning some.
+        assert!(text.contains("ACTION: delegate_in_copy(...)`"));
+        assert!(text.contains("ACTION: run_command(...)`"));
         assert!(text.contains("ACTION: read_file(...)`"));
         assert!(text.contains("ACTION: list_files(...)`"));
-        assert!(!text.contains("private workspace directory"));
+        assert!(text.contains("there is no automatic merge"));
     }
 
     #[test]
@@ -2339,10 +3070,9 @@ mod tests {
     /// `MAX_SKILL_CONTENT_CHARS` content, `MAX_LOADED_READS` reads each with full
     /// `MAX_READ_CONTENT_CHARS` content, `MAX_RECORDED_LISTS` oversized listings (the
     /// section the audit flagged as having no per-item content cap at all),
-    /// `MAX_RECORDED_WRITES` write records, and a full `MAX_PREVIOUS_TURN_CHARS`
-    /// previous turn. Mirrors the probe `docs/AUDIT-2026-07-30.md` §3.2 used, extended
-    /// with the three sections (`written_files`, `loaded_reads`, `file_listings`)
-    /// added after that audit was written.
+    /// `MAX_RUN_RECORDS` proof records, `MAX_RECORDED_WRITES` write records, and a
+    /// full `MAX_PREVIOUS_TURN_CHARS` previous turn. Mirrors the probe
+    /// `docs/AUDIT-2026-07-30.md` §3.2 used, extended with the newer sections.
     fn maximally_stuffed_ledger() -> SwarmLedger {
         let mut ledger = SwarmLedger::new();
         ledger.set_roster(vec![
@@ -2380,6 +3110,20 @@ mod tests {
                 .join("\n");
             ledger.record_file_list(&format!("dir-{i}"), &outcome);
         }
+        for i in 0..MAX_RUN_RECORDS {
+            ledger.record_run(
+                i + 1,
+                &[
+                    "cargo".to_string(),
+                    "test".to_string(),
+                    "--".to_string(),
+                    format!("case_{i}"),
+                ],
+                RunOutcome::Exited(101),
+                &"e".repeat(MAX_RUN_OUTPUT_CHARS),
+                i as u64,
+            );
+        }
         for i in 0..MAX_RECORDED_WRITES {
             ledger.record_file_write(&format!("written-{i}.md"), "ok (1234 bytes)");
         }
@@ -2415,6 +3159,7 @@ mod tests {
         unbounded.push_str(&ledger.render_previous_turn_section(&mut budget, &mut note_budget));
         unbounded.push_str(&ledger.render_loaded_skills_section(&mut budget, &mut note_budget));
         unbounded.push_str(&ledger.render_loaded_reads_section(&mut budget, &mut note_budget));
+        unbounded.push_str(&ledger.render_run_records_section(&mut budget, &mut note_budget));
         unbounded.push_str(&ledger.render_file_listings_section(&mut budget, &mut note_budget));
         unbounded.push_str(&ledger.render_written_files_section(&mut budget, &mut note_budget));
         unbounded.push_str(&SwarmLedger::render_protocols());
@@ -2441,10 +3186,12 @@ mod tests {
         assert!(text.contains("### Resource budgets"));
         assert!(text.contains("### Delegation protocol"));
         assert!(text.contains("### Skills protocol"));
+        assert!(text.contains("### Command proof protocol"));
         assert!(text.contains("### File write protocol"));
         assert!(text.contains("### File read protocol"));
         assert!(text.contains("ACTION: delegate_task"));
         assert!(text.contains("ACTION: read_skill"));
+        assert!(text.contains("ACTION: run_command"));
         assert!(text.contains("ACTION: write_file"));
         assert!(text.contains("ACTION: read_file"));
         assert!(text.contains("ACTION: list_files"));
@@ -2493,11 +3240,19 @@ mod tests {
         ledger.update_budget("ollama:llama3", "no quota needed");
         let id = ledger.add_task("summarise the diff");
         ledger.assign_task(id, "ollama:llama3");
+        ledger.associate_workspace(id, 4, Some("before applying"));
         ledger.record_result(id, "the diff adds a timeout");
         ledger.record_skill("notes.md", "be terse and cite sources");
         ledger.record_file_write("out.md", "ok (10 bytes)");
         ledger.record_file_read("in.md", "some file content");
         ledger.record_file_list("src", "ok (1 entries)\nmain.rs");
+        ledger.record_run(
+            id,
+            &["cargo".into(), "test".into()],
+            RunOutcome::Exited(101),
+            "failed",
+            25,
+        );
         ledger.record_commander_reply("Plan: ship it.");
 
         ledger.clear_content();
@@ -2507,6 +3262,7 @@ mod tests {
         assert!(ledger.written_files().is_empty());
         assert!(ledger.loaded_reads().is_empty());
         assert!(ledger.file_listings().is_empty());
+        assert!(ledger.run_records().is_empty());
         assert!(ledger.last_commander_reply().is_none());
         assert!(ledger.tasks()[0].result.is_none());
 
@@ -2519,13 +3275,93 @@ mod tests {
             ledger.tasks()[0].assigned_to.as_deref(),
             Some("ollama:llama3")
         );
+        assert_eq!(ledger.tasks()[0].workspace_id, Some(4));
+        assert!(ledger.tasks()[0].workspace_live);
+        assert_eq!(
+            ledger.tasks()[0].snapshot_note.as_deref(),
+            Some("before applying")
+        );
 
         let text = ledger.system_prompt();
         assert!(text.contains("- ollama:llama3"));
         assert!(text.contains("no quota needed"));
         assert!(text.contains("Task #1: summarise the diff"));
+        assert!(text.contains("workspace: copy #4 (live)"));
         assert!(!text.contains("the diff adds a timeout"));
         assert!(!text.contains("be terse and cite sources"));
+        assert!(!text.contains("### Command proof results"));
+    }
+
+    #[test]
+    fn state_fingerprint_ignores_task_ids_and_last_commander_reply() {
+        let mut a = SwarmLedger::new();
+        let first = a.add_task("same work");
+        a.assign_task(first, "worker");
+        a.associate_workspace(first, 3, Some("snapshot"));
+        a.record_result(first, "done");
+        a.record_commander_reply("old reply one");
+
+        let mut b = SwarmLedger::new();
+        let second = b.add_task("same work");
+        b.assign_task(second, "worker");
+        b.associate_workspace(second, 91, Some("snapshot"));
+        b.record_result(second, "done");
+        b.record_commander_reply("completely different reply");
+        b.task_mut(second).unwrap().id = 42;
+
+        assert_eq!(a.state_fingerprint(), b.state_fingerprint());
+    }
+
+    #[test]
+    fn state_fingerprint_deduplicates_semantically_identical_tasks_and_runs() {
+        let mut single = SwarmLedger::new();
+        let task_id = single.add_task("reproduce");
+        single.assign_task(task_id, "worker");
+        single.associate_workspace(task_id, 5, Some("red"));
+        single.record_result(task_id, "same failure");
+        single.record_run(
+            task_id,
+            &["cargo".into(), "test".into()],
+            RunOutcome::Exited(101),
+            "same failure",
+            10,
+        );
+
+        let mut duplicate = SwarmLedger::new();
+        let first = duplicate.add_task("reproduce");
+        duplicate.assign_task(first, "worker");
+        duplicate.associate_workspace(first, 5, Some("red"));
+        duplicate.record_result(first, "same failure");
+        duplicate.record_run(
+            first,
+            &["cargo".into(), "test".into()],
+            RunOutcome::Exited(101),
+            "same failure",
+            10,
+        );
+        let second = duplicate.add_task("reproduce");
+        duplicate.assign_task(second, "worker");
+        duplicate.associate_workspace(second, 5, Some("red"));
+        duplicate.record_result(second, "same failure");
+        duplicate.record_run(
+            second,
+            &["cargo".into(), "test".into()],
+            RunOutcome::Exited(101),
+            "same failure",
+            999,
+        );
+
+        assert_eq!(single.state_fingerprint(), duplicate.state_fingerprint());
+    }
+
+    #[test]
+    fn state_fingerprint_changes_when_workspace_liveness_changes() {
+        let mut ledger = SwarmLedger::new();
+        let task_id = ledger.add_task("fix");
+        ledger.associate_workspace(task_id, 2, Some("snapshot"));
+        let live = ledger.state_fingerprint();
+        ledger.release_workspace(2);
+        assert_ne!(live, ledger.state_fingerprint());
     }
 
     #[test]

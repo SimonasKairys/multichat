@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
@@ -78,7 +79,7 @@ impl StreamDialect {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LocalBinaryProvider {
     name: String,
     binary_path: String,
@@ -1083,6 +1084,12 @@ impl Provider for LocalBinaryProvider {
     fn is_remote(&self) -> bool {
         true
     }
+
+    fn with_project_root(&self, project_root: &Path) -> Option<Arc<dyn Provider>> {
+        let mut rerooted = self.clone();
+        rerooted.project_root = project_root.to_path_buf();
+        Some(Arc::new(rerooted))
+    }
 }
 
 #[cfg(test)]
@@ -1582,6 +1589,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply.text.trim(), expected.to_string_lossy());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn with_project_root_reroots_a_cloned_provider_without_mutating_the_original() {
+        let original_root = tempfile::tempdir().unwrap();
+        let rerooted_root = tempfile::tempdir().unwrap();
+        let original_expected = std::fs::canonicalize(original_root.path()).unwrap();
+        let rerooted_expected = std::fs::canonicalize(rerooted_root.path()).unwrap();
+        let provider = LocalBinaryProvider::new(
+            "echo",
+            "/bin/echo",
+            "echo",
+            original_root.path().to_path_buf(),
+            CliInvocation {
+                args: vec![],
+                system_arg: None,
+                dialect: None,
+                workspace_arg: Some("--add-dir".into()),
+            },
+        )
+        .unwrap();
+
+        let rerooted = provider
+            .with_project_root(rerooted_root.path())
+            .expect("local providers should support rerooting");
+        let rerooted_reply = rerooted.send(None, "ignored").await.unwrap();
+        assert_eq!(
+            rerooted_reply.text.trim(),
+            format!("--add-dir {} ignored", rerooted_expected.to_string_lossy())
+        );
+
+        let original_reply = provider
+            .send_with_timeout(None, "ignored", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            original_reply.text.trim(),
+            format!("--add-dir {} ignored", original_expected.to_string_lossy())
+        );
     }
 
     // --- streaming dialect parsing -----------------------------------------------

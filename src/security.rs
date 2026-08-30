@@ -83,6 +83,33 @@ pub fn enforce_seccomp_sandbox() -> Hardening {
     Hardening::Unavailable("seccomp sandboxing is not implemented".to_string())
 }
 
+/// Kills the Unix process group whose id is `pid`.
+///
+/// Commander proof commands are spawned into a fresh process group, so terminating
+/// only the immediate child on timeout would leave test-runner grandchildren alive.
+/// `ESRCH` is success-shaped here: it means the group exited between timeout
+/// detection and the kill call.
+#[cfg(unix)]
+pub fn kill_process_group(pid: u32) -> std::io::Result<()> {
+    // SAFETY: callers pass the id returned for a child Simon just spawned into a new
+    // process group with `process_group(0)`. Negative pid targets that group only.
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+pub fn kill_process_group(_pid: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Returns a Windows regular file's hard-link count using the stable Win32 API.
 ///
 /// Rust exposes the same field through `MetadataExt::number_of_links`, but that

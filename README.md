@@ -5,7 +5,7 @@ work to each other in one session.
 
 ## Status
 
-Working and tested, but early. `cargo test` covers 276 cases; `cargo clippy -D warnings`
+Working and tested, but early. `cargo test` covers more than 680 cases; `cargo clippy -D warnings`
 and `cargo fmt --check` are clean. **Read [Security posture](#security-posture) before
 relying on the security claims** — some features described in `docs/progress/` are not
 implemented, and that section says exactly which.
@@ -144,39 +144,56 @@ endpoint.
 ```
 ## What models can do
 
-Beyond answering, a model can act by emitting a line in its reply. Six actions exist,
-all parsed out of the model's plain text — there is no function-calling API involved:
+Beyond answering, a model can act by emitting a line in its reply. The actions are
+parsed out of plain text — there is no function-calling API involved:
 
 | Action | Effect | Result arrives |
 |---|---|---|
-| `ACTION: delegate_task(<label>, <prompt>)` | Runs a text-only sub-task on another model | next turn |
-| `ACTION: delegate_file_task(<label>, <prompt>)` | Runs a sub-task that may propose project-file writes | next turn |
-| `ACTION: read_skill(<name>)` | Loads a skill file into context | next turn |
-| `ACTION: list_files(<path>)` | Lists one directory in the project | next turn |
-| `ACTION: read_file(<path>)` | Reads one project file | next turn |
-| `ACTION: write_file(<path>)` … `ACTION: end_file` | Writes a project file | immediately, after you approve |
+| `ACTION: delegate_task(<label>, <prompt>)` | Runs an isolated, text-only sub-task | next automatic commander turn |
+| `ACTION: delegate_file_task(<label>, <prompt>)` | Creates a fresh project snapshot and runs a file-producing sub-task there | next automatic commander turn |
+| `ACTION: delegate_in_copy(<task id>, <label>, <prompt>)` | Continues work in that task's existing snapshot | next automatic commander turn |
+| `ACTION: read_skill(<name>)` | Loads a skill file into context | next automatic commander turn |
+| `ACTION: list_files(<path>)` | Lists one directory in the main project | next automatic commander turn |
+| `ACTION: read_file(<path>)` | Reads one main-project file | next automatic commander turn |
+| `ACTION: write_file(<path>)` … `ACTION: end_file` | Writes main when emitted by the commander, or the active task copy when emitted by a file worker | immediately, after you approve |
+| `ACTION: run_command(<task id>, <program>, <arg1>, ...)` | Runs one validated argv-only proof command in a live task copy | next automatic commander turn, after you approve |
+| `ACTION: run_test(<task id>)` | Shorthand for `cargo test` in a live task copy | next automatic commander turn, after you approve |
+| `ACTION: run_test(<task id>, <filter>)` | Shorthand for `cargo test -- <filter>` | next automatic commander turn, after you approve |
+| `ACTION: apply_copy(<task id>)` | Preflights and applies changed/new files from a task copy, then releases it | next automatic commander turn |
+| `ACTION: discard_copy(<task id>)` | Deletes a task copy without changing the main project | next automatic commander turn |
 
-Two rules apply to all of them, and both matter more than they look:
+Three rules matter:
 
-**Results arrive on the model's *next* turn.** The ledger that carries them is only
-rendered into the next prompt, so a model that reads a file cannot also act on its
-contents in the same reply. A single "read this and fix it" request will only read; the
-fix comes when you send the next message.
+**Action results automatically return to the commander.** The ledger is still rendered
+only into a later prompt — a model cannot read a file and act on unseen contents in the
+same reply — but you no longer have to type `continue`. One user message may cause up
+to five internal continuation calls after the initial commander call. The workflow
+stops when the commander gives a reply with no actions, repeats the same normalized
+actions against the same resulting state, reaches 48 total actions (including accepted
+worker write blocks), or reaches the turn limit. Each continuation repeats the original
+user request alongside the updated
+ledger, so the task does not disappear with the stateless transport. The TUI remains
+busy throughout and emits one final `TurnComplete`. A write or proof approval pauses
+the loop until you answer.
 
 **A sub-agent's reply is scanned for writes, and for nothing else.** It cannot delegate
 further, load a skill, or read/list files — so no reply can spawn more work, which is
 what bounds the swarm. Write blocks execute only for an explicit
 `delegate_file_task`; a regular `delegate_task` is text-only and any unsolicited write
 block is discarded. A permitted write spawns nothing, so sub-agents can still author
-files when the commander deliberately delegates authoring. Every such write passes the
-same two gates a commander's does — path hardening and your approval, which names the
-sub-agent as the one asking.
+files when the commander deliberately delegates authoring. `delegate_in_copy` is also
+write-capable because it continues an already isolated file task.
+
+**Nothing is merged automatically.** A worker's writes stay in its task copy.
+`apply_copy` is a later, explicit commander decision; `discard_copy` removes the copy.
+Proof output is evidence for the commander to inspect, not an automatic declaration
+that a finding or fix is valid.
 
 ### Delegation
 
 **A delegation result leaves the machine too.** A local Ollama model can be asked to
 summarise a private document, and its reply is recorded in the ledger and then sent to
-whichever cloud provider is primary on the next turn. Delegating *to* a local model does
+whichever cloud provider is primary on the next commander turn. Delegating *to* a local model does
 not keep the answer local. Same mitigation, same caveat as skills above: `--classified`
 refuses every remote provider, and there is no narrower control.
 
@@ -194,15 +211,41 @@ write-capable form instead:
 ACTION: delegate_file_task(ollama:mistral, create src/report.rs as specified)
 ```
 
-The orchestrator runs the sub-task and records the reply — or, on failure, the error —
-on that task in the ledger, tagged `[DONE]` or `[FAILED]`, where the delegating model
-sees it on its next turn. Each sub-agent receives only its self-contained task, its own
-connection label, and the applicable sub-agent instructions — not the shared ledger,
-conversation, or other models' prompts and results. This prevents sequential workers
-from copying one another's answers or identities. Ordinary `delegate_task` calls are
-text-only; only `delegate_file_task` receives the write protocol and may execute write
-blocks. At most 10 delegations run per turn, and they run one after another, not
-concurrently.
+That action first makes a bounded plain-filesystem snapshot of the project exactly as
+it exists on disk, including dirty tracked files and untracked files. It does not run
+Git, stash, clean, or require a clean worktree. The worker's approved write blocks land
+inside that copy, never directly in the main project. To send a later instruction to
+the same copy:
+
+```
+ACTION: delegate_in_copy(12, ollama:mistral, fix the implementation but keep the failing test)
+```
+
+The number is any task whose ledger entry names that live copy; continuation tasks
+inherit the same copy. Fresh `delegate_file_task` calls always create separate copies,
+so one worker cannot accidentally build on another worker's unaccepted changes.
+
+The orchestrator records each reply — or, on failure, the error — on its task in the
+ledger, tagged `[DONE]` or `[FAILED]`. The commander receives that result automatically
+on the next bounded internal turn. Each sub-agent receives only its self-contained task,
+its own connection label, the applicable instructions, and, for local CLI transports,
+the isolated copy as its working directory — not the shared ledger, conversation, or
+other models' prompts and results. This prevents sequential workers from copying one
+another's answers or identities. Ordinary `delegate_task` calls are text-only; only
+file-task forms receive the write protocol. At most 10 delegations run per commander
+turn, and they run one after another, not concurrently.
+
+Snapshots exclude `.git`, credential-shaped files such as `.env` and private keys,
+symlinks, sockets/FIFOs/devices, `.simon-run`, and common dependency/build caches such
+as `target`, `node_modules`, and `__pycache__`. Limits are 16 MiB per regular file,
+256 MiB and 50,000 entries per copy, and 512 MiB across all live copies in the session.
+A copy that cannot be made fails the delegation; it never falls back to writing the
+main project. Current on-disk usage, including files created after the snapshot, counts
+toward those limits. Protocol writes are rejected before they would cross a limit;
+local CLI providers and proof commands are monitored while they run. A copy found over
+quota is stopped and released. Otherwise copies are retained until explicitly
+applied/discarded or until the session ends. A fresh copy is also released if its
+provider fails before producing usable work.
 
 **The commander orients and proposes before it delegates.** Given anything more than a
 direct question it works in three steps: look at the project first (listing directories
@@ -214,16 +257,17 @@ cheaper to correct than finished files are. Asked to add word counting to a smal
 this is the difference between delegating a guess and noticing that the project's notes
 claim tabs while its only source file is indented with spaces.
 
-The commander is held to the same rule as a sub-agent about *how* files get written: it
-may read and inspect freely to orient itself, but it may not create or edit a file with
-its own tools, and may not run the project's code. Every file it writes goes out as a
-write block and waits for your approval. Without that rule it was observed editing a
-project file correctly and completely invisibly — no prompt, no `file.written` entry,
-and a `__pycache__` left behind showing it had executed the code too.
+The commander is held to the same rule as a sub-agent about *how* files and commands are
+handled: it may read and inspect freely to orient itself, but it may not edit with its
+own tools or run the project with its own shell. Direct write blocks still wait for your
+approval. Multi-step file work should use an isolated file task, and project commands
+must use the proof runner described below. Without those rules an agentic CLI was
+observed editing a project file invisibly — no prompt, no `file.written` entry — and
+leaving a `__pycache__` behind after executing code on its own.
 
-Because every prompt is sent with no message history, the commander's own previous turn is
-carried in the ledger — without it a proposed plan evaporates before the turn that would
-act on it, and answering "approved, go ahead" produced nothing at all.
+Because every prompt is sent with no message history, the commander's own previous turn
+is carried in the ledger. That preserves a user-approved plan across user turns and
+also lets each automatic continuation see what the commander just requested.
 
 **Delegating is the commander's default, not a fallback.** The roster in the system
 prompt annotates each model with roughly what it costs and how much context it holds,
@@ -250,19 +294,23 @@ history), and, hitting agy's own tools rather than ours, `declaring permissions:
 tool write_to_file: convert tool call for permissions: model output error: invalid tool
 call error (invalid_args) <path>`. Reading and listing files needs no permission and
 works reliably, so that is what the sub-agent is left with; when a task is to create or
-edit a file, it is told to emit the content as plain text using `simon`'s own write
-protocol instead of its own writer. `simon` cannot grant the missing permission itself —
-the only switch on offer is `agy`'s blanket `--dangerously-skip-permissions`, which is
-deliberately not used: it would auto-approve every tool call agy makes, and agy's own
+edit a file, it is told to emit the content as plain text using `simon`'s write protocol
+instead of its own writer. In a file task those writes target the isolated copy.
+`simon` cannot grant the missing permission itself — the only switch on offer is
+`agy`'s blanket `--dangerously-skip-permissions`, which is deliberately not used: it
+would auto-approve every tool call agy makes, and agy's own
 writes were separately observed bypassing `simon`'s write-approval gate and audit log
 entirely — four files appeared during delegations `simon` had recorded as *failed*.
-Routing every write back through `simon`'s protocol closes that hole, since the write
-is then plain text in the reply, not a tool call agy made on its own.
+Routing every write back through `simon`'s protocol closes that normal path, since the
+write is then plain text in the reply, not a tool call agy made on its own. This is
+instruction/tool-policy enforcement, not a kernel sandbox; a disobedient CLI process
+can still escape its working directory as described below.
 
 A delegation that fails transiently is retried up to 3 times with a 3s then 8s backoff,
 each retry announced in the transcript with its reason. Agentic CLI sub-agents fail
 intermittently in several unrelated ways, and a failed delegation is expensive in a way
-a failed HTTP call is not, since the commander does not learn of it until its next turn.
+a failed HTTP call is not, since the commander does not learn of it until its next
+automatic turn.
 A timeout, a missing binary, and a `--classified` refusal are *not* retried: those fail
 identically forever.
 
@@ -275,6 +323,72 @@ and includes token/request quota plus reset information when the provider report
 Providers that expose no usage metadata are labelled `tokens unavailable` rather than
 shown an estimate. The transcript gets a line when a delegation is dispatched and
 another when it finishes, with outcome and duration.
+
+### Proof commands and copy disposition
+
+The commander can request a proof only in a live task copy:
+
+```
+ACTION: run_command(12, cargo, test, parser_regression, --, --nocapture)
+ACTION: run_test(12)
+ACTION: run_test(12, parser_regression)
+```
+
+`run_command` is an argv vector, not a shell string. Shell operators, substitutions,
+absolute paths, parent traversal, path-prefixed executables, oversized arguments, and
+unapproved programs/subcommands are rejected before anything is spawned. The allowlist
+covers constrained test/check/build/lint forms of Cargo, Go, pytest/Python unittest,
+Node's test runner, npm/pnpm/yarn scripts, make/just targets, Deno, and Bun. Executables
+are resolved from absolute `PATH` directories outside both the main project and task
+copy; the child receives a cleared environment plus a small non-secret
+locale/toolchain set and task-local `HOME`, temporary, Cargo-home, and Cargo-target
+directories under `.simon-run`.
+
+Every proof run asks explicitly with **y/n**. There is no "approve all" choice for
+commands, and `--auto-write` does not bypass this gate. `--classified` refuses all proof
+commands before asking. A run has a 120-second wall-clock timeout; on Unix its process
+group is terminated at completion or timeout. The tail of stdout and stderr is retained
+with a 16 KiB cap per stream and recorded in the ledger. Exit zero, nonzero, timeout,
+resource-limit termination, denial, validation rejection, and spawn failure remain
+distinct outcomes. A nonzero exit or timeout is evidence, not an automatically verified
+defect. Command artifacts count toward the task-copy quota; crossing it terminates the
+command and releases that copy.
+
+**Proof output leaves the machine when the commander is remote.** The captured tail is
+inserted into the commander's next system prompt, so a test that prints source,
+credentials, customer data, or environment-derived secrets can disclose them to that
+provider. The snapshot excludes common credential files and the runner clears the
+environment, but neither can guarantee that trusted project code will not print
+sensitive data.
+
+The intended defect workflow is:
+
+1. `delegate_file_task` asks an unfamiliar worker for a deterministic failing test or
+   exact proof, without a fix.
+2. `run_command` reruns that proof in the worker's copy.
+3. The commander inspects whether RED failed for the claimed reason, not because the
+   test or setup was malformed.
+4. `delegate_in_copy` asks for the fix in the same copy.
+5. The commander reruns the same proof for GREEN and any relevant regression commands.
+6. On a later commander turn, `apply_copy` accepts the copy or `discard_copy` removes it.
+
+An `apply_copy` or `discard_copy` in the same reply as a proof run is refused so the
+commander must first receive and inspect that run's output. Application compares the
+copy with its baseline and the current main project. It accepts at most 500 changed/new
+UTF-8 files, each still subject to the 256 KiB protocol write limit; it refuses
+main-project drift, deletions, parent-path shape conflicts, symlinks/special files,
+non-UTF-8 changes, and over-quota copies, and never performs an automatic merge. All
+file approvals are collected before the first main project write, then the plan is
+recomputed to catch changes made while approval was pending. The copy is released only
+after every write succeeds. An operating-system I/O failure during a multi-file apply
+can still leave earlier files written; the batch stops at the first failure and retains
+the copy rather than reporting success. A later `apply_copy` treats main-project files
+already identical to that copy as completed and retries only the remaining writes.
+
+This runner is constrained, **not sandboxed**. Setting `current_dir` and clearing the
+environment does not stop trusted project code from reading absolute paths, opening
+network connections, or spawning programs indirectly. Approve commands only for a
+project and machine you trust; it is not safe for hostile test code.
 
 ### Skills
 
@@ -315,11 +429,16 @@ tree from the project folder.
 
 ### Project files
 
-Models can list, read, and write files in the **project folder** — the directory `simon`
-was started in, or whatever `--project <dir>` points at. Every access goes through the
-same path-traversal hardening as the skills directory: `..`, absolute paths, and
-symlinks escaping the root are all rejected. Multi-linked regular files are rejected
-too, because an in-root hard link can share an inode with a path outside the root.
+Commander `list_files` and `read_file` actions target the **main project folder** — the
+directory `simon` was started in, or whatever `--project <dir>` points at. A commander's
+direct `write_file` block also targets main for backward compatibility; a worker's
+write block targets only the live copy created by `delegate_file_task` or reused by
+`delegate_in_copy`. Multi-step changes should use the copy workflow.
+
+Every protocol access goes through the same path-traversal hardening as the skills
+directory: `..`, absolute paths, symlinks escaping the root, and multi-linked regular
+files are rejected. An in-root hard link can share an inode with a path outside the
+root, so accepting one would defeat confinement.
 
 ```
 ACTION: list_files(notes)          # one directory's immediate entries
@@ -340,41 +459,48 @@ An `ACTION:` line of any kind **inside** a `write_file` block is content, not a 
 This matters because a model writing documentation about this protocol will naturally
 include lines that look exactly like real ones.
 
-Limits: a single read or write is capped at 256KB, a single listing at 500 entries
-(truncation is reported, not silent), at most 10 writes and 3 reads happen per turn.
-At most 3 loaded reads are kept, evicting the oldest. There is no cap on how many files
-may exist under the root. Writes into `.git/` are refused outright — a bad write there
-can corrupt the repository in ways you cannot easily undo. Reading `.git/` is not
-special-cased, since only a write can corrupt it.
+Limits: a single protocol read or write is capped at 256KB, a single listing at 500
+entries (truncation is reported, not silent), a commander reply accepts at most 10
+direct writes and 3 reads, and each worker result accepts at most 10 writes before the
+48-action workflow cap applies. At most 3 loaded reads are kept, evicting the oldest.
+There is no cap on how many files may exist under the main root. Writes into `.git/` are refused
+outright — a bad write there can corrupt the repository in ways you cannot easily undo.
+Reading `.git/` is not special-cased, since only a write can corrupt it.
 
 Everything is audited (`project.list`, `project.read`, `file.written`, and their
 `_failed` counterparts) and shown in the TUI as it happens. **The audit log records
 paths and counts only — never file content.** Successful reads enter the bounded ledger
 because that is how their content reaches the model; failed reads and listings enter it
-as bounded failure text, so they remain visible to the commander on its next turn.
+as bounded failure text, so they remain visible to the commander on its next automatic
+turn.
 
 #### Writes are not applied silently
 
-Every `write_file` a model proposes is shown first — path, exact byte size, whether it
-creates or overwrites (and how many bytes that would destroy), and the head of the
-content — and the turn blocks until you answer:
+Every `write_file` a model proposes is shown first — author, path, exact byte size,
+whether it creates or overwrites (and how many bytes that would destroy), and the head
+of the content — and the workflow blocks until you answer:
 
 ```
 OVERWRITE src/report.py (353 bytes -> 415 bytes)? [y]es  [n]o  [a]ll
 ```
 
-Nothing reaches disk **through this protocol** before you answer. A refusal is recorded
-in the ledger, so the model learns on its next turn that the file was not written rather
-than building on one that does not exist, and is audited as `file.write_denied`.
+Nothing reaches either main or a task copy **through this protocol** before you answer.
+A refusal is recorded in the ledger, so the commander learns on its next automatic turn
+that the file was not written rather than building on one that does not exist, and is
+audited as `file.write_denied`.
+
+A delegated write approval changes only the task copy. `apply_copy` later preflights
+the diff and asks again for the writes that would change main. For a multi-file apply,
+all approvals are collected before the first main-project write, so denying a later file
+does not leave the earlier approved files partially applied.
 
 Read that scope literally. The gate governs `write_file` blocks, which is every write by
 a cloud or Ollama model — those have no other way to touch a disk. It does **not** govern
-a spawned CLI provider's own file tools. Observed directly: asked to build a package,
-three delegations to `agy` failed and were recorded as failed, yet four files appeared in
-the project anyway, with no gate prompt and no audit entry. `agy` had written them itself.
-See [This is not a sandbox for spawned CLI providers](#this-is-not-a-sandbox-for-spawned-cli-providers)
-— if you need every write to pass the gate, the commander and the swarm must be API or
-Ollama models, not CLI ones.
+a spawned CLI provider's own file tools. File-task CLIs now start in an isolated copy,
+which protects main from ordinary relative writes, and their instructions explicitly
+forbid using those tools. It is still possible for a disobedient CLI to escape the copy
+and write anywhere the invoking user can. See
+[This is not a sandbox for spawned CLI providers](#this-is-not-a-sandbox-for-spawned-cli-providers).
 
 If the UI goes away while a question is pending, the write is refused, not applied —
 with nobody left to ask, nobody has consented. A write that `Workspace` would reject
@@ -382,21 +508,24 @@ anyway (a `.git/` path, an oversized file, a traversal attempt) is refused *with
 asking, so a prompt never appears for a write your answer could not affect. `a` applies
 for the rest of the session and is never persisted.
 
-`--auto-write` skips the gate entirely, which is what an unattended or scripted run
-wants and an interactive one generally does not.
+`--auto-write` skips file-write approvals, including writes into a copy and later
+application to main. It never approves a proof command; every command still needs a
+fresh **y/n** answer.
 
 #### This is not a sandbox for spawned CLI providers
 
-A `copilot`/`claude`/`gemini`/`codex` CLI configured as a local binary provider is started with
-its working directory set to the project folder and, where the CLI supports it,
-`--add-dir <project root>`. That stops it stumbling onto whatever was lying around in
-`simon`'s own launch directory, and stops it searching elsewhere for files it was asked
-about — but it only sets a starting point.
+A `copilot`/`claude`/`gemini`/`codex` CLI configured as a local binary provider is
+started with its working directory set to the main project for commander/text work, or
+to the specific isolated copy for a file task. Where the CLI supports it, its
+`--add-dir` argument is rerooted to the same location. That prevents ordinary relative
+reads and writes from accidentally crossing task boundaries — but it only sets a
+starting point.
 
 A CLI agent with its own shell or filesystem access can `cd` anywhere the invoking user
-can reach and read or write outside the project folder freely. None of that activity
-passes through `simon`'s audit log or the protocol above, which governs only `simon`'s
-own in-process model calls: the cloud APIs and Ollama.
+can reach and read or write outside the project/copy freely. None of that activity
+passes through `simon`'s audit log or write gate. The same boundary applies to approved
+proof commands: the runner constrains the model-controlled argv and environment, but
+the project code executed by a test runner has the invoking user's OS permissions.
 
 ### CLI provider streaming and timeouts
 
@@ -408,7 +537,7 @@ while it works is parsed and shown live in the status line:
 claude · awaiting reply · Bash: Read the readme · 42s · ●···
 ```
 
-All three are also passed `--add-dir <project root>`. Copilot runs with only its
+All three are also passed `--add-dir <active project or task-copy root>`. Copilot runs with only its
 `view`, `grep`, and `glob` tools available and with its built-in GitHub MCP disabled,
 so its non-interactive auto-approval cannot execute commands, edit files, or make
 GitHub API calls. `agy` additionally gets
@@ -534,29 +663,43 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   reachable from model output via `ACTION: read_skill(<name>)` (see [Skills](#skills)),
   not just from trusted callers, so the rejection is load-bearing, not defensive dead
   code.
-- **Model-initiated file listing, reading, and writing confined to the project
-  folder** (see [Project files](#project-files)) — the same traversal hardening as
+- **Model-initiated file access confined to its selected main-project or task-copy
+  root** (see [Project files](#project-files)) — the same traversal hardening as
   skills (`..`, absolute paths, and symlinks escaping the root are all rejected),
   size-capped per read/write and entry-capped per listing, and every access is
   audited and rendered in the TUI so the user sees everything a model has listed,
-  read, or written. Writes into `.git/` are refused outright.
+  read, or written through the protocol. Delegated file writes are further confined
+  to a per-task copy until explicitly applied. Writes into `.git/` are refused
+  outright.
+- **Bounded isolated copies for file-producing delegations.** Snapshots preserve dirty
+  tracked and untracked on-disk files without touching Git, while excluding Git
+  metadata, likely credentials, links/special files, command-run artifacts, and common
+  build caches. Per-file, per-copy, entry-count, and total-live-copy limits prevent an
+  unbounded snapshot or later copy growth. Fresh tasks never fall back to main, copies
+  are not silently merged, main-project drift and deletions block application, over-
+  quota copies are stopped and released, and session shutdown removes retained copies.
 - **Every model-proposed write requires explicit approval** (see [Writes are not
   applied silently](#writes-are-not-applied-silently)) — the path, the exact size,
   whether it overwrites and how many bytes that destroys, and the head of the content
   are shown, and the turn blocks until the user answers. Nothing reaches disk
   unapproved; a lost UI denies rather than allows, and a refusal is audited as
-  `file.write_denied`. Scope: this covers `write_file` blocks — every write available to
-  a cloud or Ollama model — but **not** a spawned CLI provider's own file tools, which
-  have been observed writing files during a delegation `simon` recorded as failed. Note the scope of the check: it establishes that the *user*
-  consented, not that the content is correct — nothing inspects what is being written. The skills directory
-  itself remains read-only to models — a model that could write a skill file could
-  inject its own content into the commander's system prompt for the rest of the
-  session, including when the commander is remote — so this is deliberately a
-  separate tree, not a relaxation of that guarantee. **This confinement is `simon`'s
-  own protocol only** — it does not extend
-  to a spawned CLI provider (`claude`, `gemini`, `codex`, …), which merely *starts* in
-  the project folder and is free to read or write anywhere its own shell/filesystem
-  access reaches; see [Project files](#project-files) for the honest boundary.
+  `file.write_denied`. A copy must be explicitly applied before it changes main, and a
+  multi-file apply collects all approvals before its first write. `--auto-write`
+  bypasses file approvals only. Scope: this establishes that the *user* consented, not
+  that the content is correct — nothing inspects what is being written. It covers
+  `write_file` blocks and copy application, but **not** a spawned CLI provider's own
+  file tools. The skills directory itself remains read-only to models — a model that
+  could write a skill file could inject its own content into the commander's system
+  prompt for the rest of the session, including when the commander is remote — so this
+  is deliberately a separate tree.
+- **Commander proof execution is argv-only, copy-only, bounded, and separately
+  approved.** There is no shell; program/subcommand and argument policies are checked
+  before approval, the environment is cleared, runtime directories are task-local,
+  output, duration, and copy growth are capped, and process groups are terminated.
+  Commands cannot target main, a text-only task, or a released copy. `--auto-write`
+  never approves them, and `--classified` refuses them before asking. This constrains
+  Simon's launch surface; it does not sandbox the project code a permitted test runner
+  executes.
 - **Proxy support** — honours `HTTP_PROXY`/`HTTPS_PROXY` and, via reqwest's `socks`
   feature, `ALL_PROXY=socks5://…`. Disabled outright under `--classified`: a proxy
   routes even a loopback request off the machine, which is the one thing that flag
@@ -567,12 +710,14 @@ Be precise about what exists. This table is the source of truth; the numbered fi
 
 ### Not implemented
 
-- **Filesystem sandboxing of spawned CLI providers.** `simon`'s own list/read/write
-  protocol is confined to the project folder, but a local CLI provider (`claude`,
-  `gemini`, `codex`, …) only has its working directory *set* to the project folder at
-  spawn time; it is otherwise an ordinary subprocess with whatever shell and
-  filesystem access the invoking user has, and none of that access is mediated or
-  audited by `simon`. See [Project files](#project-files).
+- **Filesystem/network sandboxing of spawned CLI providers and proof commands.**
+  `simon`'s own protocol is root-confined, and file-task CLIs are rerooted into their
+  isolated copies, but a local CLI provider (`claude`, `gemini`, `codex`, …) remains an
+  ordinary subprocess with the invoking user's permissions. An approved test runner is
+  likewise able to execute trusted project code that reads absolute paths, opens
+  sockets, or spawns other programs. None of that indirect activity is mediated or
+  audited by `simon`. See [Project files](#project-files) and
+  [Proof commands and copy disposition](#proof-commands-and-copy-disposition).
 - **seccomp sandboxing.** A useful filter must permit `socket`/`connect` while denying
   `execve`, which needs a hand-written BPF program. `SECCOMP_MODE_STRICT` would kill the
   process on its first network call. The function is a documented no-op that reports

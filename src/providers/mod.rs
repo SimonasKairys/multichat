@@ -3,6 +3,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::Path;
+use std::sync::Arc;
 
 pub mod cloud;
 pub mod local_binary;
@@ -199,6 +201,14 @@ pub trait Provider: Send + Sync {
     /// Whether traffic leaves the machine. `--classified` refuses to construct any
     /// provider for which this is true.
     fn is_remote(&self) -> bool;
+
+    /// Returns an equivalent provider rooted at `project_root`, when rerooting is
+    /// meaningful for this transport. Remote HTTP providers ignore local roots, so
+    /// their default stays `None`; local CLI providers can override it to clone
+    /// themselves with a different working directory and workspace allowance.
+    fn with_project_root(&self, _project_root: &Path) -> Option<Arc<dyn Provider>> {
+        None
+    }
 
     /// Whether delegated calls need the long non-interactive tool guardrails.
     ///

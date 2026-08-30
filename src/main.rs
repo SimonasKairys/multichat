@@ -8,7 +8,9 @@
 
 pub mod app;
 pub mod audit;
+pub mod command_runner;
 pub mod config;
+pub mod isolation;
 pub mod orchestrator;
 pub mod picker;
 pub mod providers;
@@ -39,6 +41,7 @@ use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::app::{App, Line};
@@ -73,9 +76,8 @@ struct ChatArgs {
     vault: bool,
     /// Write files without asking. By default every `write_file` a model proposes
     /// is shown — path, size, whether it overwrites, and the content — and waits
-    /// for the user to allow it. This turns that gate off, which is what a
-    /// scripted or unattended session wants and what an interactive one almost
-    /// never does.
+    /// for the user to allow it. This turns only the file-write gate off, including
+    /// task-copy application; proof commands still require an explicit yes/no.
     #[arg(long)]
     auto_write: bool,
 }
@@ -484,7 +486,9 @@ async fn chat(
     // blocks on the answer before proposing the next write — so anything larger would
     // only be able to hold answers to questions nobody asked.
     let (decision_tx, decision_rx) = mpsc::channel(1);
-    let write_gate = if auto_write { None } else { Some(decision_rx) };
+    // The receiver remains connected even under `--auto-write`: writes bypass it,
+    // but proof commands still require one explicit yes/no answer.
+    let write_gate = Some(decision_rx);
 
     let orchestrator = Orchestrator::new(
         registry,
@@ -493,8 +497,9 @@ async fn chat(
         classified,
         event_tx,
         write_gate,
+        auto_write,
     )?;
-    let worker = tokio::spawn(orchestrator.run(command_rx));
+    let mut worker = tokio::spawn(orchestrator.run(command_rx));
 
     let ui_result = ui::run(
         app,
@@ -507,8 +512,18 @@ async fn chat(
     )
     .await;
 
-    // Let the orchestrator finish its shutdown audit entry before the process exits.
-    let _ = worker.await;
+    // A normal idle shutdown finishes immediately and writes the clean session-end
+    // audit entry. If the user presses Esc while a provider or proof command is still
+    // running, do not make the terminal wait for that external process: cancelling
+    // the task drops the provider/child handles and the orchestrator's Drop cleanup
+    // removes isolated task copies.
+    if tokio::time::timeout(Duration::from_secs(1), &mut worker)
+        .await
+        .is_err()
+    {
+        worker.abort();
+        let _ = worker.await;
+    }
 
     // Only a clean exit saves. `ui::run` returning `App` at all means
     // `TerminalGuard` has already been dropped and the terminal restored (see its

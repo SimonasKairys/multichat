@@ -154,6 +154,15 @@ pub fn builtin_endpoint(provider: &str) -> Option<CloudEndpoint> {
             base_url: "https://api.groq.com/openai/v1".into(),
             default_model: "llama-3.3-70b-versatile".into(),
         },
+        // xAI's OpenAI-compatible surface. `grok` is accepted as a user-facing alias
+        // (see `canonical_provider`), but the canonical id — what the keyring and
+        // discovery use — is `xai`. Traffic goes to api.x.ai, not grok.com (the
+        // consumer web UI).
+        "xai" | "grok" => CloudEndpoint {
+            api: Api::OpenAiCompatible,
+            base_url: "https://api.x.ai/v1".into(),
+            default_model: "grok-4.6".into(),
+        },
         _ => return None,
     };
     Some(e)
@@ -205,21 +214,33 @@ pub fn known_models(provider: &str) -> &'static [&'static str] {
             "mixtral-8x7b-32768",
             "gemma2-9b-it",
         ],
+        // Text/code models only; image, video, and voice models are excluded because
+        // this provider implementation extracts text chat-completion responses.
+        "xai" | "grok" => &[
+            "grok-4.6",
+            "grok-4.5",
+            "grok-4.3",
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-0309-non-reasoning",
+            "grok-4.20-multi-agent-0309",
+            "grok-build-0.1",
+        ],
         _ => &[],
     }
 }
 
-/// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`) to the
+/// Maps an alias accepted by `builtin_endpoint` (`claude`, `gemini`, `grok`) to the
 /// canonical id vendor discovery actually looks up in the keyring (`anthropic`,
-/// `google`). A key stored under the alias would be stored successfully but never
-/// found — discovery only ever asks for canonical ids. Kept visibly next to
+/// `google`, `xai`). A key stored under the alias would be stored successfully but
+/// never found — discovery only ever asks for canonical ids. Kept visibly next to
 /// `builtin_endpoint`'s alias arms so a future alias gets added to both. Anything
-/// that isn't one of the two aliases — including a custom endpoint name — passes
+/// that isn't one of the three aliases — including a custom endpoint name — passes
 /// through unchanged.
 pub fn canonical_provider(name: &str) -> &str {
     match name.to_ascii_lowercase().as_str() {
         "claude" => "anthropic",
         "gemini" => "google",
+        "grok" => "xai",
         _ => name,
     }
 }
@@ -511,6 +532,18 @@ mod tests {
                 "https://api.groq.com/openai/v1",
                 "llama-3.3-70b-versatile",
             ),
+            (
+                "xai",
+                Api::OpenAiCompatible,
+                "https://api.x.ai/v1",
+                "grok-4.6",
+            ),
+            (
+                "grok",
+                Api::OpenAiCompatible,
+                "https://api.x.ai/v1",
+                "grok-4.6",
+            ),
         ];
         for (provider, api, base_url, default_model) in cases {
             let endpoint = builtin_endpoint(provider)
@@ -530,7 +563,7 @@ mod tests {
         // provider with an endpoint but an empty `known_models` list would silently
         // fall back to free-text entry in the picker, exactly like an unknown
         // provider — this pins that every builtin actually has choices to show.
-        for provider in ["anthropic", "openai", "google", "openrouter", "groq"] {
+        for provider in ["anthropic", "openai", "google", "openrouter", "groq", "xai"] {
             assert!(
                 !known_models(provider).is_empty(),
                 "expected a non-empty known-model list for {provider}"
@@ -543,7 +576,7 @@ mod tests {
         // The default a fresh connection would actually use has to be a choice the
         // list itself offers — otherwise the model editor would open on a value
         // its own pick-list can't select.
-        for provider in ["anthropic", "openai", "google", "openrouter", "groq"] {
+        for provider in ["anthropic", "openai", "google", "openrouter", "groq", "xai"] {
             let default_model = builtin_endpoint(provider).unwrap().default_model;
             assert!(
                 known_models(provider).contains(&default_model.as_str()),
@@ -562,14 +595,17 @@ mod tests {
     fn known_models_aliases_match_their_canonical_provider() {
         assert_eq!(known_models("claude"), known_models("anthropic"));
         assert_eq!(known_models("gemini"), known_models("google"));
+        assert_eq!(known_models("grok"), known_models("xai"));
     }
 
     #[test]
     fn aliases_canonicalise_to_the_id_discovery_reads_back() {
         assert_eq!(canonical_provider("claude"), "anthropic");
         assert_eq!(canonical_provider("gemini"), "google");
+        assert_eq!(canonical_provider("grok"), "xai");
         assert_eq!(canonical_provider("anthropic"), "anthropic");
         assert_eq!(canonical_provider("openai"), "openai");
+        assert_eq!(canonical_provider("xai"), "xai");
         assert_eq!(canonical_provider("my-gateway"), "my-gateway");
     }
 

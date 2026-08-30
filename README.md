@@ -24,6 +24,7 @@ cargo build --release
 ```sh
 simon models                 # list every model this machine can reach
 simon auth anthropic         # store an API key (prompts; never pass it as an argument)
+simon auth grok              # store an xAI key (`grok` is an alias for `xai`)
 simon chat                   # choose connections and a commander, then chat
 simon chat -m ollama:llama3  # pick a commander explicitly
 simon chat --classified      # local models only, no network egress
@@ -44,8 +45,8 @@ can list, read, and write through `simon`'s own protocol (see
 [Project files](#project-files)). It defaults to the directory `simon` was started in,
 and is resolved and canonicalized once at startup.
 
-`simon auth` also accepts `claude` and `gemini` as aliases, storing the key under
-`anthropic`/`google` respectively so vendor discovery finds it.
+`simon auth` also accepts `claude`, `gemini`, and `grok` as aliases, storing the key
+under `anthropic`/`google`/`xai` respectively so vendor discovery finds it.
 
 The connection picker can also prompt for a key directly: press **space** on an API
 row marked `(no key stored)` to open a masked entry field instead of quitting to run
@@ -109,9 +110,13 @@ policy, and what a crash costs you.
 |---|---|---|
 | `ollama` | local HTTP daemon | `GET /api/tags` at startup |
 | `anthropic` | `POST /v1/messages` | key checked with `GET /v1/models` |
-| `openai`, `google`, `groq` | `POST /chat/completions` | key checked with `GET /models` |
+| `openai`, `google`, `groq`, `xai` | `POST /chat/completions` | key checked with `GET /models` |
 | `openrouter` | `POST /chat/completions` | inference auth checked with an empty, non-generating request to the same endpoint |
 | local CLI tools | subprocess (argv, no shell) | executable auto-detected; authentication remains unverified until first use |
+
+`xai` uses `https://api.x.ai/v1` (not `grok.com`, which is the consumer web app).
+`grok` is accepted as an alias for `xai`: `simon auth grok` and `simon auth xai` are
+equivalent and both store the key under the canonical id `xai`.
 
 Routing is per provider. A key stored for one vendor is only ever sent to that vendor's
 endpoint.

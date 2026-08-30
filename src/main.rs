@@ -119,7 +119,8 @@ enum Commands {
     /// Store an API key in the OS keyring. The key is read from the terminal or stdin,
     /// never from a command-line argument.
     Auth {
-        /// Provider name, e.g. `anthropic`, `openai`, `openrouter`, `groq`.
+        /// Provider name, e.g. `anthropic`, `openai`, `openrouter`, `groq`, `xai`.
+        /// Aliases: `claude` → `anthropic`, `gemini` → `google`, `grok` → `xai`.
         service: String,
         /// Remove the stored key instead of setting one.
         #[arg(long)]
@@ -317,7 +318,8 @@ fn auth(service: &str, delete: bool, settings: &Settings) -> Result<()> {
     if settings.endpoint(service).is_none() {
         bail!(
             "unknown provider `{service}`. Built-in providers: anthropic, openai, google, \
-             openrouter, groq. Add others under `custom_endpoints` in config.json."
+             openrouter, groq, xai (alias: grok). Add others under `custom_endpoints` in \
+             config.json."
         );
     }
 
@@ -1151,6 +1153,32 @@ mod tests {
         // confirm they still do, whatever case the alias itself is typed in.
         assert_eq!(resolve_canonical_service("Claude", &settings), "anthropic");
         assert_eq!(resolve_canonical_service("GEMINI", &settings), "google");
+        // xAI aliases: `grok` is the user-facing alias, `xai` is the canonical id.
+        assert_eq!(resolve_canonical_service("xAI", &settings), "xai");
+        assert_eq!(resolve_canonical_service("GROK", &settings), "xai");
+        assert_eq!(resolve_canonical_service("grok", &settings), "xai");
+    }
+
+    #[test]
+    fn custom_endpoint_named_grok_is_not_routed_through_the_xai_alias() {
+        // A custom endpoint the user explicitly named `grok` in config.json must keep
+        // that exact key — it must not be silently mapped to `xai` by the builtin
+        // alias path, which is reserved for builtins only.
+        let mut settings = Settings::default();
+        settings.custom_endpoints.insert(
+            "grok".to_string(),
+            crate::config::CloudEndpoint {
+                api: crate::config::Api::OpenAiCompatible,
+                base_url: "https://my-grok-proxy.example/v1".into(),
+                default_model: "grok-custom".into(),
+            },
+        );
+        assert_eq!(
+            resolve_canonical_service("grok", &settings),
+            "grok",
+            "a custom endpoint named `grok` must retain its exact name, not be \
+             redirected to the builtin `xai` alias"
+        );
     }
 
     #[test]

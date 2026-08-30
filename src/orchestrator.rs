@@ -1563,7 +1563,7 @@ fn discover_vendors(settings: &Settings, classified: bool) -> Vec<Candidate> {
             ids.push(custom.clone());
         }
     }
-    for builtin in ["anthropic", "openai", "google", "openrouter", "groq"] {
+    for builtin in ["anthropic", "openai", "google", "openrouter", "groq", "xai"] {
         if !ids.iter().any(|id| id.eq_ignore_ascii_case(builtin)) {
             ids.push(builtin.to_string());
         }
@@ -7227,6 +7227,42 @@ mod tests {
             1,
             "expected only 1 Anthropic candidate, found: {:?}",
             anthropic_candidates
+                .iter()
+                .map(|c| (&c.id, &c.group))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn xai_appears_exactly_once_in_default_discovery_and_grok_alias_does_not_duplicate_it() {
+        // Pins that the canonical id `xai` is included in builtin discovery and that
+        // the user-facing alias `grok` — which resolves to `xai` via
+        // `canonical_provider` — does not produce a second, duplicate candidate.
+        let settings = Settings::default();
+        let candidates = discover_vendors(&settings, false);
+
+        let xai_candidates: Vec<_> = candidates
+            .iter()
+            .filter(|c| c.id.eq_ignore_ascii_case("xai"))
+            .collect();
+        assert_eq!(
+            xai_candidates.len(),
+            1,
+            "expected exactly 1 xai candidate from default discovery, found: {:?}",
+            xai_candidates
+                .iter()
+                .map(|c| (&c.id, &c.group))
+                .collect::<Vec<_>>()
+        );
+
+        let grok_duplicates: Vec<_> = candidates
+            .iter()
+            .filter(|c| c.id.eq_ignore_ascii_case("grok"))
+            .collect();
+        assert!(
+            grok_duplicates.is_empty(),
+            "grok alias must not appear as a separate candidate alongside xai; found: {:?}",
+            grok_duplicates
                 .iter()
                 .map(|c| (&c.id, &c.group))
                 .collect::<Vec<_>>()

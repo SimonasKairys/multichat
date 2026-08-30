@@ -17,7 +17,7 @@ use crate::providers::{
 
 /// Anthropic requires this header on every request; it is an API-version pin, not a
 /// model version.
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
 pub struct CloudProvider {

@@ -5,6 +5,7 @@
 //! never reached a model.
 
 use anyhow::{Result, anyhow};
+use secrecy::ExposeSecret;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -654,19 +655,42 @@ fn safe_error_detail(err: &anyhow::Error) -> String {
 /// Whether a candidate connection can actually be constructed right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Availability {
+    /// Live probe succeeded (or Ollama responded): fully ready.
     Available,
+    /// Key or binary was found but has not been verified against the real API.
+    /// The endpoint is treated as usable but the user should know auth is unchecked.
+    AvailableUnverified(String),
     /// Carries the reason shown in the picker's hint line, e.g. "no key stored".
     Unavailable(String),
 }
 
 impl Availability {
     pub fn is_available(&self) -> bool {
-        matches!(self, Availability::Available)
+        matches!(
+            self,
+            Availability::Available | Availability::AvailableUnverified(_)
+        )
     }
 
+    /// The reason for an `Unavailable` state only — `None` for verified or unverified
+    /// available states. Used by the picker to decide whether to open the key-entry
+    /// prompt vs flash a reason.
     pub fn reason(&self) -> Option<&str> {
         match self {
+            Availability::Available | Availability::AvailableUnverified(_) => None,
+            Availability::Unavailable(reason) => Some(reason),
+        }
+    }
+
+    /// The note to display alongside this state: the unverified explanation for
+    /// `AvailableUnverified`, the reason for `Unavailable`, and `None` for a
+    /// fully-verified `Available`. Used to populate `ModelStatus::reason` so all
+    /// three rendering surfaces (chat transcript, `/commander`, `simon models`)
+    /// can show honest detail.
+    pub fn status_note(&self) -> Option<&str> {
+        match self {
             Availability::Available => None,
+            Availability::AvailableUnverified(note) => Some(note),
             Availability::Unavailable(reason) => Some(reason),
         }
     }
@@ -676,15 +700,18 @@ impl Availability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
     Connected,
+    /// Key or binary found but authentication has not been probed yet.
+    ConnectedUnverified,
     NotConnected,
     ConnectedUnavailable,
 }
 
 impl ConnectionState {
     pub fn from_availability(connected: bool, availability: &Availability) -> Self {
-        match (connected, availability.is_available()) {
-            (true, true) => Self::Connected,
-            (true, false) => Self::ConnectedUnavailable,
+        match (connected, availability) {
+            (true, Availability::Available) => Self::Connected,
+            (true, Availability::AvailableUnverified(_)) => Self::ConnectedUnverified,
+            (true, Availability::Unavailable(_)) => Self::ConnectedUnavailable,
             (false, _) => Self::NotConnected,
         }
     }
@@ -692,6 +719,7 @@ impl ConnectionState {
     pub fn symbol(self) -> &'static str {
         match self {
             Self::Connected => "●",
+            Self::ConnectedUnverified => "◐",
             Self::NotConnected => "○",
             Self::ConnectedUnavailable => "×",
         }
@@ -699,14 +727,18 @@ impl ConnectionState {
 
     pub fn description(self) -> &'static str {
         match self {
-            Self::Connected => "connected/ready",
+            Self::Connected => "connected/verified",
+            Self::ConnectedUnverified => "connected; authentication unverified",
             Self::NotConnected => "not connected",
             Self::ConnectedUnavailable => "connected but unavailable",
         }
     }
 
     pub fn is_connected(self) -> bool {
-        matches!(self, Self::Connected | Self::ConnectedUnavailable)
+        matches!(
+            self,
+            Self::Connected | Self::ConnectedUnverified | Self::ConnectedUnavailable
+        )
     }
 }
 
@@ -1203,7 +1235,171 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 pub async fn discover_candidates(settings: &Settings, classified: bool) -> Vec<Candidate> {
     let mut candidates = discover_ollama(settings, classified).await;
     candidates.extend(discover_vendors(settings, classified));
+    // Unit tests exercise the probe protocol against local TcpListeners below.
+    // Discovery tests must never turn a developer's real keyring entries into
+    // outbound cloud requests merely because `cargo test` was run.
+    #[cfg(not(test))]
+    if !classified {
+        run_cloud_probes(&mut candidates, settings).await;
+    }
     candidates
+}
+
+/// Returns the URL to probe and the auth style to use, without making a request.
+/// OpenRouter requires a dedicated `/auth/key` endpoint; everything else uses the
+/// standard `/models` list. Custom endpoint overrides are always treated as generic
+/// OpenAI-compatible regardless of the vendor id.
+fn probe_url_for(id: &str, endpoint: &crate::config::CloudEndpoint, is_builtin: bool) -> String {
+    let base = endpoint.base_url.trim_end_matches('/');
+    if is_builtin && id.eq_ignore_ascii_case("openrouter") {
+        return format!("{base}/auth/key");
+    }
+    match endpoint.api {
+        crate::config::Api::Anthropic => format!("{base}/v1/models"),
+        crate::config::Api::OpenAiCompatible => format!("{base}/models"),
+    }
+}
+
+/// Inner probe: accepts a pre-fetched key so tests can exercise the logic without
+/// touching the OS keyring. Credential values are never logged or stored.
+pub(crate) async fn probe_cloud_endpoint(
+    id: &str,
+    endpoint: &crate::config::CloudEndpoint,
+    is_builtin: bool,
+    key: &secrecy::SecretString,
+    client: &reqwest::Client,
+) -> Availability {
+    let url = probe_url_for(id, endpoint, is_builtin);
+
+    let req = match endpoint.api {
+        crate::config::Api::Anthropic => client
+            .get(&url)
+            .header("x-api-key", key.expose_secret())
+            .header(
+                "anthropic-version",
+                crate::providers::cloud::ANTHROPIC_VERSION,
+            ),
+        crate::config::Api::OpenAiCompatible => client.get(&url).bearer_auth(key.expose_secret()),
+    };
+
+    match req.send().await {
+        Ok(response) => {
+            let status = response.status();
+            if status.is_success() {
+                return Availability::Available;
+            }
+            let code = status.as_u16();
+            if code == 401 || code == 403 {
+                return Availability::Unavailable(format!("authentication rejected ({code})"));
+            }
+            if code == 429 {
+                Availability::AvailableUnverified(format!(
+                    "authentication probe rate limited (HTTP {code})"
+                ))
+            } else if (500..=599).contains(&code) {
+                Availability::AvailableUnverified(format!(
+                    "service error during authentication probe (HTTP {code})"
+                ))
+            } else {
+                Availability::AvailableUnverified(format!(
+                    "authentication probe inconclusive (HTTP {code})"
+                ))
+            }
+        }
+        Err(e) if e.is_timeout() => {
+            Availability::Unavailable("authentication probe timed out".into())
+        }
+        Err(e) if e.is_connect() => Availability::Unavailable("endpoint unreachable".into()),
+        Err(_) => Availability::Unavailable("authentication probe request failed".into()),
+    }
+}
+
+/// Reads credentials from the keyring and probes the endpoint, updating the
+/// candidate's availability. Drops the key immediately after the request.
+#[cfg(not(test))]
+async fn probe_cloud(
+    id: &str,
+    endpoint: &crate::config::CloudEndpoint,
+    is_builtin: bool,
+    client: &reqwest::Client,
+) -> Availability {
+    let key = match Credentials::get(id) {
+        Ok(Some(key)) => key,
+        Ok(None) => return Availability::Unavailable("no key stored".into()),
+        Err(e) => return Availability::Unavailable(format!("keyring error: {e}")),
+    };
+    let result = probe_cloud_endpoint(id, endpoint, is_builtin, &key, client).await;
+    // `key` is dropped here — SecretString zeroizes on drop.
+    result
+}
+
+/// Runs concurrent live probes against all API transports that are currently
+/// `AvailableUnverified` (i.e. a key was found but not yet validated). Updates
+/// each transport's `availability` in place. Never called under `--classified`.
+#[cfg(not(test))]
+async fn run_cloud_probes(candidates: &mut [Candidate], settings: &Settings) {
+    struct ProbeTarget {
+        candidate_idx: usize,
+        transport_idx: usize,
+        id: String,
+        endpoint: crate::config::CloudEndpoint,
+        is_builtin: bool,
+    }
+
+    let mut targets: Vec<ProbeTarget> = Vec::new();
+    for (c_idx, candidate) in candidates.iter().enumerate() {
+        for (t_idx, transport) in candidate.transports.iter().enumerate() {
+            if transport.transport == Some(Transport::Api)
+                && matches!(transport.availability, Availability::AvailableUnverified(_))
+                && let Some(endpoint) = settings.endpoint(&candidate.id)
+            {
+                let is_builtin = !settings
+                    .custom_endpoints
+                    .keys()
+                    .any(|k| k.eq_ignore_ascii_case(&candidate.id));
+                targets.push(ProbeTarget {
+                    candidate_idx: c_idx,
+                    transport_idx: t_idx,
+                    id: candidate.id.clone(),
+                    endpoint,
+                    is_builtin,
+                });
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        return;
+    }
+
+    let probe_client = match reqwest::Client::builder()
+        .use_rustls_tls()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => {
+            for target in targets {
+                candidates[target.candidate_idx].transports[target.transport_idx].availability =
+                    Availability::AvailableUnverified(
+                        "authentication probe could not start".into(),
+                    );
+            }
+            return;
+        }
+    };
+
+    let results = futures::future::join_all(
+        targets
+            .iter()
+            .map(|t| probe_cloud(&t.id, &t.endpoint, t.is_builtin, &probe_client)),
+    )
+    .await;
+
+    for (target, result) in targets.iter().zip(results) {
+        candidates[target.candidate_idx].transports[target.transport_idx].availability = result;
+    }
 }
 
 async fn discover_ollama(settings: &Settings, classified: bool) -> Vec<Candidate> {
@@ -1374,7 +1570,13 @@ fn build_vendor_candidate(
             )
         } else {
             match Credentials::get(id) {
-                Ok(Some(_)) => (Availability::Available, endpoint.base_url.clone(), false),
+                Ok(Some(_)) => (
+                    Availability::AvailableUnverified(
+                        "key stored; authentication not yet checked".into(),
+                    ),
+                    endpoint.base_url.clone(),
+                    false,
+                ),
                 // The reason is rendered separately from the detail column, so the
                 // detail stays the endpoint URL — repeating it here printed it twice.
                 // This is the only branch the picker can resolve by itself (prompt
@@ -1431,7 +1633,9 @@ fn build_vendor_candidate(
                 cli.path
             ))
         } else {
-            Availability::Available
+            Availability::AvailableUnverified(
+                "executable found; authentication is checked on first request".into(),
+            )
         };
         transports.push(TransportOption {
             transport: Some(Transport::Cli),
@@ -1587,7 +1791,7 @@ pub fn candidate_statuses(candidates: &[Candidate], settings: &Settings) -> Vec<
                 label: candidate_label(candidate, option, settings),
                 transport: option.transport,
                 state: ConnectionState::from_availability(connected, &option.availability),
-                reason: option.availability.reason().map(str::to_string),
+                reason: option.availability.status_note().map(str::to_string),
             });
         }
     }
@@ -6998,6 +7202,359 @@ mod tests {
                 .iter()
                 .map(|c| (&c.id, &c.group))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ---- cloud probe tests (deterministic: local TcpListener, no real network) ----
+
+    /// Binds to an ephemeral loopback port and returns the listener plus the base URL.
+    async fn bind_probe_listener() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, format!("http://127.0.0.1:{port}"))
+    }
+
+    /// Accepts one connection, captures the HTTP request, and replies with the given
+    /// status code.
+    async fn serve_once_returning_request(
+        listener: tokio::net::TcpListener,
+        status: u16,
+    ) -> String {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+            .await
+            .unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let body = b"{}";
+        let response = format!(
+            "HTTP/1.1 {status} Status\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        use tokio::io::AsyncWriteExt;
+        stream
+            .write_all([response.as_bytes(), body].concat().as_slice())
+            .await
+            .ok();
+        request.into_owned()
+    }
+
+    async fn serve_once_returning_path(listener: tokio::net::TcpListener, status: u16) -> String {
+        let request = serve_once_returning_request(listener, status).await;
+        request
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("/")
+            .to_string()
+    }
+
+    fn probe_test_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(4))
+            .build()
+            .unwrap()
+    }
+
+    fn test_key() -> secrecy::SecretString {
+        secrecy::SecretString::from("test-api-key".to_string())
+    }
+
+    fn openai_endpoint(base: &str) -> crate::config::CloudEndpoint {
+        crate::config::CloudEndpoint {
+            api: crate::config::Api::OpenAiCompatible,
+            base_url: base.to_string(),
+            default_model: "test".to_string(),
+        }
+    }
+
+    fn anthropic_endpoint(base: &str) -> crate::config::CloudEndpoint {
+        crate::config::CloudEndpoint {
+            api: crate::config::Api::Anthropic,
+            base_url: base.to_string(),
+            default_model: "test".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_2xx_returns_available() {
+        let (listener, base) = bind_probe_listener().await;
+        tokio::spawn(serve_once_returning_path(listener, 200));
+        let result = probe_cloud_endpoint(
+            "openai",
+            &openai_endpoint(&base),
+            true,
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+        assert_eq!(result, Availability::Available);
+    }
+
+    #[tokio::test]
+    async fn openai_probe_sends_the_key_as_a_bearer_token() {
+        let (listener, base) = bind_probe_listener().await;
+        let served = tokio::spawn(serve_once_returning_request(listener, 200));
+
+        let result = probe_cloud_endpoint(
+            "openai",
+            &openai_endpoint(&base),
+            true,
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+        let request = served.await.unwrap().to_ascii_lowercase();
+
+        assert_eq!(result, Availability::Available);
+        assert!(request.contains("authorization: bearer test-api-key\r\n"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_probe_sends_the_key_and_protocol_version() {
+        let (listener, base) = bind_probe_listener().await;
+        let served = tokio::spawn(serve_once_returning_request(listener, 200));
+
+        let result = probe_cloud_endpoint(
+            "anthropic",
+            &anthropic_endpoint(&base),
+            true,
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+        let request = served.await.unwrap().to_ascii_lowercase();
+
+        assert_eq!(result, Availability::Available);
+        assert!(request.contains("x-api-key: test-api-key\r\n"));
+        assert!(request.contains(&format!(
+            "anthropic-version: {}\r\n",
+            crate::providers::cloud::ANTHROPIC_VERSION
+        )));
+    }
+
+    #[tokio::test]
+    async fn probe_401_returns_unavailable_rejected() {
+        let (listener, base) = bind_probe_listener().await;
+        tokio::spawn(serve_once_returning_path(listener, 401));
+        let result = probe_cloud_endpoint(
+            "openai",
+            &openai_endpoint(&base),
+            true,
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+        assert_eq!(
+            result,
+            Availability::Unavailable("authentication rejected (401)".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_403_returns_unavailable_rejected() {
+        let (listener, base) = bind_probe_listener().await;
+        tokio::spawn(serve_once_returning_path(listener, 403));
+        let result = probe_cloud_endpoint(
+            "openai",
+            &openai_endpoint(&base),
+            true,
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+        assert_eq!(
+            result,
+            Availability::Unavailable("authentication rejected (403)".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_network_failure_returns_unreachable() {
+        let (listener, base) = bind_probe_listener().await;
+        drop(listener);
+        let endpoint = openai_endpoint(&base);
+        let result =
+            probe_cloud_endpoint("openai", &endpoint, true, &test_key(), &probe_test_client())
+                .await;
+        let Availability::Unavailable(reason) = result else {
+            panic!("expected Unavailable, got {result:?}");
+        };
+        assert_eq!(reason, "endpoint unreachable");
+        assert!(!reason.contains("test-api-key"));
+    }
+
+    #[tokio::test]
+    async fn openrouter_builtin_probe_targets_auth_key_path() {
+        let (listener, base) = bind_probe_listener().await;
+        let served = tokio::spawn(serve_once_returning_path(listener, 200));
+        let endpoint = openai_endpoint(&base);
+        let _ = probe_cloud_endpoint(
+            "openrouter",
+            &endpoint,
+            true, // is_builtin = true → must use /auth/key
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+        let path = served.await.unwrap();
+        assert_eq!(path, "/auth/key", "openrouter builtin must probe /auth/key");
+    }
+
+    #[tokio::test]
+    async fn openrouter_custom_override_uses_the_generic_models_path() {
+        let (listener, base) = bind_probe_listener().await;
+        let served = tokio::spawn(serve_once_returning_path(listener, 200));
+        let endpoint = openai_endpoint(&base);
+        let _ = probe_cloud_endpoint(
+            "openrouter",
+            &endpoint,
+            false,
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+        let path = served.await.unwrap();
+        assert_eq!(path, "/models");
+    }
+
+    #[tokio::test]
+    async fn custom_endpoint_404_stays_available_unverified() {
+        // A custom endpoint may not have a /models route at all; 404 must not
+        // disable it — it should become AvailableUnverified with an inconclusive note.
+        let (listener, base) = bind_probe_listener().await;
+        tokio::spawn(serve_once_returning_path(listener, 404));
+        let result = probe_cloud_endpoint(
+            "my-gateway",
+            &openai_endpoint(&base),
+            false, // is_builtin = false → inconclusive non-auth failures
+            &test_key(),
+            &probe_test_client(),
+        )
+        .await;
+        let Availability::AvailableUnverified(note) = result else {
+            panic!("expected AvailableUnverified, got {result:?}");
+        };
+        assert!(
+            note.contains("404"),
+            "note should mention the HTTP status: {note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_non_auth_http_errors_stay_available_unverified() {
+        for (status, expected_note) in [
+            (429, "authentication probe rate limited"),
+            (503, "service error during authentication probe"),
+        ] {
+            let (listener, base) = bind_probe_listener().await;
+            tokio::spawn(serve_once_returning_path(listener, status));
+            let result = probe_cloud_endpoint(
+                "anthropic",
+                &anthropic_endpoint(&base),
+                true,
+                &test_key(),
+                &probe_test_client(),
+            )
+            .await;
+            let Availability::AvailableUnverified(note) = result else {
+                panic!("expected AvailableUnverified for HTTP {status}, got {result:?}");
+            };
+            assert!(note.contains(expected_note), "unexpected note: {note}");
+            assert!(note.contains(&status.to_string()));
+        }
+    }
+
+    #[test]
+    fn classified_mode_api_candidates_are_unavailable_not_unverified() {
+        // Under --classified, discover_vendors sets API transports to
+        // Unavailable("cloud APIs are refused under --classified"), never
+        // AvailableUnverified — so run_cloud_probes would have no probe targets
+        // even if called. This test verifies the classified path directly.
+        let settings = Settings::default();
+        let candidates = discover_vendors(&settings, /* classified = */ true);
+        for candidate in &candidates {
+            for transport in &candidate.transports {
+                if transport.transport == Some(Transport::Api) {
+                    assert!(
+                        matches!(transport.availability, Availability::Unavailable(_)),
+                        "classified API transport must be Unavailable, not {:?}",
+                        transport.availability
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unverified_availability_is_available_and_exposes_note() {
+        let av = Availability::AvailableUnverified("test note".into());
+        assert!(av.is_available());
+        assert_eq!(av.status_note(), Some("test note"));
+        assert_eq!(av.reason(), None);
+    }
+
+    #[test]
+    fn connected_unverified_state_has_correct_symbol_and_description() {
+        let state = ConnectionState::ConnectedUnverified;
+        assert_eq!(state.symbol(), "◐");
+        assert!(state.is_connected());
+        assert!(state.description().contains("unverified"));
+    }
+
+    #[test]
+    fn from_availability_maps_unverified_to_connected_unverified_when_connected() {
+        let av = Availability::AvailableUnverified("note".into());
+        assert_eq!(
+            ConnectionState::from_availability(true, &av),
+            ConnectionState::ConnectedUnverified
+        );
+        // Not connected: stays NotConnected regardless of unverified
+        assert_eq!(
+            ConnectionState::from_availability(false, &av),
+            ConnectionState::NotConnected
+        );
+    }
+
+    #[test]
+    fn candidate_statuses_expose_unverified_note_as_reason() {
+        let candidate = Candidate {
+            id: "anthropic".to_string(),
+            group: "ANTHROPIC".to_string(),
+            model: "claude-opus-5".to_string(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".to_string(),
+                detail: "https://api.anthropic.com".to_string(),
+                availability: Availability::AvailableUnverified(
+                    "key stored; authentication not yet checked".to_string(),
+                ),
+                cli: None,
+                needs_key: false,
+            }],
+        };
+        let mut connections = BTreeMap::new();
+        connections.insert(
+            "anthropic".to_string(),
+            ConnectionSpec {
+                enabled: true,
+                transport: Some(Transport::Api),
+                path: None,
+                model: None,
+            },
+        );
+        let settings = Settings {
+            connections,
+            ..Default::default()
+        };
+        let statuses = candidate_statuses(&[candidate], &settings);
+        assert_eq!(statuses[0].state, ConnectionState::ConnectedUnverified);
+        assert_eq!(
+            statuses[0].reason.as_deref(),
+            Some("key stored; authentication not yet checked")
         );
     }
 }

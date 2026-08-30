@@ -4,7 +4,7 @@
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, KeyCode,
+        DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream, KeyCode,
         KeyEventKind, KeyModifiers,
     },
     execute,
@@ -15,7 +15,8 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
+    text::{Line as RatatuiLine, Span, Text},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 use std::io::{self, Stdout};
@@ -23,7 +24,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use zeroize::Zeroize;
 
-use crate::app::{App, CommanderCommand, parse_commander_command, parse_forget_command};
+use crate::app::{App, CommanderCommand, Speaker, parse_commander_command, parse_forget_command};
 use crate::config::{Credentials, Settings};
 use crate::orchestrator::{
     Command, Event, WriteDecision, discover_candidates, enrich_cli_model_options,
@@ -40,7 +41,11 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("failed to enable raw mode")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        // Mouse events are deliberately not captured: the UI has no mouse handlers,
+        // and capture prevents the terminal's native drag-to-select/copy behavior.
+        // Bracketed paste lets crossterm deliver one paste event instead of a burst of
+        // keypresses that can lose characters or trigger shortcuts.
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
 
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
@@ -52,8 +57,8 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(
             self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
+            DisableBracketedPaste,
+            LeaveAlternateScreen
         );
         let _ = self.terminal.show_cursor();
     }
@@ -135,6 +140,10 @@ pub async fn run(
                         } else {
                             handle_key(&mut app, key.code, key.modifiers, &commands, &decisions).await;
                         }
+                    }
+                    Some(Ok(TermEvent::Paste(mut text))) => {
+                        handle_chat_paste(&mut app, &text);
+                        text.zeroize();
                     }
                     // Ignore resize/mouse/focus events; the next draw picks up the size.
                     Some(Ok(_)) => {}
@@ -340,6 +349,12 @@ async fn run_picker(
                             }
                         }
                     }
+                    Some(Ok(TermEvent::Paste(mut text))) => {
+                        if let Some(state) = picker.as_mut() {
+                            handle_picker_paste(state, &text);
+                        }
+                        text.zeroize();
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => return Ok(false),
                 }
@@ -495,6 +510,55 @@ fn needs_key_row(state: &PickerState, id: &str) -> Option<(usize, usize)> {
     })
 }
 
+/// Feeds pasted text into a one-line editor without allowing terminal control bytes
+/// into application state. CRLF is one separator, standalone CR/LF and tabs become a
+/// space, and other control characters are discarded.
+fn for_each_pasted_char(text: &str, mut push: impl FnMut(char)) {
+    let mut previous_was_cr = false;
+    for c in text.chars() {
+        match c {
+            '\r' => {
+                push(' ');
+                previous_was_cr = true;
+            }
+            '\n' => {
+                if !previous_was_cr {
+                    push(' ');
+                }
+                previous_was_cr = false;
+            }
+            '\t' => {
+                push(' ');
+                previous_was_cr = false;
+            }
+            c if c.is_control() => {
+                previous_was_cr = false;
+            }
+            c => {
+                push(c);
+                previous_was_cr = false;
+            }
+        }
+    }
+}
+
+fn handle_chat_paste(app: &mut App, text: &str) {
+    // A write confirmation accepts only a deliberate y/n/a keypress. Clipboard
+    // contents must never approve or deny a filesystem change.
+    if app.pending_write.is_some() {
+        return;
+    }
+    for_each_pasted_char(text, |c| app.push_char(c));
+}
+
+fn handle_picker_paste(state: &mut PickerState, text: &str) {
+    if state.key_entry().is_some() {
+        for_each_pasted_char(text, |c| state.push_key_char(c));
+    } else if state.model_entry().is_some() {
+        for_each_pasted_char(text, |c| state.push_model_char(c));
+    }
+}
+
 async fn handle_key(
     app: &mut App,
     code: KeyCode,
@@ -587,17 +651,14 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(frame.area());
 
-    let history_body = app.body();
     let history_interior_height = chunks[0].height.saturating_sub(2) as usize;
     let history_interior_width = chunks[0].width.saturating_sub(2);
-    let total_lines = Paragraph::new(history_body.as_str())
-        .wrap(Wrap { trim: false })
-        .line_count(history_interior_width);
+    let history = Paragraph::new(render_transcript(app)).wrap(Wrap { trim: false });
+    let total_lines = history.line_count(history_interior_width);
     let base_scroll = total_lines.saturating_sub(history_interior_height);
     let effective_scroll = base_scroll.saturating_sub(app.scroll as usize) as u16;
 
-    let history = Paragraph::new(history_body)
-        .wrap(Wrap { trim: false })
+    let history = history
         .scroll((effective_scroll, 0))
         .block(Block::default().title(" simon ").borders(Borders::ALL));
     frame.render_widget(history, chunks[0]);
@@ -661,6 +722,54 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         let y = chunks[1].y + 1;
         frame.set_cursor_position((x, y));
     }
+}
+
+fn render_transcript(app: &App) -> Text<'static> {
+    let mut rendered = Vec::new();
+
+    for line in &app.transcript {
+        let (prefix, prefix_style, text_style) = match &line.speaker {
+            Speaker::You => (
+                "you › ".to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+                Style::default(),
+            ),
+            Speaker::Model(label) => (
+                format!("{label} › "),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+                Style::default(),
+            ),
+            Speaker::System => (
+                "· ".to_string(),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Speaker::Error => (
+                "! ".to_string(),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(Color::Red),
+            ),
+        };
+
+        let mut physical_lines = line.text.split('\n');
+        let first = physical_lines.next().unwrap_or_default();
+        rendered.push(RatatuiLine::from(vec![
+            Span::styled(prefix, prefix_style),
+            Span::styled(first.to_string(), text_style),
+        ]));
+        rendered.extend(
+            physical_lines
+                .map(|text| RatatuiLine::from(Span::styled(text.to_string(), text_style))),
+        );
+    }
+
+    Text::from(rendered)
 }
 
 /// Renders the picker: a body pane listing every candidate grouped by provider, and
@@ -768,6 +877,9 @@ fn render_picker_body_with_cursor(picker: &PickerState) -> (String, usize) {
         };
         let reason = match &option.availability {
             crate::orchestrator::Availability::Unavailable(reason) => format!("  ({reason})"),
+            crate::orchestrator::Availability::AvailableUnverified(note) => {
+                format!("  ({note})")
+            }
             crate::orchestrator::Availability::Available => String::new(),
         };
 
@@ -827,6 +939,19 @@ fn render_model_options_with_cursor(picker: &PickerState) -> (String, usize) {
 mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    fn visible_text(text: &Text<'_>) -> String {
+        text.lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[tokio::test]
     async fn handle_key_does_not_let_a_local_command_clear_busy_while_a_turn_is_in_flight() {
@@ -943,6 +1068,44 @@ mod tests {
     }
 
     #[test]
+    fn render_transcript_preserves_plain_text_and_styles_each_speaker() {
+        let mut app = App::new("copilot", &[], ".".to_string());
+        app.transcript = vec![
+            crate::app::Line {
+                speaker: Speaker::You,
+                text: "question".into(),
+            },
+            crate::app::Line {
+                speaker: Speaker::Model("copilot".into()),
+                text: "first\nsecond\n".into(),
+            },
+            crate::app::Line {
+                speaker: Speaker::System,
+                text: "working".into(),
+            },
+            crate::app::Line {
+                speaker: Speaker::Error,
+                text: "failed".into(),
+            },
+        ];
+
+        let rendered = render_transcript(&app);
+
+        assert_eq!(visible_text(&rendered), app.body());
+        assert_eq!(rendered.lines[0].spans[0].style.fg, Some(Color::Cyan));
+        assert!(
+            rendered.lines[0].spans[0]
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+        assert_eq!(rendered.lines[1].spans[0].style.fg, Some(Color::Green));
+        assert_eq!(rendered.lines[4].spans[1].style.fg, Some(Color::DarkGray));
+        assert_eq!(rendered.lines[5].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(rendered.lines[5].spans[1].style.fg, Some(Color::Red));
+    }
+
+    #[test]
     fn picker_scroll_offset_never_scrolls_when_the_interior_has_no_rows() {
         // Pins `interior_height > 0`: with zero interior rows there is nothing to
         // scroll into view, so the offset must stay 0 no matter how far down the
@@ -1008,7 +1171,7 @@ mod tests {
     }
 
     #[test]
-    fn render_picker_body_shows_all_three_connection_states() {
+    fn render_picker_body_shows_all_four_connection_states() {
         use crate::config::ConnectionSpec;
         use crate::orchestrator::{Availability, Candidate, TransportOption};
         let candidates = vec![
@@ -1039,6 +1202,21 @@ mod tests {
                 }],
             },
             Candidate {
+                id: "unchecked".to_string(),
+                group: "MODELS".to_string(),
+                model: "unchecked".to_string(),
+                transports: vec![TransportOption {
+                    transport: None,
+                    label: String::new(),
+                    detail: String::new(),
+                    availability: Availability::AvailableUnverified(
+                        "authentication is checked on first request".to_string(),
+                    ),
+                    cli: None,
+                    needs_key: false,
+                }],
+            },
+            Candidate {
                 id: "broken".to_string(),
                 group: "MODELS".to_string(),
                 model: "broken".to_string(),
@@ -1055,6 +1233,15 @@ mod tests {
         let connections = [
             (
                 "ready".to_string(),
+                ConnectionSpec {
+                    enabled: true,
+                    transport: None,
+                    path: None,
+                    model: None,
+                },
+            ),
+            (
+                "unchecked".to_string(),
                 ConnectionSpec {
                     enabled: true,
                     transport: None,
@@ -1080,6 +1267,8 @@ mod tests {
 
         assert!(body.contains("● ready"));
         assert!(body.contains("○ idle"));
+        assert!(body.contains("◐ unchecked"));
+        assert!(body.contains("(authentication is checked on first request)"));
         assert!(body.contains("× broken"));
         assert!(body.contains("(daemon is down)"));
     }
@@ -1807,6 +1996,89 @@ mod tests {
         assert!(
             picker.key_entry().is_some(),
             "Ctrl+A must not cancel key entry"
+        );
+    }
+
+    #[test]
+    fn chat_paste_inserts_at_the_caret_and_normalizes_one_line_input() {
+        let mut app = App::new("ollama:llama3", &[], "/tmp".to_string());
+        app.push_char('a');
+        app.push_char('b');
+        app.cursor_left();
+
+        handle_chat_paste(&mut app, "ž\r\nx\t\u{7}y");
+
+        assert_eq!(app.input, "až x yb");
+        assert_eq!(app.cursor, "až x y".len());
+        assert!(app.input.is_char_boundary(app.cursor));
+    }
+
+    #[test]
+    fn chat_paste_cannot_answer_a_pending_write_confirmation() {
+        let mut app = App::new("ollama:llama3", &[], "/tmp".to_string());
+        app.push_char('k');
+        app.pending_write = Some(crate::app::PendingWrite {
+            author: "worker".into(),
+            path: "result.txt".into(),
+            bytes: 3,
+            overwrites: None,
+        });
+
+        handle_chat_paste(&mut app, "yes");
+
+        assert_eq!(app.input, "k");
+        assert_eq!(app.cursor, 1);
+        assert!(app.pending_write.is_some());
+    }
+
+    #[test]
+    fn picker_paste_keeps_api_keys_masked_and_normalizes_separators() {
+        let mut picker = key_entry_picker();
+
+        handle_picker_paste(&mut picker, "sk-test\r\nvalue");
+
+        let (_, length) = picker.key_entry().expect("key entry remains open");
+        assert_eq!(length, "sk-test value".chars().count());
+        let (body, _) = render_picker_body_with_cursor(&picker);
+        assert!(!body.contains("sk-test"));
+        assert!(!body.contains("value"));
+
+        let (_, mut key) = picker.submit_key_entry().expect("non-empty key");
+        assert_eq!(key, "sk-test value");
+        key.zeroize();
+    }
+
+    #[test]
+    fn picker_paste_fills_the_model_editor_without_control_characters() {
+        use crate::config::Transport;
+        use crate::orchestrator::{Availability, Candidate, TransportOption};
+
+        let candidate = Candidate {
+            id: "openrouter".into(),
+            group: "OPENROUTER".into(),
+            model: "default-model".into(),
+            transports: vec![TransportOption {
+                transport: Some(Transport::Api),
+                label: "via API".into(),
+                detail: "https://openrouter.ai".into(),
+                availability: Availability::Available,
+                cli: None,
+                needs_key: false,
+            }],
+        };
+        let mut picker = PickerState::new(
+            vec![candidate],
+            &std::collections::BTreeMap::new(),
+            None,
+            false,
+        );
+        picker.start_model_entry();
+
+        handle_picker_paste(&mut picker, "deepseek/\r\nchat\tv3\u{1b}");
+
+        assert_eq!(
+            picker.model_entry().expect("model entry remains open").2,
+            "deepseek/ chat v3"
         );
     }
 

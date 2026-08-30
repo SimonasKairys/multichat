@@ -52,11 +52,13 @@ row marked `(no key stored)` to open a masked entry field instead of quitting to
 `simon auth`. Either way, the key lands in the OS keyring only — never in
 `config.json`.
 
-In the picker, status dots show **● connected/ready**, **○ not connected**, and
-**× connected but unavailable** (with the failure reason shown on that row).
-The same legend is used by `simon models` and `/commander`. These are discovery
-readiness states: `simon` never sends an automatic test prompt just to turn a dot
-green, because that could cost money or let an agentic CLI run tools.
+In the picker, status dots show **● connected/verified**, **◐ connected but
+authentication unverified**, **○ not connected**, and **× connected but
+unavailable** (with the reason shown on that row). The same legend is used by
+`simon models`, `/commander`, and the startup chat transcript. Cloud API keys are
+checked with a short, no-token authentication request; Ollama is verified through
+its live model list. A CLI executable remains **◐** until its first real request
+because an automatic test prompt could cost money or let an agentic CLI run tools.
 **Space** toggles a connection, **c** marks the highlighted row, **m** opens a model
 picker, **tab** cycles a candidate's transport, and **enter** connects — but only
 once a commander has been chosen; until then it just flashes a reminder to press
@@ -79,9 +81,13 @@ In the TUI: type and press **Enter** to send, **PageUp/PageDown** to scroll, **E
 **Ctrl-C** to quit. The prompt line edits like a normal one — **left/right** move the
 caret, **Home/End** jump to either edge, **Backspace/Delete** cut on either side of it,
 and modified chords are not typed as text (a stray **Ctrl-A** used to insert a bare
-`a`). `/forget` clears the ledger's accumulated content when a long session has piled
-up more than the commander needs. Type `/commander` on its own to list every discovered
-model, including connected-but-unavailable choices and their reason. `/commander
+`a`). Drag normally to select transcript text and use your terminal's copy shortcut;
+paste with its paste shortcut (commonly **Ctrl-Shift-V** or **Shift-Insert**). Pasted
+line breaks and tabs become spaces because the prompt, model, and API-key editors are
+single-line fields. `/forget` clears the ledger's accumulated content when a long
+session has piled up more than the commander needs. Type `/commander` on its own to
+list every discovered model, including connected-but-unavailable choices and their
+reason. `/commander
 <name>` (a full label, a bare model name, or a provider name) switches to any connected
 choice live, without leaving the conversation — the choice persists across restarts,
 same as the picker's. Neither form is ever sent to a model as a prompt.

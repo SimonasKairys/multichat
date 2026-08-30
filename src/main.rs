@@ -345,7 +345,9 @@ async fn list_models(settings: &Settings, classified: bool) -> Result<()> {
     let candidates = crate::orchestrator::discover_candidates(settings, classified).await;
     let statuses = crate::orchestrator::candidate_statuses(&candidates, settings);
 
-    println!("Models: ● connected/ready, ○ not connected, × connected but unavailable");
+    println!(
+        "Models: ● connected/verified, ◐ connected/unverified, ○ not connected, × connected but unavailable"
+    );
     for model in &statuses {
         let commander = if model.state.is_connected()
             && model.matches_commander(settings.commander.as_deref())
@@ -461,6 +463,7 @@ async fn chat(
 
     let mut app = App::new(primary, &roster, project_root.display().to_string());
     app.set_model_statuses(model_statuses);
+    app.report_model_statuses();
 
     // Password prompting and all vault I/O happen here — before the picker's result
     // is wired to a running orchestrator and, crucially, before `ui::run` ever calls

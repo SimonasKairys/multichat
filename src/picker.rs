@@ -483,12 +483,13 @@ impl PickerState {
     }
 
     /// Called by the UI after it has written the key to the OS keyring: flips the
-    /// row to available, ticks it (mirrors the normal enabling path in `toggle`,
-    /// since this row is now exactly as selectable as any other available one), and
-    /// flashes confirmation.
+    /// row to available-unverified (the key is now stored but not yet probed),
+    /// ticks it (mirrors the normal enabling path in `toggle`, since this row is
+    /// now exactly as selectable as any other available one), and flashes confirmation.
     pub fn mark_key_stored(&mut self, candidate: usize, transport: usize) {
         let option = &mut self.candidates[candidate].transports[transport];
-        option.availability = Availability::Available;
+        option.availability =
+            Availability::AvailableUnverified("key stored; authentication not yet checked".into());
         option.needs_key = false;
 
         let sel = &mut self.selections[candidate];

@@ -181,7 +181,7 @@ pub struct App {
     /// refreshed on `Reconfigured`, so retaining it is the only plumbing needed.
     pub roster: Vec<String>,
     /// Every discovered model transport, including saved connections that are
-    /// currently unavailable. Bare `/commander` renders the same three states as
+    /// currently unavailable. Bare `/commander` renders the same four states as
     /// the picker and `simon models`.
     pub model_statuses: Vec<ModelStatus>,
     /// Per-model token and quota telemetry accumulated for this session.
@@ -269,6 +269,50 @@ impl App {
 
     pub fn set_model_statuses(&mut self, model_statuses: Vec<ModelStatus>) {
         self.model_statuses = model_statuses;
+    }
+
+    /// Appends a transcript line for each enabled/connected model status, skipping
+    /// `NotConnected` rows (which would flood startup with every unconfigured builtin).
+    /// Verified connections get system lines; unavailable connections get error lines
+    /// so they stand out without terminating the session.
+    pub fn report_model_statuses(&mut self) {
+        for model in &self.model_statuses {
+            match model.state {
+                ConnectionState::NotConnected => continue,
+                ConnectionState::Connected => {
+                    let detail = if model.transport.is_none() {
+                        "daemon reachable"
+                    } else {
+                        "authentication verified"
+                    };
+                    self.transcript.push(Line {
+                        speaker: Speaker::System,
+                        text: format!("{} {} — {detail}", model.state.symbol(), model.label),
+                    });
+                }
+                ConnectionState::ConnectedUnverified => {
+                    let note = model
+                        .reason
+                        .as_deref()
+                        .unwrap_or("authentication unverified");
+                    self.transcript.push(Line {
+                        speaker: Speaker::System,
+                        text: format!("{} {} — {note}", model.state.symbol(), model.label),
+                    });
+                }
+                ConnectionState::ConnectedUnavailable => {
+                    let reason = model.reason.as_deref().unwrap_or("unavailable");
+                    self.transcript.push(Line {
+                        speaker: Speaker::Error,
+                        text: format!(
+                            "{} {} — {reason} (Ctrl+O to fix)",
+                            model.state.symbol(),
+                            model.label
+                        ),
+                    });
+                }
+            }
+        }
     }
 
     /// Advances the spinner by one frame. Called once per UI tick — see `run` in
@@ -530,6 +574,7 @@ impl App {
                         text: format!("swarm: {}", roster.join(", ")),
                     });
                 }
+                self.report_model_statuses();
             }
             Event::CommanderChanged { label, .. } => {
                 self.primary = label.clone();
@@ -568,6 +613,7 @@ impl App {
                 } else {
                     match model.state {
                         ConnectionState::Connected => "connected",
+                        ConnectionState::ConnectedUnverified => "connected; auth unverified",
                         ConnectionState::NotConnected => "not connected; Ctrl+O to connect",
                         ConnectionState::ConnectedUnavailable => {
                             "connected but unavailable; Ctrl+O to fix"
@@ -1553,6 +1599,125 @@ mod tests {
         assert_eq!(
             app.input, "/commander",
             "the typed text must be preserved, not silently dropped"
+        );
+    }
+
+    #[test]
+    fn report_model_statuses_emits_transcript_lines_for_connected_models() {
+        let mut app = App::new(
+            "ollama:llama3",
+            &["ollama:llama3".to_string()],
+            "/p".to_string(),
+        );
+        app.set_model_statuses(vec![
+            model_status("ollama:llama3", ConnectionState::Connected, None),
+            model_status(
+                "anthropic:claude-opus-5",
+                ConnectionState::ConnectedUnverified,
+                Some("key stored; authentication not yet checked"),
+            ),
+            model_status(
+                "groq:llama",
+                ConnectionState::ConnectedUnavailable,
+                Some("authentication rejected (401)"),
+            ),
+            model_status("openai:gpt-4o", ConnectionState::NotConnected, None),
+        ]);
+        // Manually set transport=None for ollama to distinguish daemon-reachable
+        app.model_statuses[0].transport = None;
+
+        app.report_model_statuses();
+
+        let body = app.body();
+        // Ollama: "daemon reachable"
+        assert!(
+            body.contains("● ollama:llama3 — daemon reachable"),
+            "ollama must report daemon reachable: {body}"
+        );
+        // Unverified API: shows note
+        assert!(
+            body.contains("◐ anthropic:claude-opus-5 — key stored; authentication not yet checked"),
+            "unverified must show note: {body}"
+        );
+        // Unavailable: error line with hint
+        assert!(
+            body.contains("× groq:llama — authentication rejected (401) (Ctrl+O to fix)"),
+            "unavailable must show reason + hint: {body}"
+        );
+        // NotConnected: must not appear
+        assert!(
+            !body.contains("openai:gpt-4o"),
+            "not-connected must be skipped: {body}"
+        );
+    }
+
+    #[test]
+    fn report_model_statuses_uses_authentication_verified_for_api_transport() {
+        use crate::config::Transport;
+        let mut app = App::new("anthropic:claude-opus-5", &[], "/p".to_string());
+        let mut status = model_status("anthropic:claude-opus-5", ConnectionState::Connected, None);
+        status.transport = Some(Transport::Api);
+        app.set_model_statuses(vec![status]);
+        app.report_model_statuses();
+        assert!(
+            app.body()
+                .contains("● anthropic:claude-opus-5 — authentication verified"),
+            "connected API must say authentication verified: {}",
+            app.body()
+        );
+    }
+
+    #[test]
+    fn reconfigured_emits_model_status_lines() {
+        let mut app = App::new("ollama:llama3", &[], "/p".to_string());
+        app.apply(Event::Reconfigured {
+            primary: "anthropic:claude-opus-5".into(),
+            roster: vec!["anthropic:claude-opus-5".into()],
+            model_statuses: vec![ModelStatus {
+                connection_id: "anthropic".into(),
+                label: "anthropic:claude-opus-5".into(),
+                transport: Some(crate::config::Transport::Api),
+                state: ConnectionState::ConnectedUnverified,
+                reason: Some("key stored; authentication not yet checked".into()),
+            }],
+        });
+        let body = app.body();
+        assert!(
+            body.contains("connections updated"),
+            "recap line must still appear: {body}"
+        );
+        assert!(
+            body.contains("◐ anthropic:claude-opus-5 — key stored; authentication not yet checked"),
+            "model status line must appear after reconfigure: {body}"
+        );
+    }
+
+    #[test]
+    fn listing_commander_includes_connected_unverified_state() {
+        let mut app = App::new(
+            "ollama:llama3",
+            &["ollama:llama3".to_string()],
+            "/p".to_string(),
+        );
+        app.set_model_statuses(vec![
+            model_status("ollama:llama3", ConnectionState::Connected, None),
+            model_status(
+                "openai:gpt-4o",
+                ConnectionState::ConnectedUnverified,
+                Some("key stored; authentication not yet checked"),
+            ),
+        ]);
+        app.push_char('/');
+        for c in "commander".chars() {
+            app.push_char(c);
+        }
+        app.submit();
+        app.list_commander();
+
+        let body = app.body();
+        assert!(
+            body.contains("◐ openai:gpt-4o (connected; auth unverified)"),
+            "unverified must show ◐ symbol and unverified role: {body}"
         );
     }
 }

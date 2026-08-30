@@ -130,12 +130,13 @@ endpoint.
 ```
 ## What models can do
 
-Beyond answering, a model can act by emitting a line in its reply. Five actions exist,
+Beyond answering, a model can act by emitting a line in its reply. Six actions exist,
 all parsed out of the model's plain text — there is no function-calling API involved:
 
 | Action | Effect | Result arrives |
 |---|---|---|
-| `ACTION: delegate_task(<label>, <prompt>)` | Runs a sub-task on another model | next turn |
+| `ACTION: delegate_task(<label>, <prompt>)` | Runs a text-only sub-task on another model | next turn |
+| `ACTION: delegate_file_task(<label>, <prompt>)` | Runs a sub-task that may propose project-file writes | next turn |
 | `ACTION: read_skill(<name>)` | Loads a skill file into context | next turn |
 | `ACTION: list_files(<path>)` | Lists one directory in the project | next turn |
 | `ACTION: read_file(<path>)` | Reads one project file | next turn |
@@ -150,11 +151,12 @@ fix comes when you send the next message.
 
 **A sub-agent's reply is scanned for writes, and for nothing else.** It cannot delegate
 further, load a skill, or read/list files — so no reply can spawn more work, which is
-what bounds the swarm. A write spawns nothing, so sub-agents *can* author files, and
-that is how a swarm builds a project: the commander delegates the authoring and the
-cheap model writes the files. Every such write still passes the same two gates a
-commander's does — path hardening and your approval, which names the sub-agent as the
-one asking.
+what bounds the swarm. Write blocks execute only for an explicit
+`delegate_file_task`; a regular `delegate_task` is text-only and any unsolicited write
+block is discarded. A permitted write spawns nothing, so sub-agents can still author
+files when the commander deliberately delegates authoring. Every such write passes the
+same two gates a commander's does — path hardening and your approval, which names the
+sub-agent as the one asking.
 
 ### Delegation
 
@@ -171,13 +173,22 @@ models, observed rate-limit budgets, and open tasks. A model delegates by emitti
 ACTION: delegate_task(ollama:mistral, summarise the attached diff)
 ```
 
+For a task that must create or edit project files, the commander uses the explicit
+write-capable form instead:
+
+```
+ACTION: delegate_file_task(ollama:mistral, create src/report.rs as specified)
+```
+
 The orchestrator runs the sub-task and records the reply — or, on failure, the error —
 on that task in the ledger, tagged `[DONE]` or `[FAILED]`, where the delegating model
 sees it on its next turn. Each sub-agent receives only its self-contained task, its own
-connection label, and the sub-agent/file-write instructions — not the shared ledger,
+connection label, and the applicable sub-agent instructions — not the shared ledger,
 conversation, or other models' prompts and results. This prevents sequential workers
-from copying one another's answers or identities. At most 10 delegations run per turn,
-and they run one after another, not concurrently.
+from copying one another's answers or identities. Ordinary `delegate_task` calls are
+text-only; only `delegate_file_task` receives the write protocol and may execute write
+blocks. At most 10 delegations run per turn, and they run one after another, not
+concurrently.
 
 **The commander orients and proposes before it delegates.** Given anything more than a
 direct question it works in three steps: look at the project first (listing directories

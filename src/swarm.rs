@@ -43,6 +43,9 @@ pub struct Task {
 pub struct Delegation {
     pub target: String,
     pub prompt: String,
+    /// Only explicit file-producing delegations receive the write protocol and may
+    /// have write blocks executed. Ordinary delegated answers stay text-only.
+    pub allow_writes: bool,
 }
 
 /// A file write request parsed out of a model's plain-text reply by
@@ -683,9 +686,9 @@ impl SwarmLedger {
     /// The commander protocol promises that a sub-agent sees only the self-contained
     /// task written for it, not the conversation or shared ledger. Besides keeping
     /// that contract honest, isolation prevents sequential delegations from copying
-    /// an earlier model's identity or answer. A sub-agent still needs the file-write
-    /// protocol because writes are the only `ACTION:` blocks its reply may execute.
-    pub fn subagent_system_prompt(model_label: &str) -> String {
+    /// an earlier model's identity or answer. Only an explicit file-producing
+    /// delegation receives the file-write protocol.
+    pub fn subagent_system_prompt(model_label: &str, allow_writes: bool) -> String {
         let mut out = format!(
             "## DELEGATED MODEL CONTEXT\n\n\
              You are connected as `{model_label}`. This label is your identity for \
@@ -694,15 +697,25 @@ impl SwarmLedger {
              You are a sub-agent, not the swarm commander. Work only from the \
              delegated task in the user message. You do not receive the shared \
              ledger, the broader conversation, or other models' prompts or results, \
-             and must not infer or reproduce them.\n\
-             The file-write protocol below is the only swarm action recognized from \
-             your reply.\n"
+             and must not infer or reproduce them.\n"
         );
-        out.push_str(Self::file_write_protocol());
-        out.push_str(
-            "A delegated model receives no automatic follow-up turn. Emit complete \
-             file contents in this reply and do not wait for a write outcome.\n",
-        );
+        if allow_writes {
+            out.push_str(
+                "This delegation explicitly allows project-file writes. The \
+                 file-write protocol below is the only swarm action recognized from \
+                 your reply.\n",
+            );
+            out.push_str(Self::file_write_protocol());
+            out.push_str(
+                "A delegated model receives no automatic follow-up turn. Emit complete \
+                 file contents in this reply and do not wait for a write outcome.\n",
+            );
+        } else {
+            out.push_str(
+                "This is a text-only delegation. Do not create or edit files and do \
+                 not emit any `ACTION:` line; answer only with the requested prose.\n",
+            );
+        }
         out
     }
 
@@ -1057,8 +1070,12 @@ impl SwarmLedger {
              Keep for yourself only what delegation cannot do: deciding what needs \
              doing, choosing who does it, judgement calls, and stitching sub-agent \
              results into the final answer. Delegate everything else.\n\
-             To hand work to another model, emit a line of exactly this form:\n\
+             To hand text-only work to another model, emit a line of exactly this form:\n\
              `ACTION: delegate_task(<model label>, <prompt>)`\n\
+             If and only if the task must create or edit project files, use:\n\
+             `ACTION: delegate_file_task(<model label>, <prompt>)`\n\
+             Only `delegate_file_task` gives the sub-agent the file-write protocol \
+             and permits write blocks from its reply to execute.\n\
              Use a label from the \"Available models\" list above, which annotates each \
              model with what it costs and how much context it holds. Pick the CHEAPEST \
              model that can do the task, not the strongest one — a large-context, \
@@ -1133,14 +1150,16 @@ impl SwarmLedger {
          Writes into `.git/` are refused — a bad write there can corrupt the \
          repository. A line exactly `ACTION: end_file` cannot appear inside the \
          content — it always closes the block there instead. `ACTION: \
-         delegate_task(...)`, `ACTION: read_skill(...)`, `ACTION: read_file(...)`, \
-         and `ACTION: list_files(...)` lines inside the content are treated as \
-         content, not executed, so you can safely write documentation about this \
-         protocol. Every write is shown to the user, who must approve it before \
-         it reaches disk; a refusal is recorded like any other outcome.\n"
+         delegate_task(...)`, `ACTION: delegate_file_task(...)`, `ACTION: \
+         read_skill(...)`, `ACTION: read_file(...)`, and `ACTION: list_files(...)` \
+         lines inside the content are treated as content, not executed, so you can \
+         safely write documentation about this protocol. Every write is shown to the \
+         user, who must approve it before it reaches disk; a refusal is recorded like \
+         any other outcome.\n"
     }
 
-    /// Extracts every `ACTION: delegate_task(target, prompt)` line from a reply.
+    /// Extracts every `ACTION: delegate_task(target, prompt)` and
+    /// `ACTION: delegate_file_task(target, prompt)` line from a reply.
     ///
     /// Splits on the *first* comma (so the target cannot contain one) and matches to the
     /// *last* closing parenthesis on the line, so prompts may contain commas and nested
@@ -1152,7 +1171,7 @@ impl SwarmLedger {
     /// `strip_prefix`, not `find`. A model that was just told to use this protocol
     /// explains it constantly — "you would write ACTION: delegate_task(model, task) in
     /// your reply" — and matching mid-line executed that sentence: a real sub-agent
-    /// call, one of the three delegation slots for the turn, and a task written into
+    /// call, one of the bounded delegation slots for the turn, and a task written into
     /// the shared ledger that the commander afterwards reads as fact. A comment beside
     /// `parse_file_writes` used to justify the permissive siblings on the grounds that
     /// a stray match there "costs one ignored request"; it does not, and this is what
@@ -1243,11 +1262,17 @@ impl SwarmLedger {
     }
 
     pub fn parse_delegations(reply: &str) -> Vec<Delegation> {
-        const MARKER: &str = "ACTION: delegate_task(";
+        const TEXT_MARKER: &str = "ACTION: delegate_task(";
+        const FILE_MARKER: &str = "ACTION: delegate_file_task(";
         let mut found = Vec::new();
 
         for line in reply.lines() {
-            let Some(inner) = Self::action_argument(line, MARKER) else {
+            let parsed = [(FILE_MARKER, true), (TEXT_MARKER, false)]
+                .into_iter()
+                .find_map(|(marker, allow_writes)| {
+                    Self::action_argument(line, marker).map(|inner| (inner, allow_writes))
+                });
+            let Some((inner, allow_writes)) = parsed else {
                 continue;
             };
             let Some((target, prompt)) = inner.split_once(',') else {
@@ -1263,7 +1288,11 @@ impl SwarmLedger {
             if target.is_empty() || prompt.is_empty() {
                 continue;
             }
-            found.push(Delegation { target, prompt });
+            found.push(Delegation {
+                target,
+                prompt,
+                allow_writes,
+            });
         }
 
         found
@@ -1451,7 +1480,7 @@ mod tests {
         // The worst of this set. A model told to use the protocol explains it, and the
         // explanation used to run: a real sub-agent call, one of the three delegation
         // slots for the turn, and a task written into the ledger the commander then
-        // reads as fact. The same held for the other three actions.
+        // reads as fact. The same held for the other action forms.
         let prose = "To delegate work, you would write ACTION: delegate_task(ollama:llama3, \
                      summarize this) in your reply.";
         assert!(
@@ -1459,6 +1488,12 @@ mod tests {
             "fixture must actually contain the marker, or this proves nothing"
         );
         assert!(SwarmLedger::parse_delegations(prose).is_empty());
+        assert!(
+            SwarmLedger::parse_delegations(
+                "Mention ACTION: delegate_file_task(ollama:llama3, write it) mid-sentence."
+            )
+            .is_empty()
+        );
 
         assert!(
             SwarmLedger::parse_read_skill("Mention ACTION: read_skill(rust) mid-sentence.")
@@ -1603,6 +1638,23 @@ mod tests {
         let text = SwarmLedger::new().system_prompt();
         assert!(text.contains("No active tasks."));
         assert!(text.contains("delegate_task"));
+        assert!(text.contains("delegate_file_task"));
+    }
+
+    #[test]
+    fn subagent_prompt_exposes_write_instructions_only_for_file_tasks() {
+        let text_only = SwarmLedger::subagent_system_prompt("ollama:llama3.2:3b", false);
+        assert!(text_only.contains("connected as `ollama:llama3.2:3b`"));
+        assert!(text_only.contains("text-only delegation"));
+        assert!(!text_only.contains("### File write protocol"));
+        assert!(!text_only.contains("## SWARM LEDGER"));
+
+        let file_task = SwarmLedger::subagent_system_prompt("worker:builder", true);
+        assert!(file_task.contains("connected as `worker:builder`"));
+        assert!(file_task.contains("### File write protocol"));
+        assert!(file_task.contains("ACTION: write_file"));
+        assert!(!file_task.contains("### Delegation protocol"));
+        assert!(!file_task.contains("### File read protocol"));
     }
 
     #[test]
@@ -1745,9 +1797,26 @@ mod tests {
             found,
             vec![Delegation {
                 target: "ollama:llama3".into(),
-                prompt: "summarise the file".into()
+                prompt: "summarise the file".into(),
+                allow_writes: false,
             }]
         );
+    }
+
+    #[test]
+    fn file_delegations_explicitly_allow_write_blocks() {
+        let found = SwarmLedger::parse_delegations(
+            "ACTION: delegate_file_task(ollama:llama3, create src/main.rs)",
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target, "ollama:llama3");
+        assert_eq!(found[0].prompt, "create src/main.rs");
+        assert!(found[0].allow_writes);
+
+        let text_only =
+            SwarmLedger::parse_delegations("ACTION: delegate_task(ollama:llama3, review it)");
+        assert_eq!(text_only.len(), 1);
+        assert!(!text_only[0].allow_writes);
     }
 
     #[test]
@@ -1783,6 +1852,7 @@ mod tests {
         assert!(SwarmLedger::parse_delegations("ACTION: delegate_task(no-comma)").is_empty());
         assert!(SwarmLedger::parse_delegations("ACTION: delegate_task(a, )").is_empty());
         assert!(SwarmLedger::parse_delegations("ACTION: delegate_task(, prompt)").is_empty());
+        assert!(SwarmLedger::parse_delegations("ACTION: delegate_file_task(no-comma)").is_empty());
     }
 
     #[test]

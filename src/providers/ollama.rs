@@ -162,6 +162,10 @@ impl Provider for OllamaProvider {
     fn is_remote(&self) -> bool {
         !is_loopback_host(&self.host)
     }
+
+    fn requires_subagent_tool_guardrails(&self) -> bool {
+        false
+    }
 }
 
 /// True only when `host` is a URL whose host component resolves to loopback:
@@ -190,6 +194,16 @@ pub(crate) fn is_loopback_host(host: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_skips_agentic_cli_guardrails() {
+        let provider = OllamaProvider::new(
+            "http://127.0.0.1:11434",
+            "llama3.2:3b",
+            reqwest::Client::new(),
+        );
+        assert!(!provider.requires_subagent_tool_guardrails());
+    }
 
     #[test]
     fn extracts_ollama_prompt_and_generated_token_counts() {

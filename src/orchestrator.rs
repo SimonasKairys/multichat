@@ -105,10 +105,12 @@ fn commander_preamble(primary: &str, roster: &[String]) -> Option<String> {
          3. DELEGATE, once the plan has been agreed. Hand each piece to the cheapest \
          capable model with `ACTION: delegate_task(<label>, <self-contained \
          prompt>)`, then stop and say what you delegated; results reach you on your \
-         NEXT turn. A sub-agent can create and edit project files, so \"build X\" is \
-         delegated like anything else: tell it exactly which files to write and what \
-         each must contain. Give one file, or one coherent group of files, per \
-         delegation. Keep only judgement and synthesis for yourself.\n\
+         NEXT turn. Use `ACTION: delegate_file_task(<label>, <self-contained prompt>)` \
+         instead when the task must create or edit project files; only that explicit \
+         form gives the worker the file-write protocol and permits its write blocks \
+         to execute. Tell it exactly which files to write and what each must contain. \
+         Give one file, or one coherent group of files, per delegation. Keep only \
+         judgement and synthesis for yourself.\n\
          If the user asks to hear from every connected model, emit every required \
          delegation in this reply (up to the 10-delegation safety cap). There is no \
          automatic continuation turn, so never promise to query omitted models later.\n\
@@ -280,11 +282,13 @@ pub enum Event {
 /// reaches an `Event::ActivityProgress`. Progress belongs in a one-line status area,
 /// unlike delegated task text, which lives in the scrollable transcript and is kept
 /// complete.
-/// The directive prepended to a delegated task's prompt before it is sent.
+/// Builds the directive prepended to a delegated task's prompt before it is sent.
 ///
 /// Symmetric with `commander_preamble` and for the same underlying reason: an
 /// agentic CLI has its own ideas about how to work, and the only lever simon has over
-/// them is the text of the turn.
+/// them is the text of the turn. Plain completion providers skip those irrelevant
+/// tool warnings; a small local model was observed following the warning instead of
+/// its greeting task.
 ///
 /// A sub-agent's reply is the ENTIRE result that reaches simon — there is no second
 /// round trip in which to collect anything it deferred. Left to itself, `agy` will
@@ -313,34 +317,53 @@ pub enum Event {
 /// permission checking is out of the way — four such files were observed appearing
 /// during delegations simon had recorded as *failed*. Skipping permissions would make
 /// that worse, not better. Keeping the sub-agent to permission-free tools and routing
-/// every file it produces back through simon's own write protocol closes that hole:
-/// the write is plain text in the reply, so it lands on simon's side of the gate.
-fn subagent_preamble() -> &'static str {
-    "[sub-agent] Complete this task fully in THIS reply. Do not dispatch, launch, or \
-     delegate to a subagent of your own, and do not answer that you are waiting on \
-     one: your reply is the entire result that reaches the requester, so anything you \
-     defer is lost. If you genuinely cannot finish, say what you found and what \
-     blocked you.\n\
-     Do not run any shell, terminal, or command-line tool for any reason. This \
-     includes running or executing code to check that it works, and inspecting git \
-     history or git log. You are running non-interactively with nobody present to \
-     approve a command, so any attempt to run one is refused and fails this task — \
-     do not try, even once, even to verify something you already wrote.\n\
-     Do not use your own file-writing or file-editing tools either, for the same \
-     reason: a file written that way is invisible to this system and to the user, is \
-     not recorded anywhere, and does not count as this task being done, even if the \
-     tool call itself appears to succeed.\n\
-     Reading files and listing directories needs no permission and is fine to use \
-     freely. Prefer listing a directory to searching across one: a project-wide \
-     search is slow enough to time out on its own, and on a task that starts from an \
-     empty or nearly empty folder it has nothing to find anyway.\n\
-     If this task is to CREATE or EDIT a file, the only way that file actually \
-     reaches the project is to emit it as plain text in your reply, using the marker \
-     that opens a write block followed by the path in parentheses, then the file's \
-     complete final content, then the matching end-of-file marker — one such block \
-     per file. Describing a file, or quoting it in prose outside such a block, writes \
-     nothing.\n\
-     --- the task follows ---\n"
+/// explicitly requested files back through simon's own write protocol closes that
+/// hole: the write is plain text in the reply, so it lands on simon's side of the
+/// gate.
+fn subagent_preamble(requires_tool_guardrails: bool, allow_writes: bool) -> String {
+    let mut out = String::from(
+        "[sub-agent] Complete this task fully in THIS reply. Do not dispatch, launch, \
+         or delegate to a subagent of your own, and do not answer that you are waiting \
+         on one: your reply is the entire result that reaches the requester, so \
+         anything you defer is lost. If you genuinely cannot finish, say what you \
+         found and what blocked you.\n",
+    );
+
+    if requires_tool_guardrails {
+        out.push_str(
+            "Do not run any shell, terminal, or command-line tool for any reason. This \
+             includes running or executing code to check that it works, and inspecting \
+             git history or git log. You are running non-interactively with nobody \
+             present to approve a command, so any attempt to run one is refused and \
+             fails this task — do not try, even once, even to verify something you \
+             already wrote.\n\
+             Do not use your own file-writing or file-editing tools either, for the \
+             same reason: a file written that way is invisible to this system and to \
+             the user, is not recorded anywhere, and does not count as this task being \
+             done, even if the tool call itself appears to succeed.\n\
+             Reading files and listing directories needs no permission and is fine to \
+             use freely. Prefer listing a directory to searching across one: a \
+             project-wide search is slow enough to time out on its own, and on a task \
+             that starts from an empty or nearly empty folder it has nothing to find \
+             anyway.\n",
+        );
+    }
+
+    if allow_writes {
+        out.push_str(
+            "This task explicitly allows project-file writes. The only way a file \
+             reaches the project is to emit it as plain text using the file-write \
+             protocol in the system prompt. Do not use your own file-writing tools.\n",
+        );
+    } else {
+        out.push_str(
+            "This is a text-only task. Do not create or edit files, emit any ACTION \
+             line, or invent a file as a way to answer; reply only with the requested \
+             prose.\n",
+        );
+    }
+    out.push_str("--- the task follows ---\n");
+    out
 }
 
 /// The user's answer to a pending write request.
@@ -2300,7 +2323,7 @@ impl Orchestrator {
         self.run_file_writes(&primary_label, writes).await;
     }
 
-    /// Executes any `delegate_task` lines the primary emitted.
+    /// Executes any `delegate_task` or `delegate_file_task` lines the primary emitted.
     ///
     /// Sub-agent replies are not themselves scanned for delegations, so the swarm
     /// cannot recurse indefinitely.
@@ -2356,13 +2379,17 @@ impl Orchestrator {
             // A delegated task is intentionally isolated from the shared ledger.
             // Besides matching the protocol's documented contract ("its prompt is
             // all it gets"), this prevents a later worker in the same batch from
-            // copying an earlier worker's identity or result. The scoped prompt still
-            // carries the file-write protocol, the only sub-agent action executed
-            // below.
-            let system = SwarmLedger::subagent_system_prompt(&target_label);
+            // copying an earlier worker's identity or result. Only an explicit
+            // `delegate_file_task` receives the file-write protocol.
+            let system =
+                SwarmLedger::subagent_system_prompt(&target_label, delegation.allow_writes);
             // Only what is sent is augmented; the ledger and the TUI keep the
             // commander's own wording, the same split `commander_preamble` uses.
-            let effective_task = format!("{}{}", subagent_preamble(), delegation.prompt);
+            let preamble = subagent_preamble(
+                target.requires_subagent_tool_guardrails(),
+                delegation.allow_writes,
+            );
+            let effective_task = format!("{preamble}{}", delegation.prompt);
             let started = Instant::now();
             let mut attempts = 1;
             let outcome = loop {
@@ -2374,7 +2401,23 @@ impl Orchestrator {
                         if reply.text.trim().is_empty() {
                             Err(anyhow!("{target_label} produced no output"))
                         } else {
-                            Ok(reply)
+                            let (parsed_writes, sub_text) =
+                                SwarmLedger::parse_file_writes(&reply.text);
+                            let sub_writes = if delegation.allow_writes {
+                                parsed_writes
+                            } else {
+                                Vec::new()
+                            };
+                            if sub_text.trim().is_empty() && sub_writes.is_empty() {
+                                // A malformed unterminated write block is removed by
+                                // the parser so its swallowed content cannot execute
+                                // as another action. Validate the usable result, not
+                                // only the raw response, or that safe removal turns a
+                                // non-empty model reply into a blank "success".
+                                Err(anyhow!("{target_label} produced no usable output"))
+                            } else {
+                                Ok((reply, sub_writes, sub_text))
+                            }
                         }
                     });
                 // Drops the sink, closing the forwarding task's channel — see
@@ -2416,7 +2459,7 @@ impl Orchestrator {
                 .await;
             };
             match outcome {
-                Ok(reply) => {
+                Ok((reply, sub_writes, sub_text)) => {
                     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     self.emit(Event::UsageUpdated {
                         label: target_label.clone(),
@@ -2428,19 +2471,26 @@ impl Orchestrator {
                         self.ledger.update_budget(&target_label, &budget);
                     }
                     // A sub-agent's reply IS scanned for write blocks — and for
-                    // nothing else. That asymmetry is the whole design: the bound on
-                    // the swarm is that a sub-agent cannot *delegate*, read a skill,
-                    // or read/list files, so no reply can spawn more work. A write
-                    // spawns nothing. Without this a swarm could only ever describe a
-                    // project it had been asked to build, because the commander is the
-                    // one told to hand authoring off and the author could not write.
+                    // nothing else. Only `delegate_file_task` keeps and executes
+                    // those blocks; a regular text delegation strips them. That
+                    // asymmetry bounds the swarm: a sub-agent cannot delegate, read a
+                    // skill, or read/list files, so no reply can spawn more work. A
+                    // permitted write spawns nothing.
                     //
                     // Safe to allow only because every write still passes the same two
                     // gates a commander's does: `Workspace`'s path hardening, and the
                     // user's explicit approval, which now names the sub-agent as the
                     // one asking.
-                    let (sub_writes, sub_text) = SwarmLedger::parse_file_writes(&reply.text);
+                    let write_count = sub_writes.len();
                     self.run_file_writes(&target_label, sub_writes).await;
+                    let sub_text = if sub_text.trim().is_empty() {
+                        format!(
+                            "Submitted {write_count} file write request{}.",
+                            if write_count == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        sub_text
+                    };
 
                     // Record the reply on the task before flipping it to Done, so the
                     // ledger shown to the delegating model on its next turn carries
@@ -2969,6 +3019,9 @@ mod tests {
             &self.provider
         }
         fn is_remote(&self) -> bool {
+            false
+        }
+        fn requires_subagent_tool_guardrails(&self) -> bool {
             false
         }
     }
@@ -4230,8 +4283,8 @@ mod tests {
                 "delegated model did not receive its own identity: {system}"
             );
             assert!(
-                system.contains("### File write protocol"),
-                "delegated model lost the only action protocol it may use: {system}"
+                !system.contains("### File write protocol"),
+                "text-only delegation received irrelevant write instructions: {system}"
             );
             assert!(
                 !system.contains("## SWARM LEDGER")
@@ -4258,6 +4311,11 @@ mod tests {
                     && !prompt.contains(other_marker)
                     && !prompt.contains("COMMANDER-SECRET-MARKER"),
                 "delegated model received another turn's user context: {prompt}"
+            );
+            assert!(
+                prompt.contains("reply only with the requested prose")
+                    && !prompt.contains("Do not run any shell"),
+                "plain completion provider received agentic CLI guardrails: {prompt}"
             );
         }
     }
@@ -4602,6 +4660,206 @@ mod tests {
         assert_eq!(
             orch.ledger.tasks()[0].status,
             crate::swarm::TaskStatus::Failed
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unterminated_write_only_reply_is_not_reported_as_a_blank_success() {
+        // Captured from llama3.2:3b after prompt isolation: it returned an
+        // `ACTION: write_file(/welcome_message)` opener followed by the greeting but
+        // no `ACTION: end_file`. The safety parser correctly discarded that malformed
+        // block, but the orchestrator had validated only the raw response and then
+        // reported the stripped result as a successful zero-character answer.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "ollama:llama3.2:3b".into(),
+            Arc::new(ScriptedProvider {
+                provider: "ollama".into(),
+                model: "llama3.2:3b".into(),
+                reply: "ACTION: write_file(/welcome_message)\n\
+                        Hello! I am ollama:llama3.2:3b."
+                    .into(),
+            }),
+        );
+        let registry = Registry {
+            providers,
+            primary: "primary:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut orch = Orchestrator {
+            registry,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![5u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: false,
+        };
+
+        orch.run_delegations(
+            "primary:commander",
+            "ACTION: delegate_task(ollama:llama3.2:3b, greet the user)",
+        )
+        .await;
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::DelegationRetry { .. }))
+                .count(),
+            MAX_DELEGATION_ATTEMPTS - 1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Reply { .. })),
+            "a malformed reply must not become a blank successful answer"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Error(message) if message.contains("produced no usable output")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::DelegationFinished {
+                ok: false,
+                chars: 0,
+                ..
+            }
+        )));
+        assert_eq!(
+            orch.ledger.tasks()[0].status,
+            crate::swarm::TaskStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_valid_write_only_reply_gets_a_visible_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "worker:builder".into(),
+            Arc::new(ScriptedProvider {
+                provider: "worker".into(),
+                model: "builder".into(),
+                reply: "ACTION: write_file(greeting.txt)\n\
+                        hello\n\
+                        ACTION: end_file"
+                    .into(),
+            }),
+        );
+        let registry = Registry {
+            providers,
+            primary: "primary:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut orch = Orchestrator {
+            registry,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![6u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            approve_all: true,
+        };
+
+        orch.run_delegations(
+            "primary:commander",
+            "ACTION: delegate_file_task(worker:builder, create greeting.txt)",
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(project_dir.path().join("greeting.txt")).unwrap(),
+            "hello"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Reply { text, .. } if text == "Submitted 1 file write request."
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::DelegationFinished {
+                ok: true,
+                chars: 31,
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_text_only_delegation_cannot_execute_an_unrequested_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "worker:chat".into(),
+            Arc::new(ScriptedProvider {
+                provider: "worker".into(),
+                model: "chat".into(),
+                reply: "Hello from the worker.\n\
+                        ACTION: write_file(unrequested.txt)\n\
+                        should not land\n\
+                        ACTION: end_file"
+                    .into(),
+            }),
+        );
+        let registry = Registry {
+            providers,
+            primary: "primary:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let mut orch = Orchestrator {
+            registry,
+            ledger: SwarmLedger::new(),
+            audit: AuditLogger::with_key(paths.audit_log.clone(), vec![7u8; 32]).unwrap(),
+            skills: SkillsDir::new(paths.skills_dir.clone()).unwrap(),
+            workspace: Workspace::new(project_dir.path().to_path_buf()).unwrap(),
+            events: event_tx,
+            classified: false,
+            project_root: project_dir.path().to_path_buf(),
+            decisions: None,
+            // Even global auto-approval must not grant write capability to a
+            // text-only delegation.
+            approve_all: true,
+        };
+
+        orch.run_delegations(
+            "primary:commander",
+            "ACTION: delegate_task(worker:chat, greet the user)",
+        )
+        .await;
+
+        assert!(!project_dir.path().join("unrequested.txt").exists());
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Reply { text, .. } if text == "Hello from the worker."
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::FileWritten { .. }))
         );
     }
 
@@ -5542,7 +5800,7 @@ mod tests {
 
         orch.run_delegations(
             "ollama:llama3",
-            "ACTION: delegate_task(ollama:builder, build it)",
+            "ACTION: delegate_file_task(ollama:builder, build it)",
         )
         .await;
 
@@ -5825,6 +6083,7 @@ mod tests {
         // ...but bulk reading is still handed off, or the expensive model does the
         // very work delegation exists to avoid.
         assert!(preamble.contains("bulk reading is still work to hand off"));
+        assert!(preamble.contains("ACTION: delegate_file_task"));
     }
 
     #[test]
@@ -5906,7 +6165,7 @@ mod tests {
         // "Prefer not to" still leaves running the code to check it, or `git log` to
         // read history, as live options — both are real failures pulled from the
         // audit log, so the wording must refuse the tool, not just discourage it.
-        let preamble = subagent_preamble();
+        let preamble = subagent_preamble(true, false);
         assert!(preamble.contains("Do not run any shell, terminal, or command-line tool"));
         assert!(preamble.contains("running or executing code to check that it works"));
         assert!(preamble.contains("git history or git log"));
@@ -5917,7 +6176,7 @@ mod tests {
         // agy's own writer already errors while declaring permissions non-interactively,
         // and separately was observed writing files simon never saw or approved. Both
         // are closed by refusing the tool outright rather than merely preferring simon's.
-        let preamble = subagent_preamble();
+        let preamble = subagent_preamble(true, true);
         assert!(preamble.contains("Do not use your own file-writing or file-editing tools"));
         // A broad search timed out on an empty directory, failing the delegation.
         assert!(preamble.contains("Prefer listing a directory to searching across one"));
@@ -5926,13 +6185,17 @@ mod tests {
 
     #[test]
     fn subagent_preamble_still_tells_it_to_finish_in_turn_and_not_dispatch_a_subagent() {
-        let preamble = subagent_preamble();
-        assert!(preamble.contains("Complete this task fully in THIS reply"));
-        assert!(
-            preamble.contains("Do not dispatch, launch, or delegate to a subagent of your own")
-        );
-        assert!(preamble.contains("do not answer that you are waiting on"));
-        assert!(preamble.contains("say what you found and what blocked you"));
+        for preamble in [
+            subagent_preamble(true, false),
+            subagent_preamble(false, false),
+        ] {
+            assert!(preamble.contains("Complete this task fully in THIS reply"));
+            assert!(
+                preamble.contains("Do not dispatch, launch, or delegate to a subagent of your own")
+            );
+            assert!(preamble.contains("do not answer that you are waiting on"));
+            assert!(preamble.contains("say what you found and what blocked you"));
+        }
     }
 
     #[test]
@@ -5941,11 +6204,18 @@ mod tests {
         // a line that STARTS with the write-block marker opens a real block, so this
         // instructional text must never contain that marker at the start of a line
         // (mid-sentence is fine — the parser only checks a line's start).
-        for line in subagent_preamble().lines() {
-            assert!(
-                !line.trim().starts_with("ACTION: write_file("),
-                "preamble line would be parsed as a real write block: {line:?}"
-            );
+        for preamble in [
+            subagent_preamble(true, true),
+            subagent_preamble(true, false),
+            subagent_preamble(false, true),
+            subagent_preamble(false, false),
+        ] {
+            for line in preamble.lines() {
+                assert!(
+                    !line.trim().starts_with("ACTION: write_file("),
+                    "preamble line would be parsed as a real write block: {line:?}"
+                );
+            }
         }
     }
 

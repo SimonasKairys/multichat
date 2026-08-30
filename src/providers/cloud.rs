@@ -239,6 +239,10 @@ impl Provider for CloudProvider {
     fn is_remote(&self) -> bool {
         true
     }
+
+    fn requires_subagent_tool_guardrails(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +258,11 @@ mod tests {
             SecretString::from("test-key".to_string()),
             reqwest::Client::new(),
         )
+    }
+
+    #[test]
+    fn cloud_completion_providers_skip_agentic_cli_guardrails() {
+        assert!(!provider("openai").requires_subagent_tool_guardrails());
     }
 
     #[test]

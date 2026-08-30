@@ -200,6 +200,17 @@ pub trait Provider: Send + Sync {
     /// provider for which this is true.
     fn is_remote(&self) -> bool;
 
+    /// Whether delegated calls need the long non-interactive tool guardrails.
+    ///
+    /// Agentic CLI providers can launch shells, edit files, and delegate again, so
+    /// they need explicit restrictions in the user turn. Plain HTTP completion
+    /// providers have no such tools; giving a small model pages of irrelevant tool
+    /// warnings can make it follow those warnings instead of its actual task.
+    /// Unknown/custom implementations default to the conservative guarded behavior.
+    fn requires_subagent_tool_guardrails(&self) -> bool {
+        true
+    }
+
     /// Fully-qualified label, e.g. `anthropic:claude-opus-5`.
     fn label(&self) -> String {
         format!("{}:{}", self.provider_name(), self.model_name())

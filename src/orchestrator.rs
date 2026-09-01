@@ -1330,10 +1330,15 @@ pub(crate) fn which_on_path_in(name: &str, path_var: Option<std::ffi::OsString>)
     };
 
     for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(name);
-        if is_executable_file(&candidate) {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
+        // On Windows the `PATHEXT` candidates are tried *before* the bare name. npm's
+        // CLI shims — the usual way `claude` and its peers land on a Windows PATH —
+        // install an extensionless POSIX `claude` script (for Git Bash) right next to
+        // the `claude.cmd` Windows can actually run, and `is_executable_file` on
+        // Windows is only an `is_file` check, so the bare name used to win and hand
+        // `Command::new` a shell script `CreateProcess` rejects. The bare name stays
+        // as a last resort rather than being dropped: `CreateProcess` judges by PE
+        // format, not extension, so a genuinely extensionless executable still
+        // resolves when nothing with a `PATHEXT` extension shadows it.
         #[cfg(windows)]
         {
             for ext in &extensions {
@@ -1347,6 +1352,10 @@ pub(crate) fn which_on_path_in(name: &str, path_var: Option<std::ffi::OsString>)
                     return Some(candidate_ext.to_string_lossy().into_owned());
                 }
             }
+        }
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Some(candidate.to_string_lossy().into_owned());
         }
     }
     None
@@ -1470,10 +1479,18 @@ pub(crate) async fn probe_cloud_endpoint(
                 ))
             }
         }
+        // `is_connect` is tested before `is_timeout`: a connect timeout satisfies
+        // both, and it means the TCP handshake never completed — the endpoint is
+        // unreachable, whichever clock noticed first. The distinction is real on
+        // Windows, where a refused loopback port is retried by the socket stack
+        // long enough to trip the 2-second connect timeout, and the probe used to
+        // report "timed out" for an endpoint that was simply not there. "timed
+        // out" is reserved for endpoints that accepted the connection and then
+        // never answered.
+        Err(e) if e.is_connect() => Availability::Unavailable("endpoint unreachable".into()),
         Err(e) if e.is_timeout() => {
             Availability::Unavailable("authentication probe timed out".into())
         }
-        Err(e) if e.is_connect() => Availability::Unavailable("endpoint unreachable".into()),
         Err(_) => Availability::Unavailable("authentication probe request failed".into()),
     }
 }

@@ -46,6 +46,11 @@ impl RateLimit {
     }
 
     /// Extracts the common `x-ratelimit-*` / `anthropic-ratelimit-*` headers.
+    ///
+    /// Each kept value passes through [`bound_rate_limit_value`]: these strings are
+    /// server-controlled and flow verbatim into the TUI status line and the ledger's
+    /// resource-budget section, so they get the same bounded treatment as every other
+    /// piece of provider-controlled text (see `truncate_error_detail`).
     pub fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
         let get = |names: &[&str]| -> Option<String> {
             names.iter().find_map(|n| {
@@ -54,7 +59,7 @@ impl RateLimit {
                     .and_then(|v| v.to_str().ok())
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
+                    .map(bound_rate_limit_value)
             })
         };
         Self {
@@ -78,6 +83,26 @@ impl RateLimit {
                 "retry-after",
             ]),
         }
+    }
+}
+
+/// Ceiling on one rate-limit header value, in characters. A legitimate value is a
+/// short number ("9850"), duration ("59m59.9s"), or RFC 3339 timestamp (~25 chars),
+/// so 40 keeps every real value intact — while a malicious or buggy endpoint cannot
+/// stuff kilobytes into a header that is re-rendered on every status-line draw and
+/// injected into every model's system prompt via the ledger's budget section.
+const MAX_RATE_LIMIT_VALUE_CHARS: usize = 40;
+
+/// Bounds one rate-limit header value before it is stored on [`RateLimit`].
+///
+/// Control characters are stripped for the same reason `sanitize_progress_detail`
+/// strips them from status-line text: `HeaderValue::to_str` already rejects every
+/// control byte except `\t`, and that one must not reach a single-line render either.
+fn bound_rate_limit_value(raw: &str) -> String {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    match cleaned.char_indices().nth(MAX_RATE_LIMIT_VALUE_CHARS) {
+        Some((cut, _)) => format!("{}…", &cleaned[..cut]),
+        None => cleaned,
     }
 }
 
@@ -469,5 +494,39 @@ mod tests {
         assert_eq!(rl.tokens_remaining.as_deref(), Some("999"));
         assert!(rl.summary().unwrap().contains("999 tokens left"));
         assert!(rl.summary().unwrap().contains("resets in 45"));
+    }
+
+    #[test]
+    fn rate_limit_header_values_are_bounded_and_control_character_free() {
+        let mut headers = HeaderMap::new();
+        // A hostile endpoint stuffing a header: without the bound this whole string
+        // reached the status line on every draw and the ledger's budget section of
+        // every model's system prompt.
+        headers.insert(
+            "x-ratelimit-remaining-requests",
+            HeaderValue::from_str(&"9".repeat(500)).unwrap(),
+        );
+        // `\t` is the one control byte `HeaderValue::to_str` admits; it must not
+        // survive into single-line renders.
+        headers.insert("retry-after", HeaderValue::from_str("59\tm").unwrap());
+        // A realistic value must pass through untouched.
+        headers.insert(
+            "anthropic-ratelimit-tokens-remaining",
+            HeaderValue::from_static("2026-09-01T12:00:00Z"),
+        );
+
+        let rl = RateLimit::from_headers(&headers);
+        let requests = rl.requests_remaining.expect("requests header kept");
+        assert_eq!(
+            requests.chars().count(),
+            MAX_RATE_LIMIT_VALUE_CHARS + 1,
+            "bounded to the cap plus the ellipsis: {requests}"
+        );
+        assert!(
+            requests.ends_with('…'),
+            "truncation is announced: {requests}"
+        );
+        assert_eq!(rl.reset_after.as_deref(), Some("59m"));
+        assert_eq!(rl.tokens_remaining.as_deref(), Some("2026-09-01T12:00:00Z"));
     }
 }

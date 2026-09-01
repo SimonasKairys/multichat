@@ -368,8 +368,40 @@ pub async fn execute_command(
             child_command.env(name, value);
         }
     }
+    // Windows toolchains cannot work from an empty environment. rustc locates the
+    // MSVC linker through vswhere under `ProgramFiles(x86)` and the registry via
+    // COM, both of which resolve through these system-installation variables, and
+    // process creation itself leans on `SystemRoot` and `ComSpec`. Scrubbing them
+    // made every `cargo test` in a task copy die with "linker `link.exe` not
+    // found" before the fixture's own tests ever ran. They name machine-wide
+    // install locations, not user data — nothing here is a secret.
+    #[cfg(windows)]
+    for name in [
+        "SYSTEMROOT",
+        "WINDIR",
+        "SYSTEMDRIVE",
+        "COMSPEC",
+        "PATHEXT",
+        "PROGRAMFILES",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "PROGRAMDATA",
+        "ALLUSERSPROFILE",
+        "COMMONPROGRAMFILES",
+        "CommonProgramFiles(x86)",
+        "CommonProgramW6432",
+    ] {
+        if let Some(value) = inherited_non_secret(name) {
+            child_command.env(name, value);
+        }
+    }
+    // The child's HOME/USERPROFILE point at the scratch runtime, so a rustup
+    // proxy in the child would look for toolchains under the scratch directory
+    // and find none. Resolve the parent's real home here — `HOME` on unix,
+    // `USERPROFILE` on Windows, where `HOME` is usually not set at all — and
+    // hand the proxy its real toolchain store explicitly.
     if std::env::var_os("RUSTUP_HOME").is_none()
-        && let Some(home) = std::env::var_os("HOME")
+        && let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
     {
         let default_rustup = PathBuf::from(home).join(".rustup");
         if default_rustup.is_dir() {
@@ -602,6 +634,9 @@ mod tests {
         tempdir().unwrap()
     }
 
+    // Every consumer is a unix-gated executor test; without the matching gate the
+    // helper is dead code on Windows and `-D warnings` turns that into a red gate.
+    #[cfg(unix)]
     fn generous_quota() -> CopyQuota {
         CopyQuota {
             max_regular_file_bytes: u64::MAX,
@@ -615,10 +650,17 @@ mod tests {
         let root = root();
         let cargo =
             validate_command(&["cargo".into(), "test".into()], root.path(), root.path()).unwrap();
-        assert_eq!(
-            cargo.program.file_name().and_then(|name| name.to_str()),
-            Some("cargo"),
-            "rustup-style proxies must keep the invoked cargo basename"
+        // `file_stem`, compared case-insensitively: Windows resolution appends a
+        // PATHEXT extension whose case follows the PATHEXT entry (`cargo.EXE`),
+        // and the basename check must not fail on either count.
+        assert!(
+            cargo
+                .program
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("cargo")),
+            "rustup-style proxies must keep the invoked cargo basename, got {:?}",
+            cargo.program
         );
         assert!(
             validate_command(

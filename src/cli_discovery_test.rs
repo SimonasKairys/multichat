@@ -77,3 +77,30 @@ fn test_which_on_path_finds_executable_with_extension_on_windows() {
         "expected found path to end with claude.exe, got {found_path}"
     );
 }
+
+#[cfg(windows)]
+#[test]
+fn which_on_path_prefers_pathext_match_over_extensionless_npm_shim_on_windows() {
+    // npm installs three shims side by side: an extensionless POSIX `claude` script
+    // (for Git Bash), `claude.cmd`, and `claude.ps1`. `CreateProcess` cannot run the
+    // POSIX script, so discovery must hand back the `.cmd` even though the bare file
+    // matches the name exactly.
+    let temp = tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("claude"),
+        "#!/bin/sh\nexec node claude.js \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        temp.path().join("claude.cmd"),
+        "@echo off\r\nnode claude.js %*\r\n",
+    )
+    .unwrap();
+
+    let found = which_on_path_in("claude", Some(temp.path().as_os_str().to_os_string()))
+        .expect("discovery must find the shim pair");
+    assert!(
+        found.to_ascii_lowercase().ends_with("claude.cmd"),
+        "expected the spawnable claude.cmd, got the unspawnable {found}"
+    );
+}

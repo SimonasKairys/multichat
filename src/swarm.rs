@@ -462,7 +462,21 @@ fn truncate_tail_chars(content: &str, cap: usize) -> String {
 
 /// Splits a `foo, bar, baz(qux, quux)`-style action argument list on top-level
 /// commas only, respecting quoted strings and nested parentheses. Returns `None`
-/// for malformed input (unterminated quote, unmatched parenthesis).
+/// for malformed input (an unmatched parenthesis).
+///
+/// The quote rules here deliberately mirror `action_argument`'s, because the two
+/// scanners read the same text and every past divergence between them silently
+/// dropped a delegation: `action_argument` would accept a line, this splitter
+/// would read its quotes differently, fail, and the action vanished without a
+/// trace. A quote opens only at the start of a field and only when a matching
+/// close quote still exists later — an apostrophe or a stray quote in prose is
+/// content, not structure. A `\` before the quote character escapes it only when
+/// this quote is not the first field's close and a later quote can still close
+/// the field; otherwise the backslash is a literal (a Windows path separator)
+/// and the quote closes. The tests named
+/// `an_unterminated_quoted_argument_still_parses_as_prose` and
+/// `a_backslash_before_a_quote_and_delimiter_closes_the_quote_for_the_whole_line`
+/// are the witnesses.
 fn split_top_level_fields(inner: &str) -> Option<Vec<String>> {
     split_top_level_fields_limited(inner, usize::MAX)
 }
@@ -472,28 +486,37 @@ fn split_top_level_fields_limited(inner: &str, max_fields: usize) -> Option<Vec<
     let mut current = String::new();
     let mut depth = 0usize;
     let mut in_quote: Option<char> = None;
-    let mut escaped = false;
     let mut at_field_start = true;
+    let mut chars = inner.char_indices().peekable();
 
-    for c in inner.chars() {
+    while let Some((i, c)) = chars.next() {
         if let Some(quote) = in_quote {
             current.push(c);
-            if escaped {
-                escaped = false;
-                continue;
-            }
             if c == '\\' {
-                escaped = true;
-                continue;
-            }
-            if c == quote {
+                if let Some(&(qi, next_char)) = chars.peek()
+                    && next_char == quote
+                {
+                    let after_quote = &inner[qi + next_char.len_utf8()..];
+                    let closes_first_field =
+                        fields.is_empty() && after_quote.trim_start().starts_with(',');
+                    let has_later_field_closing_quote =
+                        after_quote.match_indices(quote).any(|(offset, _)| {
+                            let following = after_quote[offset + quote.len_utf8()..].trim_start();
+                            following.starts_with(',') || following.is_empty()
+                        });
+                    if !closes_first_field && has_later_field_closing_quote {
+                        let (_, escaped_quote) = chars.next().expect("peeked");
+                        current.push(escaped_quote);
+                    }
+                }
+            } else if c == quote {
                 in_quote = None;
             }
             continue;
         }
 
         match c {
-            '"' | '\'' if at_field_start => {
+            '"' | '\'' if at_field_start && inner[i + c.len_utf8()..].contains(c) => {
                 in_quote = Some(c);
                 current.push(c);
                 at_field_start = false;
@@ -1599,6 +1622,17 @@ impl SwarmLedger {
     /// stops at the parenthesis that actually closes the call and ignores the rest of
     /// the line, which also settles the one-action-per-line question the same way
     /// `strip_prefix` already settles it.
+    ///
+    /// Quotes open only where an argument can start — the head of the argument list
+    /// or right after a top-level `,` — and only when a matching close quote still
+    /// exists later in the line. Both guards exist because the first quote-aware
+    /// version of this scanner entered quote mode on *any* `'` or `"`, so an ordinary
+    /// apostrophe (`delegate_task(worker, summarize the user's login flow)`) consumed
+    /// the rest of the line including the closing parenthesis, and the whole action
+    /// was silently dropped. Prose contractions are near-inevitable in prompts, so
+    /// this fired in routine operation; worse, an `ACTION: write_file(...)` open line
+    /// dropped this way un-fenced its block, and content lines written to be *stored*
+    /// were parsed as actions to *execute*.
     fn action_argument<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
         let trimmed = line
             .trim()
@@ -3421,5 +3455,81 @@ mod tests {
         assert_eq!(found2.len(), 1, "Case 2 should find 1 delegation");
         assert_eq!(found2[0].target, "worker");
         assert_eq!(found2[0].prompt, "Check smile :(");
+    }
+
+    #[test]
+    fn reproduction_test_apostrophe_in_unquoted_prose_does_not_swallow_the_action() {
+        // The preamble's own documented form: unquoted arguments. An English
+        // contraction must not read as an opening quote that eats the closing paren.
+        let reply = "ACTION: delegate_task(worker, Summarize the user's login flow)";
+        let found = SwarmLedger::parse_delegations(reply);
+        assert_eq!(
+            found.len(),
+            1,
+            "an apostrophe in prose silently dropped the whole delegation"
+        );
+        assert_eq!(found[0].target, "worker");
+        assert_eq!(found[0].prompt, "Summarize the user's login flow");
+
+        // Quoted prose *inside* an unquoted argument is content, not structure.
+        let quoted_aside = "ACTION: delegate_task(worker, say \"hello world\" politely)";
+        let found = SwarmLedger::parse_delegations(quoted_aside);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].prompt, "say \"hello world\" politely");
+    }
+
+    #[test]
+    fn reproduction_test_apostrophe_in_write_file_path_keeps_its_block_fenced() {
+        // When the open line was dropped, the block was never recognised and its
+        // *content* — including action-shaped lines meant to be stored — leaked into
+        // the stripped text that the delegation parser then executes for real.
+        let reply = "ACTION: write_file(user's notes.txt)\n\
+                     ACTION: delegate_task(worker, run this)\n\
+                     ACTION: end_file";
+        let (writes, stripped) = SwarmLedger::parse_file_writes(reply);
+        assert_eq!(
+            writes.len(),
+            1,
+            "the write_file block must be recognised despite the apostrophe"
+        );
+        assert_eq!(writes[0].path, "user's notes.txt");
+        assert_eq!(writes[0].content, "ACTION: delegate_task(worker, run this)");
+        assert!(
+            SwarmLedger::parse_delegations(&stripped).is_empty(),
+            "file content must never execute as a delegation: {stripped}"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_quoted_argument_still_parses_as_prose() {
+        // A quote that opens an argument but never closes must not discard the
+        // action. The scanner and the field splitter both refuse to open a quote
+        // that nothing later closes, so the stray quote reads as prose and the
+        // balanced-paren rule still finds the call's end.
+        let reply = "ACTION: delegate_task(worker, \"it's fine)";
+        let found = SwarmLedger::parse_delegations(reply);
+        assert_eq!(found.len(), 1, "unterminated quote dropped the delegation");
+        assert_eq!(found[0].target, "worker");
+        assert_eq!(found[0].prompt, "it's fine");
+    }
+
+    #[test]
+    fn a_backslash_before_a_quote_and_delimiter_closes_the_quote_for_the_whole_line() {
+        // Pins the first-argument half of the escaped-quote rule (`\"` before `,`
+        // closes a first argument; the backslash is a literal path separator, not an
+        // escape). Its failure is observable only when a later quoted argument holds
+        // a parenthesis or comma: treating the close as an escape leaves the scanner
+        // inside the first quote, the second argument's opening quote reads as the
+        // first one's close, and the structure comes apart. Both `action_argument`
+        // and `split_top_level_fields_limited` must agree on this reading — when
+        // they diverged, the scanner accepted the line and the splitter dropped it.
+        let reply = "ACTION: delegate_task(\"dir\\\", \"step 1) go\")";
+        let found = SwarmLedger::parse_delegations(reply);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].target, "dir\\");
+        assert_eq!(
+            found[0].prompt, "step 1) go",
+            "the escaped-quote heuristic must close the first quote at its delimiter"
+        );
     }
 }

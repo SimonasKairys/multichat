@@ -1,6 +1,11 @@
 $ErrorActionPreference = 'Stop'
 
 $tree = cargo tree -d --locked
+if ($LASTEXITCODE -ne 0) {
+    # A native command failing does not trip $ErrorActionPreference; without this
+    # guard an empty $tree reads as "no duplicates" and the check silently passes.
+    throw "cargo tree failed with exit code ${LASTEXITCODE}; cannot audit crossterm versions"
+}
 $versions = @(
     $tree |
         Select-String -Pattern '^crossterm v([0-9]+\.[0-9]+\.[0-9]+)' |

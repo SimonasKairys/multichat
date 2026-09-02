@@ -645,6 +645,28 @@ mod tests {
         }
     }
 
+    // The executor tests need a real binary to spawn, and where a given unix keeps
+    // one is not fixed: `sleep` is /usr/bin/sleep on Linux and /bin/sleep on macOS.
+    // Hardcoding either spelling meant the test failed with a bare ENOENT on the
+    // other platform, which reads like a bug in the executor rather than a bad
+    // fixture. Search the same directories the executor puts on the child's PATH.
+    #[cfg(unix)]
+    const TOOL_DIRS: [&str; 4] = ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"];
+
+    #[cfg(unix)]
+    fn tool(name: &str) -> PathBuf {
+        TOOL_DIRS
+            .iter()
+            .map(|dir| PathBuf::from(dir).join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| panic!("`{name}` is not in any of {TOOL_DIRS:?}"))
+    }
+
+    #[cfg(unix)]
+    fn tool_path() -> OsString {
+        std::env::join_paths(TOOL_DIRS.iter().map(PathBuf::from)).unwrap()
+    }
+
     #[test]
     fn permits_cargo_test_and_rejects_shells_and_dangerous_subcommands() {
         let root = root();
@@ -736,8 +758,8 @@ mod tests {
         let root = root();
         let command = ValidatedCommand {
             argv: vec!["false".into()],
-            program: PathBuf::from("/usr/bin/false"),
-            child_path: OsString::from("/usr/bin:/bin"),
+            program: tool("false"),
+            child_path: tool_path(),
         };
         let result = execute_command(
             &command,
@@ -756,8 +778,8 @@ mod tests {
         let root = root();
         let command = ValidatedCommand {
             argv: vec!["sleep".into(), "30".into()],
-            program: PathBuf::from("/usr/bin/sleep"),
-            child_path: OsString::from("/usr/bin:/bin"),
+            program: tool("sleep"),
+            child_path: tool_path(),
         };
         let result = execute_command(
             &command,
@@ -779,8 +801,8 @@ mod tests {
         fs::write(root.path().join("large.bin"), [0u8; 16]).unwrap();
         let command = ValidatedCommand {
             argv: vec!["sleep".into(), "30".into()],
-            program: PathBuf::from("/usr/bin/sleep"),
-            child_path: OsString::from("/usr/bin:/bin"),
+            program: tool("sleep"),
+            child_path: tool_path(),
         };
 
         let result = execute_command(

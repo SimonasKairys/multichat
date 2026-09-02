@@ -1,0 +1,147 @@
+name: mutation audit
+
+# The gate in ci.yml is `--in-diff`: it stops the mutation backlog growing, and by
+# construction it never measures anything that is not being touched. Untouched
+# orchestrator, provider, and security paths are therefore not covered by any number at
+# all, and the last full-crate figure in docs/progress/23 (~953 mutants) was months old
+# and, by that document's own admission, "not recently re-measured". Nobody knew the
+# real score.
+#
+# So this job measures, and does not gate. It is scheduled, not on push; it does not
+# block a merge; and its only output is a number written where the claim lives. A
+# blocking full-crate run would fail on day one against a pre-existing backlog, and the
+# thing people do with a job that is always red is ignore it — which is how the diff
+# gate came to be the only one in the first place.
+
+on:
+  schedule:
+    # Sunday 03:00 UTC. The run takes hours; nothing waits on it.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  full-crate:
+    name: full-crate mutation score
+    runs-on: ubuntu-latest
+    env:
+      # Same reason as the gating job: with `-D warnings`, a mutant that stubs a
+      # function to `Ok(())` leaves its parameters unused and fails to compile, so
+      # cargo-mutants files it as "unviable" instead of "missed" — silently discarding
+      # the most valuable class of mutant while the report still looks healthy.
+      RUSTFLAGS: ""
+    # The last measured full run was ~3.5 hours. The ceiling is generous because a run
+    # that is killed mid-way produces no number, which is the state this job exists to
+    # end.
+    timeout-minutes: 420
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Measure the whole crate
+        id: measure
+        run: |
+          # `|| true`: a missed mutant is the expected finding here, not a failure. The
+          # job fails only if cargo-mutants cannot run at all, which the outcome parse
+          # below detects.
+          cargo mutants --jobs 2 --timeout 120 2>&1 | tee mutants.log || true
+
+          summary=$(grep -E "^[0-9]+ mutants tested" mutants.log | tail -1)
+          if [ -z "$summary" ]; then
+            summary=$(tail -5 mutants.log | tr '\n' ' ')
+          fi
+          missed=$(wc -l < mutants.out/missed.txt 2>/dev/null || echo 0)
+          caught=$(wc -l < mutants.out/caught.txt 2>/dev/null || echo 0)
+          unviable=$(wc -l < mutants.out/unviable.txt 2>/dev/null || echo 0)
+          timeout=$(wc -l < mutants.out/timeout.txt 2>/dev/null || echo 0)
+          total=$((missed + caught + unviable + timeout))
+
+          if [ "$total" -eq 0 ]; then
+            echo "cargo-mutants produced no results at all; the measurement failed"
+            tail -40 mutants.log
+            exit 1
+          fi
+
+          {
+            echo "summary=$summary"
+            echo "missed=$missed"
+            echo "caught=$caught"
+            echo "unviable=$unviable"
+            echo "timeout=$timeout"
+            echo "total=$total"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Keep the missed list
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out/
+          retention-days: 90
+
+      - name: File the number where the claim lives
+        uses: actions/github-script@v7
+        env:
+          MISSED: ${{ steps.measure.outputs.missed }}
+          CAUGHT: ${{ steps.measure.outputs.caught }}
+          UNVIABLE: ${{ steps.measure.outputs.unviable }}
+          TIMEOUT: ${{ steps.measure.outputs.timeout }}
+          TOTAL: ${{ steps.measure.outputs.total }}
+        with:
+          script: |
+            const { MISSED, CAUGHT, UNVIABLE, TIMEOUT, TOTAL } = process.env;
+            const date = new Date().toISOString().slice(0, 10);
+            const body = [
+              `Full-crate mutation run, ${date}.`,
+              '',
+              `- total: ${TOTAL}`,
+              `- caught: ${CAUGHT}`,
+              `- **missed: ${MISSED}**`,
+              `- unviable: ${UNVIABLE}`,
+              `- timeout: ${TIMEOUT}`,
+              '',
+              'The per-mutant lists are in the `mutants-out` artifact on this run.',
+              '',
+              'Update `docs/progress/23_mutation_debt.md` with these numbers. A missed',
+              'mutant is a line the suite executes without checking; the diff gate in',
+              '`ci.yml` stops new ones, and this run is the only thing that says how',
+              'many old ones remain.',
+            ].join('\n');
+
+            // One rolling issue, not one per week: a new issue every Sunday is a feed
+            // nobody reads, and the question being answered ("what is the score today")
+            // has exactly one current answer.
+            const title = 'Full-crate mutation score';
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'mutation-audit',
+            });
+
+            if (existing.data.length > 0) {
+              const number = existing.data[0].number;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['mutation-audit'],
+              });
+            }

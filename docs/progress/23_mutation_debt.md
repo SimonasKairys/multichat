@@ -1,11 +1,13 @@
 # Mutation Coverage Debt
 
-CI gates changed lines. Full crate: ~953 mutants / ~3.5h, not recently re-measured.
+CI gates changed lines. `mutation-audit.yml` re-measures the crate weekly and files
+the score in an issue: measured, not remembered.
 
-2026-08-26 accumulated audit diff: 107 tested, 97 caught, 9 unviable, 1 equivalent
-survivor. This is diff evidence, not full-module coverage.
+Full crate: ~953 mutants / ~3.5h (2026-08); awaiting the first scheduled run.
 
-Remaining debt includes untouched provider/orchestrator/security paths and historical
-vault branches. `Credentials::*` is skipped where runners lack a keyring.
+2026-08-26 audit diff: 107 tested, 97 caught, 9 unviable, 1 survivor.
 
-Unset `RUSTFLAGS`: `-D warnings` can hide stub mutants as unviable.
+Debt: untouched provider/orchestrator/security paths, old vault branches.
+`restrict_to_owner` left it (see `config.rs`).
+
+Unset `RUSTFLAGS`: `-D warnings` hides stubs as unviable.

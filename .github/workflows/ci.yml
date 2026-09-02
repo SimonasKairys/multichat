@@ -122,12 +122,19 @@ jobs:
     # guard deleted. Both were found by hand, by removing the fix and re-running. This
     # job does the same thing mechanically.
     #
-    # Scoped to the diff, not the crate. A full run is 953 mutants and about 3.6 hours,
-    # and it would fail on day one: `src/config.rs` alone has 9 missed out of 27,
-    # including `restrict_to_owner -> Ok(())` — deleting the permission restriction
-    # entirely is caught by nothing. Those are worth fixing, but blocking every push on
-    # a pre-existing backlog would only teach people to ignore a red job. Requiring it
-    # of *changed* lines stops the backlog growing.
+    # Scoped to the diff, not the crate. A full run was 953 mutants and about 3.6 hours
+    # when it was last measured, and it would fail on day one: `src/config.rs` alone had
+    # 9 missed out of 27. Those are worth fixing, but blocking every push on a
+    # pre-existing backlog would only teach people to ignore a red job. Requiring it of
+    # *changed* lines stops the backlog growing.
+    #
+    # This comment used to cite `restrict_to_owner -> Ok(())` — deleting the data
+    # directory's permission tightening — as an example of a mutant caught by nothing.
+    # It has been caught since `config::tests::the_data_directory_is_tightened_to_owner
+    # _only` was written, and the comment stayed wrong for months, which is the same
+    # drift `posture_proofs_test` now guards the README against. The backlog is
+    # re-measured by `.github/workflows/mutation-audit.yml` rather than described from
+    # memory here.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

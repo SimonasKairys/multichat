@@ -18,7 +18,13 @@
 *.pem
 *.key
 vault.enc
+# Transcripts moved aside after a lock-out are still ciphertext, but they are
+# still the user's transcripts.
+vault.enc.locked*
 audit.log
+
+# Local premortem log: planning notes, not part of the crate.
+/.premortem/
 
 # Databases
 *.db

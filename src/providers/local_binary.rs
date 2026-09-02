@@ -1596,13 +1596,20 @@ mod tests {
     async fn with_project_root_reroots_a_cloned_provider_without_mutating_the_original() {
         let original_root = tempfile::tempdir().unwrap();
         let rerooted_root = tempfile::tempdir().unwrap();
+        // Canonicalize before handing either path to a provider, for the reason spelled
+        // out in `workspace_arg_precedes_configured_args_and_the_prompt`: the flag
+        // carries `project_root` verbatim, and on macOS a tempdir path under
+        // `/var/folders/...` is a symlink to `/private/var/folders/...`, so passing the
+        // raw path and expecting the canonical one only agrees on Linux and Windows.
+        // Production canonicalizes once in `resolve_project_root`, so a real provider
+        // never sees an uncanonical root either.
         let original_expected = std::fs::canonicalize(original_root.path()).unwrap();
         let rerooted_expected = std::fs::canonicalize(rerooted_root.path()).unwrap();
         let provider = LocalBinaryProvider::new(
             "echo",
             "/bin/echo",
             "echo",
-            original_root.path().to_path_buf(),
+            original_expected.clone(),
             CliInvocation {
                 args: vec![],
                 system_arg: None,
@@ -1613,7 +1620,7 @@ mod tests {
         .unwrap();
 
         let rerooted = provider
-            .with_project_root(rerooted_root.path())
+            .with_project_root(&rerooted_expected)
             .expect("local providers should support rerooting");
         let rerooted_reply = rerooted.send(None, "ignored").await.unwrap();
         assert_eq!(

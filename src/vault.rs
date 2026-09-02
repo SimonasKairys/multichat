@@ -42,7 +42,7 @@ use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use argon2::Argon2;
 use secrecy::{ExposeSecret, SecretString};
 use std::fs;
@@ -90,7 +90,7 @@ fn should_zero_before_unlink(path: &Path, meta: &fs::Metadata) -> bool {
     matches!(regular_file_link_count(path, meta), Some(0 | 1))
 }
 
-/// Consecutive wrong passwords before the vault is destroyed.
+/// Consecutive wrong passwords before the vault is locked aside.
 pub const MAX_ATTEMPTS: u8 = 5;
 /// Idle window after which the vault is reported as stale on next open.
 ///
@@ -128,8 +128,15 @@ pub enum VaultError {
     Missing,
     #[error("incorrect master password ({remaining} attempt(s) before the vault is wiped)")]
     WrongPassword { remaining: u8 },
-    #[error("vault destroyed: {0}")]
-    Destroyed(String),
+    /// The attempt limit was reached. The ciphertext is *not* gone: it has been moved
+    /// to `moved_to` and this path will not open again until someone moves it back by
+    /// hand. `moved_to` is `None` only when the move itself failed, in which case the
+    /// vault is still where it was and `reason` says so.
+    #[error("vault locked: {reason}")]
+    LockedOut {
+        reason: String,
+        moved_to: Option<PathBuf>,
+    },
     #[error("vault file is corrupt: {0}")]
     Corrupt(String),
 }
@@ -281,8 +288,8 @@ impl EncryptedVault {
     /// Decrypts the vault.
     ///
     /// Enforces the anti-brute-force policy: after [`MAX_ATTEMPTS`] consecutive wrong
-    /// passwords the file is destroyed. Sitting idle past [`MAX_IDLE_SECS`] does *not*
-    /// destroy it — see the comment in the body.
+    /// passwords the file is moved aside — see [`Self::lock_aside`]. Sitting idle past
+    /// [`MAX_IDLE_SECS`] does not touch it at all — see the comment in the body.
     ///
     /// Note the limitation: the attempt counter lives in the (unauthenticated) header
     /// of the same file, so an attacker who can copy the file can reset it by restoring
@@ -369,10 +376,26 @@ impl EncryptedVault {
                     )));
                 }
                 if header.attempts >= MAX_ATTEMPTS {
-                    self.destroy();
-                    return Err(VaultError::Destroyed(format!(
-                        "{MAX_ATTEMPTS} consecutive failed unlock attempts"
-                    )));
+                    return Err(match self.lock_aside() {
+                        Ok(moved_to) => VaultError::LockedOut {
+                            reason: format!(
+                                "{MAX_ATTEMPTS} consecutive failed unlock attempts; the \
+                                 encrypted transcript was moved to {} rather than \
+                                 destroyed",
+                                moved_to.display()
+                            ),
+                            moved_to: Some(moved_to),
+                        },
+                        Err(e) => VaultError::LockedOut {
+                            reason: format!(
+                                "{MAX_ATTEMPTS} consecutive failed unlock attempts, and \
+                                 the vault could not be moved aside ({e}); it is still \
+                                 at {}",
+                                self.path.display()
+                            ),
+                            moved_to: None,
+                        },
+                    });
                 }
                 Err(VaultError::WrongPassword {
                     remaining: MAX_ATTEMPTS - header.attempts,
@@ -387,6 +410,87 @@ impl EncryptedVault {
         updated[9] = header.attempts;
         updated[10..18].copy_from_slice(&header.last_unlock.to_be_bytes());
         write_atomically(&self.path, &updated)
+    }
+
+    /// Moves the vault out of the way instead of destroying it, and returns where it
+    /// went.
+    ///
+    /// This is what the attempt limit does now. The old behaviour zeroed and unlinked
+    /// the file on the 5th wrong password, permanently, with no recovery — and that
+    /// cost fell on the legitimate owner far more reliably than on any attacker.
+    /// Weigh the two adversaries the counter can actually meet:
+    ///
+    /// * Someone who can *write* files here was never bounded by the counter at all.
+    ///   Byte 9 is outside the AEAD's authenticated data, so they can restore a copy
+    ///   with the count at zero and keep guessing — the README has always said so.
+    ///   Against them a rename loses nothing a wipe was protecting.
+    /// * Someone who can only *type* is stopped just as hard by a rename as by a wipe:
+    ///   the path no longer opens, and they cannot put it back.
+    ///
+    /// The owner, meanwhile, is the one who actually reaches five wrong passwords — by
+    /// mistyping a password they are about to remember — and for them the difference is
+    /// their entire transcript. The payload stays AES-256-GCM under an Argon2id key, so
+    /// what is left behind is exactly as confidential as it was a second earlier; the
+    /// wipe added little the encryption did not already give.
+    ///
+    /// The move is a rename in the same directory, so it is atomic and never copies
+    /// plaintext anywhere new. A symlink at `self.path` renames the link, not its
+    /// target, the same asymmetry [`Self::destroy`] relies on. An existing
+    /// `.locked` file is not overwritten — an earlier lock-out is someone else's
+    /// transcript and gets its own suffix.
+    ///
+    /// A crash-orphaned `<path>.tmp` still holds a complete decryptable snapshot and is
+    /// still shredded: the vault itself is preserved now, so the orphan is a duplicate
+    /// with no owner, and leaving it would be a leak with nothing to justify it.
+    pub fn lock_aside(&self) -> Result<PathBuf> {
+        let destination = self.next_locked_path();
+        fs::rename(&self.path, &destination).with_context(|| {
+            format!(
+                "failed to move {} aside to {}",
+                self.path.display(),
+                destination.display()
+            )
+        })?;
+        self.shred_orphaned_tmp();
+        Ok(destination)
+    }
+
+    /// `vault.enc.locked`, or `vault.enc.locked.2`, `.3`, … if earlier lock-outs are
+    /// still there. Never returns a path that already exists, so no lock-out can
+    /// silently overwrite the transcript of an earlier one.
+    fn next_locked_path(&self) -> PathBuf {
+        let mut candidate = append_extension(&self.path, "locked");
+        let mut ordinal = 2u32;
+        while candidate.symlink_metadata().is_ok() {
+            candidate = append_extension(&self.path, &format!("locked.{ordinal}"));
+            ordinal += 1;
+        }
+        candidate
+    }
+
+    /// Zeroes and unlinks a `<path>.tmp` left behind by a crash mid-write, if one is
+    /// there. Shared by [`Self::destroy`] and [`Self::lock_aside`].
+    fn shred_orphaned_tmp(&self) {
+        // `write_atomically` writes the replacement vault to `<path>.tmp` and only
+        // renames it over `self.path` once the write (and, on Unix, the permission
+        // copy) has fully succeeded. A crash or power loss in that window — between
+        // the temp file landing on disk and the rename — leaves `<path>.tmp` behind
+        // holding a complete, valid, decryptable snapshot of the vault: the exact
+        // secret this function exists to erase. Destroying `self.path` alone would
+        // leave that orphaned snapshot fully recoverable right next to it, so it
+        // gets the same zero-then-unlink treatment (symlink caution included) as
+        // the vault file itself. On the common path there is no such file, so this
+        // is a harmless no-op.
+        let tmp = tmp_path_for(&self.path);
+        match fs::symlink_metadata(&tmp) {
+            Ok(meta)
+                if !meta.file_type().is_symlink() && should_zero_before_unlink(&tmp, &meta) =>
+            {
+                let _ = fs::write(&tmp, vec![0u8; meta.len() as usize]);
+            }
+            _ => {}
+        }
+        let _ = fs::remove_file(&tmp);
     }
 
     /// Overwrites the file with zeros before unlinking, so the ciphertext is not left
@@ -426,27 +530,7 @@ impl EncryptedVault {
             }
         }
         let _ = fs::remove_file(&self.path);
-
-        // `write_atomically` writes the replacement vault to `<path>.tmp` and only
-        // renames it over `self.path` once the write (and, on Unix, the permission
-        // copy) has fully succeeded. A crash or power loss in that window — between
-        // the temp file landing on disk and the rename — leaves `<path>.tmp` behind
-        // holding a complete, valid, decryptable snapshot of the vault: the exact
-        // secret this function exists to erase. Destroying `self.path` alone would
-        // leave that orphaned snapshot fully recoverable right next to it, so it
-        // gets the same zero-then-unlink treatment (symlink caution included) as
-        // the vault file itself. On the common path there is no such file, so this
-        // is a harmless no-op.
-        let tmp = tmp_path_for(&self.path);
-        match fs::symlink_metadata(&tmp) {
-            Ok(meta)
-                if !meta.file_type().is_symlink() && should_zero_before_unlink(&tmp, &meta) =>
-            {
-                let _ = fs::write(&tmp, vec![0u8; meta.len() as usize]);
-            }
-            _ => {}
-        }
-        let _ = fs::remove_file(&tmp);
+        self.shred_orphaned_tmp();
     }
 
     /// Reads the plaintext header fields without decrypting anything, so `simon vault
@@ -696,6 +780,16 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 /// `config.json.tmp`. This does rename the vault's own temp file from the historical
 /// `vault.tmp` to `vault.enc.tmp` — noted because nothing else in the tree parses or
 /// depends on that name (checked: it appears nowhere outside this function).
+/// `vault.enc` + `locked` = `vault.enc.locked`, for the same reason `tmp_path_for`
+/// appends rather than replaces: `Path::set_extension` would turn `vault.enc` into
+/// `vault.locked` and lose which file it came from.
+fn append_extension(target: &Path, extension: &str) -> PathBuf {
+    let mut name = target.as_os_str().to_owned();
+    name.push(".");
+    name.push(extension);
+    PathBuf::from(name)
+}
+
 fn tmp_path_for(target: &Path) -> PathBuf {
     let mut name = target.as_os_str().to_owned();
     name.push(".tmp");
@@ -787,6 +881,10 @@ mod tests {
 
     #[test]
     fn vault_self_destructs_after_max_attempts() {
+        // Historical name, kept so the behaviour it guards stays findable: the vault no
+        // longer self-destructs, it locks. What must not change is the half that is a
+        // security property — after `MAX_ATTEMPTS`, this path stops opening — as
+        // distinct from the half that was only ever data loss.
         let dir = tempfile::tempdir().unwrap();
         let vault = vault_in(&dir);
         let pw = SecretString::from("right".to_string());
@@ -799,9 +897,118 @@ mod tests {
                 Err(VaultError::WrongPassword { .. })
             ));
         }
-        assert!(matches!(vault.load(&wrong), Err(VaultError::Destroyed(_))));
-        assert!(!vault.exists(), "vault file should be gone");
+        assert!(matches!(
+            vault.load(&wrong),
+            Err(VaultError::LockedOut { .. })
+        ));
+        assert!(!vault.exists(), "the vault path must no longer open");
         assert!(matches!(vault.load(&pw), Err(VaultError::Missing)));
+    }
+
+    #[test]
+    fn the_fifth_wrong_password_locks_the_vault_aside_instead_of_destroying_it() {
+        // The wipe was documented and deliberate, and it still harmed the owner far
+        // more reliably than an attacker: the person who reaches five wrong passwords
+        // is overwhelmingly the one who is about to remember the right one, and the
+        // counter never bounded anyone who could write the file anyway (it is plaintext
+        // and restorable from a copy — `a_forged_attempt_count_cannot_destroy_a_vault…`
+        // is the other half of that story). So the ciphertext survives, and it must
+        // survive *as ciphertext*: a lock-out that left a decryptable file readable
+        // under a new name would have traded a data-loss bug for a disclosure one.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let pw = SecretString::from("right".to_string());
+        let wrong = SecretString::from("wrong".to_string());
+        vault
+            .save(b"the transcript that must not be lost", &pw)
+            .unwrap();
+
+        for _ in 0..(MAX_ATTEMPTS - 1) {
+            assert!(matches!(
+                vault.load(&wrong),
+                Err(VaultError::WrongPassword { .. })
+            ));
+        }
+
+        let moved_to = match vault.load(&wrong) {
+            Err(VaultError::LockedOut { moved_to, .. }) => {
+                moved_to.expect("the move must have succeeded on a writable tempdir")
+            }
+            other => panic!("expected LockedOut, got {other:?}"),
+        };
+
+        assert!(
+            !vault.exists(),
+            "the vault path must stop opening — that is the anti-brute-force property"
+        );
+        assert!(moved_to.is_file(), "the ciphertext must still be on disk");
+        assert_eq!(
+            moved_to,
+            dir.path().join("vault.enc.locked"),
+            "the locked file must sit beside the vault, named after it"
+        );
+
+        let bytes = fs::read(&moved_to).unwrap();
+        assert!(
+            !bytes.windows(6).any(|w| w == b"transc"),
+            "the set-aside file must still be encrypted"
+        );
+
+        // And it is genuinely recoverable: move it back, and the right password opens
+        // it. A "kept" file that could not be reopened would be no better than a wipe.
+        fs::rename(&moved_to, dir.path().join("vault.enc")).unwrap();
+        assert_eq!(
+            vault.load(&pw).unwrap(),
+            b"the transcript that must not be lost"
+        );
+    }
+
+    #[test]
+    fn a_second_lock_out_does_not_overwrite_the_first_ones_transcript() {
+        // `vault.enc.locked` already existing is not an edge case: it is what the
+        // second bad day looks like. Overwriting it would destroy the very transcript
+        // the first lock-out was preserving, quietly reintroducing the loss this change
+        // exists to remove.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_in(&dir);
+        let wrong = SecretString::from("wrong".to_string());
+
+        let mut locked_paths = Vec::new();
+        for round in 0..2 {
+            vault
+                .save(
+                    format!("transcript {round}").as_bytes(),
+                    &SecretString::from(format!("password {round}")),
+                )
+                .unwrap();
+            for _ in 0..(MAX_ATTEMPTS - 1) {
+                assert!(matches!(
+                    vault.load(&wrong),
+                    Err(VaultError::WrongPassword { .. })
+                ));
+            }
+            match vault.load(&wrong) {
+                Err(VaultError::LockedOut { moved_to, .. }) => {
+                    locked_paths.push(moved_to.expect("the move must have succeeded"))
+                }
+                other => panic!("expected LockedOut, got {other:?}"),
+            }
+        }
+
+        assert_ne!(
+            locked_paths[0], locked_paths[1],
+            "the second lock-out reused the first one's path"
+        );
+        for (round, path) in locked_paths.iter().enumerate() {
+            let vault_at_locked = EncryptedVault::new(path.clone());
+            assert_eq!(
+                vault_at_locked
+                    .load(&SecretString::from(format!("password {round}")))
+                    .unwrap(),
+                format!("transcript {round}").as_bytes(),
+                "lock-out {round} lost its transcript"
+            );
+        }
     }
 
     #[test]
@@ -887,12 +1094,15 @@ mod tests {
                 other => panic!("expected WrongPassword, got {other:?}"),
             }
             // Each failed attempt rewrites the header, so re-stale it: the point is
-            // that the wipe below comes from the attempt count, not from the clock.
+            // that the lock-out below comes from the attempt count, not from the clock.
             set_last_unlock(&vault, stale);
         }
 
-        assert!(matches!(vault.load(&wrong), Err(VaultError::Destroyed(_))));
-        assert!(!vault.exists(), "the attempt-based wipe still applies");
+        assert!(matches!(
+            vault.load(&wrong),
+            Err(VaultError::LockedOut { .. })
+        ));
+        assert!(!vault.exists(), "the attempt-based lock-out still applies");
     }
 
     #[test]

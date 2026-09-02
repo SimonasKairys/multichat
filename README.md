@@ -101,7 +101,7 @@ memory: no model ever receives the transcript or any prior turn as context, vaul
 not (see [Delegation](#delegation) — every prompt still goes out on its own). The vault
 only gives the *user* their own history back on screen. It is off by default and changes
 nothing about `simon chat` without the flag. See
-[Security posture](#security-posture) for what it protects against, its self-destruct
+[Security posture](#security-posture) for what it protects against, its lock-out
 policy, and what a crash costs you.
 
 ### Providers
@@ -588,10 +588,14 @@ Be precise about what exists. This table is the source of truth; the numbered fi
 
 - **API keys in the OS keyring**, read from a hidden terminal prompt or stdin — never
   from `argv`, where any local user could read them from the process table.
+  <!-- proof: main::tests::no_command_line_argument_anywhere_accepts_a_secret_value -->
+  <!-- proof: config::tests::setting_an_empty_credential_is_rejected_before_any_keyring_call -->
 - **Tamper-evident audit log** — a chain of JSON entries, each carrying a keyed
   `Blake2s256` MAC over the previous entry. The key lives in the OS keyring, so writing
   the log file is not enough to forge it. Recovers the chain head across restarts.
   `simon audit` verifies the whole file.
+  <!-- proof: audit::tests::chain_survives_a_restart -->
+  <!-- proof: audit::tests::a_different_key_cannot_verify_the_chain -->
 - **The chain is anchored outside itself, so a cut tail is visible.** A forward walk
   alone cannot see truncation: delete the last N lines and what remains is a shorter,
   perfectly valid chain. Every append therefore also rewrites `<log>.anchor`, a small
@@ -603,6 +607,9 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   orchestrator writes many entries per turn. Deleting a log on purpose is legitimate,
   so `simon audit --reset-anchor` re-baselines the evidence, says plainly that it is
   discarding it, and records the reset in the new chain.
+  <!-- proof: audit::tests::verify_detects_truncation_of_several_trailing_entries -->
+  <!-- proof: audit::tests::verify_detects_a_tampered_anchor -->
+  <!-- proof: audit::tests::reset_anchor_after_truncation_records_the_reset_and_verifies_clean -->
 - **Appends are serialised, so two `simon` processes cannot break the chain.** Each
   logger used to cache the chain head in memory and append without coordination, so a
   second process linked its entry to a `prev` that was no longer the file's tail — and
@@ -612,12 +619,16 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   that links to it, not in the write alone. The lock lives on the file descriptor, so the
   kernel releases it if a process dies holding it; a lock *file* whose existence meant
   "locked" would strand the log after a crash.
+  <!-- proof: audit::tests::two_real_processes_interleaved_appends_produce_a_valid_chain -->
+  <!-- proof: audit::tests::append_lock_contention_times_out_visibly_instead_of_hanging_or_dropping_the_entry -->
 - **The saved transcript is bounded.** It used to grow forever: every clean exit
   re-derived a key and re-encrypted the entire history, every unlock decrypted all of it,
   and the whole plaintext sat in memory that `mlockall` pins and so cannot be paged out.
   It is now capped at 2,000 lines, oldest dropped first, with a marker line left in their
   place so a shortened history is visible rather than silent. `simon vault prune --keep N`
   does it deliberately.
+  <!-- proof: vault::tests::a_transcript_over_the_cap_is_trimmed_oldest_first_and_reloads_cleanly -->
+  <!-- proof: vault::tests::repeated_trims_accumulate_one_running_marker_instead_of_stacking_new_ones -->
 - **Failures are logged by kind, never by text.** The log's invariant is sizes, counts,
   and paths only — but every error path used to format the error's own message into it,
   and an error can carry a fragment of a provider's response or a path a model chose. A
@@ -626,12 +637,17 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   error's typed cause rather than by scanning its words, so the two failures that
   dominate in practice — a model CLI that never answered, a provider returning non-2xx —
   are named rather than lumped into "unspecified".
+  <!-- proof: orchestrator::tests::the_audit_detail_names_the_failure_kind_but_never_its_text -->
+  <!-- proof: orchestrator::tests::io_error_kinds_survive_into_the_audit_detail -->
 - **A damaged MAC key stops the program instead of replacing itself.** The key is the
   only thing that makes the log verifiable, so silently generating a new one invalidates
   every entry ever written — and anyone able to write a short value into the keyring
   could have triggered exactly that, making a forged history look like ordinary
   corruption. A keyring entry that is present but unusable is now a hard error naming
   the service and what to do about it. An absent entry is still a normal first run.
+  <!-- proof: audit::tests::wrong_length_key_error_never_contains_the_decoded_bytes_either -->
+  <!-- proof: audit::tests::an_absent_value_still_generates_a_new_key -->
+  <!-- proof: audit::tests::decide_key_rejects_multibyte_utf8_in_keyring_without_panicking -->
 - **Links are refused where a file's identity is the point.** The vault's
   self-destruct used `fs::write`, which follows a link: pointing `vault.enc` at another
   file made the wipe zero *that* file and unlink only the link. The atomic writer took
@@ -641,14 +657,24 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   the write was refused. All three now use `symlink_metadata` and refuse. Skills and
   project files also reject multi-linked regular files; vault destruction unlinks its
   own path but never zeroes an inode shared by another hard link.
+  <!-- proof: vault::tests::destroy_refuses_to_zero_a_symlinks_target -->
+  <!-- proof: vault::tests::write_atomically_refuses_a_symlinked_target_rather_than_borrow_its_permissions -->
+  <!-- proof: workspace::tests::a_symlink_to_dot_git_is_refused_before_any_directory_is_created -->
+  <!-- proof: skills::tests::a_hard_link_escaping_the_root_leaks_no_description_and_fails_to_read -->
 - **`--classified`** — refuses any provider whose traffic leaves the machine, and
   requires process-wide memory locking to succeed rather than warning.
+  <!-- proof: providers::ollama::tests::a_non_loopback_ollama_host_reports_remote_and_is_refused_under_classified -->
+  <!-- proof: providers::local_binary::tests::cli_tools_count_as_remote_for_classified_mode -->
+  <!-- proof: picker::tests::classified_blocks_tab_and_submit_on_a_remote_transport -->
 - **Process-wide memory locking on Linux** — `mlockall` at startup (`main.rs`), pinning
   the whole process into RAM so nothing is swapped to disk. The other half of this
   claim, per-allocation `mlock`/`VirtualLock` of derived key material, is genuinely live
   too now: `simon chat --vault` runs `EncryptedVault::save`/`load`, both of which call
   `derive_key`, which allocates the Argon2id output through `LockedBuffer::new` (see
   `src/security.rs`) — not just exercised by `src/vault.rs`'s own tests.
+  <!-- proof: security::tests::non_strict_memory_protection_never_fails_startup -->
+  <!-- proof: security::tests::locked_buffer_exposes_contents -->
+  <!-- proof: security::tests::dropping_a_locked_buffer_releases_the_lock_it_took -->
 - **Encrypted transcript vault (`simon chat --vault`)** — the TUI transcript
   (`App::transcript`: what you and the models said, nothing else) encrypted with
   AES-256-GCM under an Argon2id-derived key, opt-in and off by default. The salt lives
@@ -662,11 +688,17 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   plaintext header data — see
   [Known limits](#known-limits-of-what-is-implemented)). `simon vault destroy` deletes
   it after a typed `yes`.
+  <!-- proof: vault::tests::tampering_with_authenticated_header_fails_decryption -->
+  <!-- proof: vault::tests::round_trips_without_an_externally_supplied_salt -->
+  <!-- proof: vault::tests::status_reports_header_fields_without_needing_the_password -->
 - **Path-traversal protection** on the read-only skills directory: `..`, absolute paths,
   symlinks escaping the root, and multi-linked regular files are all rejected. This is
   reachable from model output via `ACTION: read_skill(<name>)` (see [Skills](#skills)),
   not just from trusted callers, so the rejection is load-bearing, not defensive dead
   code.
+  <!-- proof: skills::tests::rejects_parent_directory_traversal -->
+  <!-- proof: skills::tests::rejects_absolute_paths -->
+  <!-- proof: skills::tests::a_symlink_escaping_the_root_leaks_no_description_and_still_fails_to_read -->
 - **Model-initiated file access confined to its selected main-project or task-copy
   root** (see [Project files](#project-files)) — the same traversal hardening as
   skills (`..`, absolute paths, and symlinks escaping the root are all rejected),
@@ -675,6 +707,10 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   read, or written through the protocol. Delegated file writes are further confined
   to a per-task copy until explicitly applied. Writes into `.git/` are refused
   outright.
+  <!-- proof: workspace::tests::a_write_lands_under_the_workspace_root -->
+  <!-- proof: workspace::tests::a_traversal_attempt_surfaces_as_an_error_not_a_crash -->
+  <!-- proof: workspace::tests::an_uppercase_git_directory_write_is_refused -->
+  <!-- proof: workspace::tests::a_directory_one_entry_over_the_max_is_truncated -->
 - **Bounded isolated copies for file-producing delegations.** Snapshots preserve dirty
   tracked and untracked on-disk files without touching Git, while excluding Git
   metadata, likely credentials, links/special files, command-run artifacts, and common
@@ -682,6 +718,10 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   unbounded snapshot or later copy growth. Fresh tasks never fall back to main, copies
   are not silently merged, main-project drift and deletions block application, over-
   quota copies are stopped and released, and session shutdown removes retained copies.
+  <!-- proof: isolation::tests::snapshot_fidelity_preserves_regular_and_untracked_files -->
+  <!-- proof: isolation::tests::limit_breach_cleans_the_partial_new_copy -->
+  <!-- proof: isolation::tests::changed_files_conflict_when_main_has_drifted -->
+  <!-- proof: isolation::tests::release_all_removes_the_unique_session_directory -->
 - **Every model-proposed write requires explicit approval** (see [Writes are not
   applied silently](#writes-are-not-applied-silently)) — the path, the exact size,
   whether it overwrites and how many bytes that destroys, and the head of the content
@@ -696,6 +736,10 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   could write a skill file could inject its own content into the commander's system
   prompt for the rest of the session, including when the commander is remote — so this
   is deliberately a separate tree.
+  <!-- proof: orchestrator::tests::a_denied_write_never_reaches_disk_and_is_recorded_as_denied -->
+  <!-- proof: orchestrator::tests::a_closed_decision_channel_denies_rather_than_writes -->
+  <!-- proof: orchestrator::tests::denied_apply_keeps_the_copy_and_leaves_main_unchanged -->
+  <!-- proof: ui::tests::chat_paste_cannot_answer_a_pending_write_confirmation -->
 - **Commander proof execution is argv-only, copy-only, bounded, and separately
   approved.** There is no shell; program/subcommand and argument policies are checked
   before approval, the environment is cleared, runtime directories are task-local,
@@ -704,13 +748,19 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   never approves them, and `--classified` refuses them before asking. This constrains
   Simon's launch surface; it does not sandbox the project code a permitted test runner
   executes.
+  <!-- proof: command_runner::tests::permits_cargo_test_and_rejects_shells_and_dangerous_subcommands -->
+  <!-- proof: command_runner::tests::rejects_shell_tokens_and_paths_that_escape_the_copy -->
+  <!-- proof: command_runner::tests::safe_path_excludes_both_main_and_task_copy_directories -->
+  <!-- proof: ui::tests::chat_paste_cannot_answer_a_pending_run_confirmation -->
 - **Proxy support** — honours `HTTP_PROXY`/`HTTPS_PROXY` and, via reqwest's `socks`
   feature, `ALL_PROXY=socks5://…`. Disabled outright under `--classified`: a proxy
   routes even a loopback request off the machine, which is the one thing that flag
   promises cannot happen.
+  <!-- proof: providers::tests::a_classified_http_client_still_builds -->
 - **`unsafe` confined to one file** — `#![deny(unsafe_code)]` crate-wide with a single
   audited override in `src/security.rs`, enforced by a CI job that rejects the override
   anywhere else.
+  <!-- unproven: no test; the `unsafe-boundary` job in .github/workflows/ci.yml enforces it, because the property is about which files may carry an attribute, not about behaviour a test can observe -->
 
 ### Not implemented
 
@@ -739,11 +789,22 @@ Be precise about what exists. This table is the source of truth; the numbered fi
 
 ### Known limits of what is implemented
 
-- **The vault's self-destruct is a data-loss feature, not just a security one.** 5
-  consecutive wrong passwords wipes the saved transcript — automatically, permanently,
-  with no recovery. That is the anti-brute-force property and it is unchanged: a correct
-  password typed after the 5th failure does not bring the file back. `simon vault status`
+- **5 consecutive wrong passwords lock the vault; they no longer destroy it.** They
+  used to: the 5th failure zeroed and unlinked the file, permanently, with no recovery.
+  That cost fell on the owner far more reliably than on an attacker — the person who
+  reaches five wrong passwords is overwhelmingly the one who is about to remember the
+  right one, while an attacker who can *write* the file was never bounded by the counter
+  at all (it is plaintext and restorable from a copy — see below). The anti-brute-force
+  half is unchanged: after the 5th failure `vault.enc` stops opening, and someone who
+  can only type cannot bring it back. The file is moved to `vault.enc.locked` (`.locked.2`,
+  `.3`, … if earlier lock-outs are still there, so one never overwrites another) and is
+  still AES-256-GCM ciphertext under the same Argon2id key — exactly as confidential as
+  it was a second earlier, since the wipe added little the encryption did not already
+  give. If it is yours, move it back over `vault.enc` and unlock it. `simon vault status`
   shows the count so far.
+  <!-- proof: vault::tests::vault_self_destructs_after_max_attempts -->
+  <!-- proof: vault::tests::a_wrong_password_on_an_idle_expired_vault_still_counts_toward_the_wipe -->
+  <!-- proof: vault::tests::the_fifth_wrong_password_locks_the_vault_aside_instead_of_destroying_it -->
 - **Sitting idle past 24 hours warns; it no longer destroys the vault.** It used to:
   `EncryptedVault::load` checked the idle window **before** the password, so a 24-hour
   gap deleted the transcript with the right password powerless to stop it. The window is
@@ -757,6 +818,9 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   works normally, and a successful unlock resets the timer. `simon vault status` reports
   the idle window, whether it has been passed, and a system clock that is behind the
   vault's own last-unlock time.
+  <!-- proof: vault::tests::an_idle_expired_vault_is_not_destroyed_and_still_opens_with_the_right_password -->
+  <!-- proof: vault::tests::unlocking_an_idle_expired_vault_resets_the_idle_window -->
+  <!-- proof: vault::tests::status_reports_a_clock_behind_the_last_unlock_rather_than_a_full_window -->
 - **Only a clean exit saves.** `simon chat --vault` serializes and encrypts the
   transcript once, after the TUI loop returns normally — not after every turn, because
   Argon2id key derivation is deliberately slow and running it per-message would stall
@@ -764,6 +828,7 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   clean exit (or vault open, on the first run) is lost. This is a real trade-off, not an
   oversight: continuous session-to-session use is safe, but do not rely on `--vault` as
   a crash-safe log.
+  <!-- unproven: no test; the save runs after the TUI loop returns, and nothing here exercises a crash mid-session -->
 - The vault's failed-attempt counter and last-unlock timestamp live in the same file
   they protect and are deliberately excluded from the authenticated data (see
   `src/vault.rs`), so they are plaintext and unauthenticated — an attacker who can copy
@@ -771,10 +836,14 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   without a password for exactly this reason: they were never tamper-proof to begin
   with. This raises the cost of online guessing; it is not a substitute for a TPM or
   secure enclave.
+  <!-- proof: vault::tests::a_forged_attempt_count_cannot_destroy_a_vault_the_password_still_opens -->
+  <!-- proof: vault::tests::status_reports_header_fields_without_needing_the_password -->
 - The audit log uses a MAC, not a signature. Anyone who can read the keyring key can
   forge entries, so it proves integrity against local tampering, not non-repudiation.
   That is the threat model the anchor above is built for too: it stops someone who can
   edit files, not someone who already holds the key.
+  <!-- proof: audit::tests::a_different_key_cannot_verify_the_chain -->
+  <!-- proof: audit::tests::verify_detects_a_tampered_anchor -->
 - The ledger is re-sent in full on every call, so a long session used to grow the
   system prompt without bound — a maximally-loaded ledger measured 241,945 characters.
   It is now capped at 16,000. The protocol sections are rendered in full and their cost
@@ -787,14 +856,20 @@ Be precise about what exists. This table is the source of truth; the numbered fi
   is announced in the prompt so the model is not misled into thinking it sees
   everything. `/forget` clears that content on demand, keeping the roster and
   the task list, and is recorded in the audit log with the before and after sizes.
+  <!-- proof: swarm::tests::a_maximally_stuffed_ledger_renders_within_the_total_budget -->
+  <!-- proof: swarm::tests::load_bearing_sections_survive_a_maximally_stuffed_prompt -->
+  <!-- proof: swarm::tests::elision_from_the_whole_prompt_budget_is_announced_not_silent -->
 - A local CLI tool is treated as remote for `--classified` purposes, because we cannot
   see whether it calls a cloud API internally.
+  <!-- proof: providers::local_binary::tests::cli_tools_count_as_remote_for_classified_mode -->
 - Output from a local CLI is bounded as it is read, not after. The cap used to apply to
   what was *kept*, while the whole of a child's output was buffered first — and since
   `mlockall` pins the process into RAM, that buffer could not even be paged out. Both
   streams are now read concurrently, each capped, with the remainder drained rather than
   dropped: closing the pipe early kills a chatty child with SIGPIPE and misreports it as
   a crash, which is a bug this project already shipped once.
+  <!-- proof: providers::local_binary::tests::stderr_summary_caps_a_single_enormous_line -->
+  <!-- proof: providers::local_binary::tests::stderr_summary_keeps_the_message_and_drops_the_stack_trace -->
 
 ## Development
 

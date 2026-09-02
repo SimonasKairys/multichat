@@ -37,6 +37,9 @@ mod action_argument_apostrophe_test;
 #[cfg(test)]
 mod action_argument_trailing_quote_test;
 
+#[cfg(test)]
+mod posture_proofs_test;
+
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use secrecy::SecretString;
@@ -624,8 +627,8 @@ fn vault_unlock_for_chat(paths: &Paths, app: &mut App) -> Result<VaultSession> {
     }
 
     // Bounded by construction, not by a counter kept here: `EncryptedVault::load`
-    // self-destructs the file once `MAX_ATTEMPTS` is reached, which turns every
-    // subsequent iteration's `Err(VaultError::Destroyed(_))` arm into a `return`.
+    // moves the file aside once `MAX_ATTEMPTS` is reached, which turns every
+    // subsequent iteration's `Err(VaultError::LockedOut { .. })` arm into a `return`.
     loop {
         let password = SecretString::from(
             rpassword::prompt_password("Vault password (input hidden): ")
@@ -695,16 +698,25 @@ fn vault_unlock_for_chat(paths: &Paths, app: &mut App) -> Result<VaultSession> {
                     ),
                 );
                 eprintln!(
-                    "Wrong password — {remaining} attempt(s) left before the vault \
-                     self-destructs and the transcript is lost for good."
+                    "Wrong password — {remaining} attempt(s) left before the vault is \
+                     locked and set aside. The encrypted transcript is kept, but this \
+                     session continues without it."
                 );
             }
-            Err(VaultError::Destroyed(reason)) => {
-                let _ = audit.log("vault.destroyed", &reason);
-                // Printed verbatim: `reason` names what actually triggered the wipe.
-                // Only the attempt limit destroys a vault now — idle expiry warns
-                // instead (see `EncryptedVault::load`).
-                println!("Vault destroyed: {reason}");
+            Err(VaultError::LockedOut { reason, moved_to }) => {
+                let _ = audit.log("vault.locked_out", &reason);
+                // Printed verbatim: `reason` names what triggered the lock-out and
+                // where the ciphertext went. Only the attempt limit locks a vault out —
+                // idle expiry warns instead (see `EncryptedVault::load`).
+                println!("Vault locked: {reason}");
+                if let Some(moved_to) = moved_to {
+                    println!(
+                        "The old transcript is still encrypted at {}. If it is yours, \
+                         move it back over {} and try again with the right password.",
+                        moved_to.display(),
+                        vault.path().display()
+                    );
+                }
                 println!("Continuing with an empty transcript. Choose a new password:");
                 let password = prompt_new_vault_password()?;
                 return Ok(VaultSession { vault, password });
@@ -1013,7 +1025,7 @@ fn vault_prune(paths: &Paths, vault: &EncryptedVault, keep: Option<usize>) -> Re
         Err(VaultError::WrongPassword { remaining }) => {
             bail!("wrong password ({remaining} attempt(s) left before the vault self-destructs)")
         }
-        Err(VaultError::Destroyed(reason)) => bail!("vault destroyed: {reason}"),
+        Err(VaultError::LockedOut { reason, .. }) => bail!("vault locked: {reason}"),
         Err(VaultError::Corrupt(msg)) => bail!("vault file is corrupt: {msg}"),
         Err(VaultError::Missing) => bail!("vault file disappeared before it could be read"),
     };
@@ -1073,6 +1085,45 @@ fn vault_prune(paths: &Paths, vault: &EncryptedVault, keep: Option<usize>) -> Re
 mod tests {
     use super::*;
     use crate::app::Speaker;
+
+    #[test]
+    fn no_command_line_argument_anywhere_accepts_a_secret_value() {
+        // The README's first posture claim is that keys are read from a hidden prompt
+        // or stdin and "never from `argv`, where any local user could read them from
+        // the process table". `set_key` honours that, but the claim is about the whole
+        // CLI surface, and the way it would be lost is not an edit to `set_key` — it is
+        // a convenience `--key` added to some other subcommand a year from now, at
+        // which point the sentence in the README quietly becomes false.
+        //
+        // So the guard is structural: walk every subcommand clap knows about and refuse
+        // any *value-taking* argument whose name reads like a secret. Flags are exempt
+        // because a flag carries no value to leak — `--reset-key` names a key and
+        // discloses nothing.
+        use clap::CommandFactory;
+
+        fn walk(command: &clap::Command, path: &str, offenders: &mut Vec<String>) {
+            for arg in command.get_arguments() {
+                let name = arg.get_id().as_str();
+                let takes_value = arg.get_action().takes_values();
+                let secret_sounding = ["key", "secret", "token", "password", "credential"]
+                    .iter()
+                    .any(|word| name.contains(word));
+                if takes_value && secret_sounding {
+                    offenders.push(format!("{path} --{name}"));
+                }
+            }
+            for sub in command.get_subcommands() {
+                walk(sub, &format!("{path} {}", sub.get_name()), offenders);
+            }
+        }
+
+        let mut offenders = Vec::new();
+        walk(&Cli::command(), "simon", &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "these arguments would put a secret in the process table: {offenders:?}"
+        );
+    }
 
     #[test]
     fn vault_prune_parses_with_and_without_an_explicit_keep_count() {

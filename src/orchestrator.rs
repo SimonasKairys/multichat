@@ -279,6 +279,12 @@ pub enum Event {
         label: String,
         usage: TokenUsage,
         rate_limit: RateLimit,
+        /// Running total of tokens spent so far this UTC calendar month, across every
+        /// model and session, persisted by `usage_ledger.rs` so it survives restarts.
+        /// Set to `0` if persisting this call's tokens failed (see
+        /// `Orchestrator::record_month_usage`) rather than silently keeping the
+        /// previous, now-inaccurate, total.
+        month_tokens: u64,
     },
     /// A delegation was dispatched. `task` is the complete sub-agent prompt for the
     /// scrollable TUI transcript. The audit log still records only its task id and
@@ -2394,6 +2400,11 @@ pub struct Orchestrator {
     /// Set by a `WriteDecision::ApproveAll`; skips the prompt for the rest of the
     /// session. Never persisted — see `WriteDecision`.
     approve_all: bool,
+    /// The application data directory, kept so `record_call_usage` can persist the
+    /// running this-month token total (`usage_ledger.rs`) without needing the full
+    /// `Paths` struct (whose other fields describe files this orchestrator never
+    /// touches) threaded through every call site.
+    data_dir: PathBuf,
 }
 
 impl Orchestrator {
@@ -2422,12 +2433,38 @@ impl Orchestrator {
             project_root,
             decisions,
             approve_all: auto_write,
+            data_dir: paths.data_dir.clone(),
         })
     }
 
     async fn emit(&self, event: Event) {
         // A closed channel means the UI already exited; dropping the event is correct.
         let _ = self.events.send(event).await;
+    }
+
+    /// Persists `usage`'s observed token count into this-month's running total
+    /// (`usage_ledger::record`) and returns the new total, or the previous known
+    /// total (via `Err`'s absence — see below) if the write failed.
+    ///
+    /// A disk error here (permissions, full disk, a concurrent writer) must never
+    /// interrupt the turn that is already in flight and must already have its reply
+    /// ready to show the user — the whole point of this counter is a status-line
+    /// nicety, not something worth failing a prompt over. So this logs to the audit
+    /// trail and falls back to `0`, which just means "this call's tokens didn't make
+    /// it into this month's total"; the status line stays believable (no phantom
+    /// spike, no stale-looking freeze) rather than propagating an error the caller
+    /// has no good way to surface anyway.
+    fn record_month_usage(&mut self, usage: &TokenUsage) -> u64 {
+        let tokens = usage.observed_total().unwrap_or(0);
+        match crate::usage_ledger::record(&self.data_dir, tokens) {
+            Ok(total) => total,
+            Err(e) => {
+                let _ = self
+                    .audit
+                    .log("usage.persist_failed", &safe_error_detail(&e));
+                0
+            }
+        }
     }
 
     /// Sets up progress reporting for one provider call: a `ProgressSink` to hand to
@@ -2764,10 +2801,12 @@ impl Orchestrator {
         // needs.
         drop(progress);
 
+        let month_tokens = self.record_month_usage(&reply.usage);
         self.emit(Event::UsageUpdated {
             label: primary_label.clone(),
             usage: reply.usage.clone(),
             rate_limit: reply.rate_limit.clone(),
+            month_tokens,
         })
         .await;
         if let Some(budget) = reply.rate_limit.summary() {
@@ -3218,10 +3257,12 @@ impl Orchestrator {
             match outcome {
                 Ok((reply, sub_writes, sub_text)) => {
                     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    let month_tokens = self.record_month_usage(&reply.usage);
                     self.emit(Event::UsageUpdated {
                         label: target_label.clone(),
                         usage: reply.usage.clone(),
                         rate_limit: reply.rate_limit.clone(),
+                        month_tokens,
                     })
                     .await;
                     if let Some(budget) = reply.rate_limit.summary() {
@@ -4643,6 +4684,7 @@ mod tests {
             project_root,
             decisions,
             approve_all: auto_write,
+            data_dir: paths.data_dir.clone(),
         }
     }
 
@@ -4670,6 +4712,7 @@ mod tests {
             project_root,
             decisions,
             approve_all: auto_write,
+            data_dir: paths.data_dir.clone(),
         }
     }
 
@@ -6908,6 +6951,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -6924,10 +6968,15 @@ mod tests {
                     label,
                     usage,
                     rate_limit,
+                    month_tokens,
                 } => {
                     assert_eq!(label, "ollama:llama3");
                     assert!(usage.is_empty());
                     assert!(rate_limit.is_empty());
+                    // A fresh temp data dir with no prior usage history and an empty
+                    // `TokenUsage` (observed_total is `None`) adds zero tokens, so the
+                    // persisted this-month total must still read zero.
+                    assert_eq!(month_tokens, 0);
                     saw_usage = true;
                 }
                 Event::Reply { label, text } => break (label, text),
@@ -6963,6 +7012,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -7018,6 +7068,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -7073,6 +7124,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
         orch.ledger
             .record_commander_reply("COMMANDER-SECRET-MARKER and all delegation lines");
@@ -7151,6 +7203,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations("ollama:llama3", "ACTION: delegate_task(ghost:model, hi)")
@@ -7200,6 +7253,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -7254,6 +7308,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -7308,6 +7363,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -7370,6 +7426,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -7436,6 +7493,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -7514,6 +7572,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -7589,6 +7648,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: true,
+            data_dir: paths.data_dir.clone(),
         };
         orch.workspace.enable_task_copies(&paths.data_dir).unwrap();
         orch.run_delegations(
@@ -7657,6 +7717,7 @@ mod tests {
             // Even global auto-approval must not grant write capability to a
             // text-only delegation.
             approve_all: true,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -7700,6 +7761,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         let long_task = format!("a{}", "€".repeat(130));
@@ -7739,6 +7801,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
@@ -7779,6 +7842,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
@@ -7828,6 +7892,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_skill_reads(
@@ -7883,6 +7948,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(nope.md)")
@@ -7941,6 +8007,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         let prompt = orch.system_prompt();
@@ -7967,6 +8034,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -8018,6 +8086,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         // Bare model name, not the full label — exercises `set_primary`'s flexible
@@ -8062,6 +8131,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.set_commander("ghost").await;
@@ -8089,6 +8159,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         // Load the ledger with content that `clear_content` is documented to drop.
@@ -8141,6 +8212,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         // `StubProvider::send` echoes `"echo: {prompt}"`, prefixing only the first
@@ -8190,6 +8262,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_file_writes(
@@ -8236,6 +8309,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_file_writes(
@@ -8280,6 +8354,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
         orch.run_delegations(
             "ollama:llama3",
@@ -8331,6 +8406,7 @@ mod tests {
             project_root: project.to_path_buf(),
             decisions: Some(decisions),
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         }
     }
 
@@ -8610,6 +8686,7 @@ mod tests {
             // about what a sub-agent's reply is allowed to cause.
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
         orch.workspace.enable_task_copies(&paths.data_dir).unwrap();
 
@@ -8817,6 +8894,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -8860,6 +8938,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -9059,6 +9138,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.handle_prompt("hello").await;
@@ -9114,6 +9194,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(notes.txt)")
@@ -9150,6 +9231,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(notes.txt)")
@@ -9200,6 +9282,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(../secret.txt)")
@@ -9256,6 +9339,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         // Leading newline so the marker lands at the start of a line in the stub's
@@ -9310,6 +9394,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_file_lists("ollama:llama3", "ACTION: list_files()")
@@ -9355,6 +9440,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(missing.md)")
@@ -9402,6 +9488,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         // Traversal attempt: the file exists outside the project root but must be
@@ -9451,6 +9538,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         // Request listing of a path that does not exist inside the project root.
@@ -9531,6 +9619,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(
@@ -9580,6 +9669,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(utf8.txt)")
@@ -9619,6 +9709,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(utf8.md)")
@@ -9680,6 +9771,7 @@ mod tests {
             project_root: project_dir.path().to_path_buf(),
             decisions: None,
             approve_all: false,
+            data_dir: paths.data_dir.clone(),
         };
 
         orch.run_delegations(

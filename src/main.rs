@@ -18,6 +18,7 @@ pub mod security;
 pub mod skills;
 pub mod swarm;
 pub mod ui;
+pub mod usage_ledger;
 pub mod vault;
 pub mod workspace;
 

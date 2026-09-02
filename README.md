@@ -321,8 +321,12 @@ long it has taken, including the latest progress detail from a streaming CLI (se
 keeps per-model and whole-session token totals, shows the last call's input/output split,
 and includes token/request quota plus reset information when the provider reports it.
 Providers that expose no usage metadata are labelled `tokens unavailable` rather than
-shown an estimate. The transcript gets a line when a delegation is dispatched and
-another when it finishes, with outcome and duration.
+shown an estimate. A running total of tokens spent this UTC calendar month is also
+shown once any usage has been reported; it is persisted to `usage_history.json` in the
+application data directory (see `usage_ledger.rs`) so it survives restarts and rolls
+over to zero automatically at the start of the next month, rather than resetting on
+every launch the way the per-session total does. The transcript gets a line when a
+delegation is dispatched and another when it finishes, with outcome and duration.
 
 ### Proof commands and copy disposition
 

@@ -189,6 +189,13 @@ pub struct App {
     pub model_statuses: Vec<ModelStatus>,
     /// Per-model token and quota telemetry accumulated for this session.
     usage: BTreeMap<String, ModelUsage>,
+    /// Running total of tokens spent so far this UTC calendar month, across every
+    /// model, persisted across restarts by `usage_ledger.rs` and reported by the
+    /// orchestrator on every `Event::UsageUpdated` (see `Orchestrator::record_month_usage`).
+    /// Unlike `usage`'s per-model/per-session totals, this is never reset by `App`
+    /// itself — it always reflects the last value the orchestrator persisted, and a
+    /// fresh `App` shows nothing for it (`0`) until the first usage event arrives.
+    month_tokens: u64,
     /// Set while a model is waiting for permission to write a file. While this is
     /// `Some` the input line becomes a y/n/a prompt rather than a text box — see
     /// `handle_key` in `ui/mod.rs` — because answering it is the only thing that lets
@@ -286,6 +293,7 @@ impl App {
                 })
                 .collect(),
             usage: BTreeMap::new(),
+            month_tokens: 0,
             pending_write: None,
             pending_run: None,
             should_quit: false,
@@ -477,6 +485,7 @@ impl App {
                 label,
                 usage,
                 rate_limit,
+                month_tokens,
             } => {
                 let stats = self.usage.entry(label).or_default();
                 if let Some(total) = usage.observed_total() {
@@ -484,6 +493,7 @@ impl App {
                 }
                 stats.last = usage;
                 stats.rate_limit = rate_limit;
+                self.month_tokens = month_tokens;
             }
             Event::Reply { label, text } => self.transcript.push(Line {
                 speaker: Speaker::Model(label),
@@ -829,10 +839,27 @@ impl App {
     }
 
     fn with_usage(&self, label: &str, base: String) -> String {
-        match self.usage_summary(label) {
-            Some(summary) => format!("{base} · {summary}"),
-            None => base,
+        // Per-model/session telemetry (may be absent if `label` has never reported
+        // usage) and the this-month total (global, so it can show even the first
+        // time a *different* model's status line is what's on screen) are combined
+        // independently rather than one gating the other — see `usage_summary` and
+        // `month_summary`'s own docs for why each is optional on its own terms.
+        let parts: Vec<String> = [self.usage_summary(label), self.month_summary()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if parts.is_empty() {
+            base
+        } else {
+            format!("{base} · {}", parts.join(" · "))
         }
+    }
+
+    /// The persisted this-month token total (see `App::month_tokens`'s doc), or
+    /// `None` before any `Event::UsageUpdated` has arrived — a fresh session with
+    /// nothing to report yet must not print "this month 0 tok" on every status line.
+    fn month_summary(&self) -> Option<String> {
+        (self.month_tokens > 0).then(|| format!("this month {} tok", self.month_tokens))
     }
 
     fn usage_summary(&self, label: &str) -> Option<String> {
@@ -956,6 +983,7 @@ mod tests {
                 tokens_remaining: Some("9850".into()),
                 reset_after: Some("60s".into()),
             },
+            month_tokens: 0,
         });
 
         let idle = app.status_line();
@@ -986,6 +1014,7 @@ mod tests {
                 total_tokens: Some(15),
             },
             rate_limit: RateLimit::default(),
+            month_tokens: 0,
         });
         assert_eq!(
             app.activity.as_ref().unwrap().started,
@@ -1008,11 +1037,13 @@ mod tests {
                 ..TokenUsage::default()
             },
             rate_limit: RateLimit::default(),
+            month_tokens: 0,
         });
         app.apply(Event::UsageUpdated {
             label: "claude:claude".into(),
             usage: TokenUsage::default(),
             rate_limit: RateLimit::default(),
+            month_tokens: 0,
         });
         app.apply(Event::ActivityStarted {
             label: "claude:claude".into(),
@@ -1024,6 +1055,49 @@ mod tests {
         assert!(line.contains("tokens unavailable"));
         assert!(line.contains("session 100 tok"));
         assert!(!line.contains("used 0 tok"));
+    }
+
+    #[test]
+    fn status_line_shows_the_this_month_total_once_it_is_reported() {
+        let mut app = app();
+        // Before any usage event, there's nothing to report yet — no "this month 0
+        // tok" noise on every idle status line from the moment the app starts.
+        assert!(!app.status_line().contains("this month"));
+
+        app.apply(Event::UsageUpdated {
+            label: "ollama:llama3".into(),
+            usage: TokenUsage::default(),
+            rate_limit: RateLimit::default(),
+            month_tokens: 12_345,
+        });
+        let line = app.status_line();
+        assert!(
+            line.contains("this month 12345 tok"),
+            "expected the persisted monthly total on the status line: {line}"
+        );
+
+        // The month total is global, not per-model: it must still show up on a
+        // different label's status line, not just the one that happened to report it.
+        app.apply(Event::ActivityStarted {
+            label: "claude:claude".into(),
+            kind: ActivityKind::Delegating,
+        });
+        let delegated = app.status_line();
+        assert!(
+            delegated.contains("this month 12345 tok"),
+            "the monthly total must not be scoped to whichever model last reported \
+             usage: {delegated}"
+        );
+
+        // A later event with a higher persisted total replaces the displayed value —
+        // it always reflects the orchestrator's latest read of the on-disk counter.
+        app.apply(Event::UsageUpdated {
+            label: "ollama:llama3".into(),
+            usage: TokenUsage::default(),
+            rate_limit: RateLimit::default(),
+            month_tokens: 12_400,
+        });
+        assert!(app.status_line().contains("this month 12400 tok"));
     }
 
     #[test]

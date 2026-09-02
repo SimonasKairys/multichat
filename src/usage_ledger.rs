@@ -176,4 +176,131 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(record_at(tmp.path(), 7, "2024-06").unwrap(), 7);
     }
+
+    /// `load` treats a missing file as "no usage yet" and every other read error as an
+    /// error. Widening that guard to accept any error would turn an unreadable ledger
+    /// into a silent reset to zero: the month's total would appear to vanish and the
+    /// next `record_at` would overwrite the file that could not be read.
+    #[test]
+    fn a_read_error_that_is_not_a_missing_file_is_never_treated_as_no_usage_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory where the file belongs fails `read_to_string` with something
+        // other than NotFound on every platform.
+        fs::create_dir(usage_file(tmp.path())).unwrap();
+        let err = record_at(tmp.path(), 5, "2024-06")
+            .expect_err("an unreadable ledger must not be reported as an empty one");
+        assert!(
+            err.to_string().contains("failed to read"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A parse failure is likewise an error, not an implicit reset.
+    #[test]
+    fn a_corrupt_ledger_is_an_error_rather_than_a_silent_reset() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(usage_file(tmp.path()), b"{not json").unwrap();
+        let err = record_at(tmp.path(), 5, "2024-06")
+            .expect_err("a corrupt ledger must not be reported as an empty one");
+        assert!(
+            err.to_string().contains("failed to parse"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `record` is the only entry point production code calls; every test above goes
+    /// through `record_at` instead, so without this one the real-clock wrapper could
+    /// return a constant and nothing would notice.
+    #[test]
+    fn record_against_the_real_clock_accumulates_a_running_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        assert_eq!(record(dir, 300).unwrap(), 300);
+        assert_eq!(record(dir, 45).unwrap(), 345);
+        // And it landed on disk under the month the real clock reports, so a later
+        // call in the same month keeps accumulating rather than starting over.
+        assert_eq!(
+            record_at(dir, 5, &current_month_utc()).unwrap(),
+            350,
+            "record must persist under the same month key current_month_utc returns"
+        );
+    }
+
+    #[test]
+    fn current_month_utc_is_this_month_in_year_dash_month_form() {
+        let month = current_month_utc();
+        let (year, rest) = month
+            .split_once('-')
+            .unwrap_or_else(|| panic!("expected YYYY-MM, got {month:?}"));
+        assert_eq!(year.len(), 4, "expected a four-digit year in {month:?}");
+        assert_eq!(rest.len(), 2, "expected a two-digit month in {month:?}");
+        let year: i32 = year.parse().unwrap();
+        let rest: u32 = rest.parse().unwrap();
+        // Not a fixed string: it has to track the clock. The lower bound is when this
+        // module was written, the upper bound is loose enough never to expire.
+        assert!(
+            (2024..=2999).contains(&year),
+            "implausible year in {month:?}"
+        );
+        assert!((1..=12).contains(&rest), "impossible month in {month:?}");
+        assert_eq!(month, month_utc(SystemTime::now()));
+    }
+
+    /// `civil_from_days` is pure arithmetic with no branches to speak of, so spot
+    /// checks against a handful of known dates leave most of its terms free to be
+    /// perturbed without any test noticing. Round-tripping every day across a wide
+    /// range against an independent inverse pins all of them: the inverse is a
+    /// separate implementation, so a change to either side breaks the identity.
+    #[test]
+    fn civil_from_days_round_trips_every_day_across_eras() {
+        // Hinnant's `days_from_civil`, the documented inverse of the function above.
+        fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
+            let y = y as i64 - if m <= 2 { 1 } else { 0 };
+            let era = if y >= 0 { y } else { y - 399 } / 400;
+            let yoe = (y - era * 400) as u64; // [0, 399]
+            let m = m as u64;
+            let doy = (153 * if m > 2 { m - 3 } else { m + 9 } + 2) / 5 + d as u64 - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            era * 146_097 + doe as i64 - 719_468
+        }
+
+        // The range has to cross an era boundary in both directions. `civil_from_days`
+        // shifts the epoch by 719_468 days and then takes a *different* branch for a
+        // negative shifted value, so a range that starts at 1970 — or even at 1900 —
+        // never executes the `z - 146_096` correction at all and leaves it free to be
+        // anything. Starting before 0000-03-01 (shifted day zero) exercises it.
+        let mut previous_day: Option<i64> = None;
+        for z in -800_000..120_000i64 {
+            let (year, month, day) = civil_from_days(z);
+            assert_eq!(
+                days_from_civil(year, month, day),
+                z,
+                "epoch day {z} decoded to {year:04}-{month:02}-{day:02}, a different day"
+            );
+            assert!(
+                (1..=12).contains(&month),
+                "epoch day {z} gave month {month}"
+            );
+            assert!((1..=31).contains(&day), "epoch day {z} gave day {day}");
+            // Consecutive epoch days must be consecutive calendar days, so no
+            // arithmetic change can stay hidden by cancelling out across the triple.
+            if let Some(previous) = previous_day {
+                assert_eq!(
+                    z - previous,
+                    1,
+                    "epoch day {z} did not follow the day before"
+                );
+            }
+            previous_day = Some(z);
+        }
+
+        // Spot-check the far end against dates computed independently — by walking the
+        // calendar a day at a time backwards from the epoch under plain leap-year
+        // rules — so the round-trip cannot pass by both implementations being wrong in
+        // the same way. Year numbering is astronomical (there is a year 0, and it is a
+        // leap year), which is what "proleptic Gregorian" means here.
+        assert_eq!(civil_from_days(-800_000), (-221, 9, 4));
+        assert_eq!(civil_from_days(-719_468), (0, 3, 1)); // shifted day zero
+        assert_eq!(civil_from_days(-719_469), (0, 2, 29)); // one day earlier, negative branch
+    }
 }

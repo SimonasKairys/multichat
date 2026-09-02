@@ -7008,6 +7008,42 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// The test above pins `month_tokens` at zero because its provider reports no
+    /// usage, which leaves "return the real running total" and "return zero" looking
+    /// identical. This one reports actual tokens, so the total has to be carried out
+    /// of the ledger rather than made up, and has to accumulate across calls.
+    #[tokio::test]
+    async fn the_month_total_reports_what_the_ledger_holds_rather_than_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(16);
+        let mut orch = workflow_orchestrator(
+            registry_with(vec![("ollama", "llama3", false)], "ollama:llama3"),
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        );
+
+        let usage = |total: u64| TokenUsage {
+            total_tokens: Some(total),
+            ..Default::default()
+        };
+        assert_eq!(orch.record_month_usage(&usage(1_200)), 1_200);
+        assert_eq!(orch.record_month_usage(&usage(300)), 1_500);
+        // A call the provider reported no usage for adds nothing but must still
+        // report the total so far, not reset the status line to zero.
+        assert_eq!(orch.record_month_usage(&TokenUsage::default()), 1_500);
+        // And it is genuinely persisted, not just accumulated in memory.
+        assert_eq!(
+            crate::usage_ledger::record(&paths.data_dir, 0).unwrap(),
+            1_500
+        );
+    }
+
     #[tokio::test]
     async fn delegation_dispatches_to_the_named_model() {
         let tmp = tempfile::tempdir().unwrap();

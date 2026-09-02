@@ -4638,6 +4638,21 @@ mod tests {
         }
 
         commands_tx.send(Command::Shutdown).await.unwrap();
+
+        // Keep collecting until the orchestrator drops its sender. Stopping at
+        // `TurnComplete` looked equivalent and was not: an event emitted around the
+        // same moment — the release of an applied task copy is the one that caught
+        // this — is sometimes still in flight when `TurnComplete` arrives, so a caller
+        // asserting on it failed intermittently and only under load. That is a race in
+        // this helper, not in the orchestrator: the event is sent either way, and
+        // draining to close observes all of them in the order they were actually
+        // emitted.
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_secs(5), events.recv()).await
+        {
+            collected.push(event);
+        }
+
         tokio::time::timeout(Duration::from_secs(5), runner)
             .await
             .expect("orchestrator did not shut down")
@@ -5135,13 +5150,16 @@ mod tests {
             2,
             "proof runs must still ask under --auto-write"
         );
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::TaskCopyReleased {
-                task_id: 1,
-                applied: true
-            }
-        )));
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::TaskCopyReleased {
+                    task_id: 1,
+                    applied: true
+                }
+            )),
+            "the copy was never applied and released; events were: {events:#?}"
+        );
         assert_eq!(commander_calls.lock().unwrap().len(), 6);
         assert_eq!(worker_calls.lock().unwrap().len(), 2);
         let final_system = &commander_calls.lock().unwrap()[5].0;

@@ -460,23 +460,187 @@ fn truncate_tail_chars(content: &str, cap: usize) -> String {
     format!("…{}", &content[start..])
 }
 
+/// What, in the surrounding grammar, is allowed to follow a quote that closes a
+/// field. This is the *only* thing the two readers of an action line disagree
+/// about, and naming it is what lets them share one scanner.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QuoteClose {
+    /// `action_argument` reads a whole `name(...)` call, so the last argument's
+    /// quote is closed by the call's `)`.
+    Call,
+    /// The field splitter reads an argument list on its own, so a field's quote is
+    /// closed by a `,` or by the end of the text.
+    Field,
+}
+
+impl QuoteClose {
+    fn follows(self, after_quote: &str) -> bool {
+        let following = after_quote.trim_start();
+        match self {
+            Self::Call => following.starts_with(')'),
+            Self::Field => following.starts_with(',') || following.is_empty(),
+        }
+    }
+}
+
+/// One step of `ActionScan`, reported to whichever reader is driving it.
+enum ActionEvent {
+    /// A character of the current field.
+    Char(char),
+    /// A top-level `,`. Whether the current field actually ends here is the
+    /// caller's decision — a field *limit* must not change how the text is
+    /// tokenized, or the two readers part company again: with a limit of two,
+    /// `worker, ,'('` stopped treating the second comma as a field start, so the
+    /// quote after it never opened, its `(` was left unbalanced, and the splitter
+    /// refused a line the scanner had accepted.
+    FieldBreak,
+    /// The `)` that closes the call, at byte index `i`. `QuoteClose::Call` only.
+    CallEnd(usize),
+    /// A `)` with no matching `(`: the text is malformed.
+    Unbalanced,
+}
+
+/// The single scanner for action text — the one place the quote, escape, and
+/// nesting rules of this grammar live.
+///
+/// There used to be two of these: `action_argument` walked the call and
+/// `split_top_level_fields_limited` walked its arguments, each with its own copy of
+/// the same three rules. Every divergence between the copies dropped a delegation
+/// silently — the scanner accepted a line, the splitter read its quotes differently
+/// and refused it, and the action vanished with no error and no ledger record; when
+/// the dropped line was a `write_file` open, its content executed as actions. The
+/// defect was fixed independently twice and a third copy survived both fixes,
+/// because a doc comment saying "these must never diverge" was all that held them
+/// together. They cannot diverge now: there is one loop.
+///
+/// The rules, each learned from a defect rather than chosen up front:
+///
+/// * A quote opens only where a field can start — the head of the list or right
+///   after a top-level `,` — and only when a matching quote still exists later.
+///   Without both guards an ordinary apostrophe (`summarize the user's login flow`)
+///   swallowed the rest of the line.
+/// * A `\` before the quote character escapes it only when this quote is not the
+///   *first* field's close and some later quote can still close a field; otherwise
+///   the backslash is a literal Windows path separator and the quote closes.
+/// * Parentheses nest, so a prompt may contain them.
+///
+/// The witnesses are `an_unterminated_quoted_argument_still_parses_as_prose`,
+/// `a_backslash_before_a_quote_and_delimiter_closes_the_quote_for_the_whole_line`,
+/// and the differential corpus test `the_two_readers_of_an_action_line_agree`.
+struct ActionScan<'a> {
+    text: &'a str,
+    chars: std::iter::Peekable<std::str::CharIndices<'a>>,
+    /// The nesting depth at which fields are separated: 1 inside a call (the call's
+    /// own `(` is already consumed by the marker), 0 for a bare argument list.
+    top_depth: usize,
+    depth: usize,
+    in_quote: Option<char>,
+    at_field_start: bool,
+    fields_done: usize,
+    /// Set when the previous character was a `\` judged to escape the quote that
+    /// follows it, so that quote is content rather than the field's close.
+    escaped_next: bool,
+    close: QuoteClose,
+}
+
+impl<'a> ActionScan<'a> {
+    /// Scans the text after `name(`, up to the `)` that closes the call.
+    fn over_call(text: &'a str) -> Self {
+        Self::new(text, 1, QuoteClose::Call)
+    }
+
+    /// Scans a bare argument list.
+    fn over_fields(text: &'a str) -> Self {
+        Self::new(text, 0, QuoteClose::Field)
+    }
+
+    fn new(text: &'a str, top_depth: usize, close: QuoteClose) -> Self {
+        Self {
+            text,
+            chars: text.char_indices().peekable(),
+            top_depth,
+            depth: top_depth,
+            in_quote: None,
+            at_field_start: true,
+            fields_done: 0,
+            escaped_next: false,
+            close,
+        }
+    }
+
+    /// Whether the text ended with every quote and parenthesis closed.
+    fn balanced(&self) -> bool {
+        self.in_quote.is_none() && self.depth == self.top_depth
+    }
+
+    fn next_event(&mut self) -> Option<ActionEvent> {
+        let (i, c) = self.chars.next()?;
+
+        if let Some(quote) = self.in_quote {
+            if self.escaped_next {
+                self.escaped_next = false;
+                return Some(ActionEvent::Char(c));
+            }
+            if c == '\\' {
+                if let Some(&(qi, next_char)) = self.chars.peek()
+                    && next_char == quote
+                {
+                    let after_quote = &self.text[qi + next_char.len_utf8()..];
+                    let closes_first_field =
+                        self.fields_done == 0 && after_quote.trim_start().starts_with(',');
+                    let has_later_closing_quote =
+                        after_quote.match_indices(quote).any(|(offset, _)| {
+                            self.close
+                                .follows(&after_quote[offset + quote.len_utf8()..])
+                        });
+                    self.escaped_next = !closes_first_field && has_later_closing_quote;
+                }
+            } else if c == quote {
+                self.in_quote = None;
+            }
+            return Some(ActionEvent::Char(c));
+        }
+
+        match c {
+            '"' | '\'' if self.at_field_start && self.text[i + c.len_utf8()..].contains(c) => {
+                self.in_quote = Some(c);
+                self.at_field_start = false;
+                Some(ActionEvent::Char(c))
+            }
+            '(' => {
+                self.depth += 1;
+                self.at_field_start = false;
+                Some(ActionEvent::Char(c))
+            }
+            ')' => {
+                if self.depth == 0 {
+                    return Some(ActionEvent::Unbalanced);
+                }
+                self.depth -= 1;
+                if self.depth == 0 && self.close == QuoteClose::Call {
+                    return Some(ActionEvent::CallEnd(i));
+                }
+                self.at_field_start = false;
+                Some(ActionEvent::Char(c))
+            }
+            ',' if self.depth == self.top_depth => {
+                self.fields_done += 1;
+                self.at_field_start = true;
+                Some(ActionEvent::FieldBreak)
+            }
+            c => {
+                if !c.is_whitespace() {
+                    self.at_field_start = false;
+                }
+                Some(ActionEvent::Char(c))
+            }
+        }
+    }
+}
+
 /// Splits a `foo, bar, baz(qux, quux)`-style action argument list on top-level
 /// commas only, respecting quoted strings and nested parentheses. Returns `None`
-/// for malformed input (an unmatched parenthesis).
-///
-/// The quote rules here deliberately mirror `action_argument`'s, because the two
-/// scanners read the same text and every past divergence between them silently
-/// dropped a delegation: `action_argument` would accept a line, this splitter
-/// would read its quotes differently, fail, and the action vanished without a
-/// trace. A quote opens only at the start of a field and only when a matching
-/// close quote still exists later — an apostrophe or a stray quote in prose is
-/// content, not structure. A `\` before the quote character escapes it only when
-/// this quote is not the first field's close and a later quote can still close
-/// the field; otherwise the backslash is a literal (a Windows path separator)
-/// and the quote closes. The tests named
-/// `an_unterminated_quoted_argument_still_parses_as_prose` and
-/// `a_backslash_before_a_quote_and_delimiter_closes_the_quote_for_the_whole_line`
-/// are the witnesses.
+/// for malformed input (an unmatched parenthesis or an unclosed quote).
 fn split_top_level_fields(inner: &str) -> Option<Vec<String>> {
     split_top_level_fields_limited(inner, usize::MAX)
 }
@@ -484,71 +648,25 @@ fn split_top_level_fields(inner: &str) -> Option<Vec<String>> {
 fn split_top_level_fields_limited(inner: &str, max_fields: usize) -> Option<Vec<String>> {
     let mut fields = Vec::new();
     let mut current = String::new();
-    let mut depth = 0usize;
-    let mut in_quote: Option<char> = None;
-    let mut at_field_start = true;
-    let mut chars = inner.char_indices().peekable();
+    let mut scan = ActionScan::over_fields(inner);
 
-    while let Some((i, c)) = chars.next() {
-        if let Some(quote) = in_quote {
-            current.push(c);
-            if c == '\\' {
-                if let Some(&(qi, next_char)) = chars.peek()
-                    && next_char == quote
-                {
-                    let after_quote = &inner[qi + next_char.len_utf8()..];
-                    let closes_first_field =
-                        fields.is_empty() && after_quote.trim_start().starts_with(',');
-                    let has_later_field_closing_quote =
-                        after_quote.match_indices(quote).any(|(offset, _)| {
-                            let following = after_quote[offset + quote.len_utf8()..].trim_start();
-                            following.starts_with(',') || following.is_empty()
-                        });
-                    if !closes_first_field && has_later_field_closing_quote {
-                        let (_, escaped_quote) = chars.next().expect("peeked");
-                        current.push(escaped_quote);
-                    }
+    while let Some(event) = scan.next_event() {
+        match event {
+            ActionEvent::Char(c) => current.push(c),
+            ActionEvent::FieldBreak => {
+                if fields.len() + 1 < max_fields {
+                    fields.push(current.trim().to_string());
+                    current.clear();
+                } else {
+                    current.push(',');
                 }
-            } else if c == quote {
-                in_quote = None;
             }
-            continue;
-        }
-
-        match c {
-            '"' | '\'' if at_field_start && inner[i + c.len_utf8()..].contains(c) => {
-                in_quote = Some(c);
-                current.push(c);
-                at_field_start = false;
-            }
-            '(' => {
-                depth += 1;
-                current.push(c);
-                at_field_start = false;
-            }
-            ')' => {
-                if depth == 0 {
-                    return None;
-                }
-                depth -= 1;
-                current.push(c);
-                at_field_start = false;
-            }
-            ',' if depth == 0 && fields.len() + 1 < max_fields => {
-                fields.push(current.trim().to_string());
-                current.clear();
-                at_field_start = true;
-            }
-            c => {
-                if !c.is_whitespace() {
-                    at_field_start = false;
-                }
-                current.push(c);
-            }
+            ActionEvent::Unbalanced => return None,
+            ActionEvent::CallEnd(_) => unreachable!("field scans never report a call end"),
         }
     }
 
-    if in_quote.is_some() || depth != 0 {
+    if !scan.balanced() {
         return None;
     }
 
@@ -1623,16 +1741,9 @@ impl SwarmLedger {
     /// the line, which also settles the one-action-per-line question the same way
     /// `strip_prefix` already settles it.
     ///
-    /// Quotes open only where an argument can start — the head of the argument list
-    /// or right after a top-level `,` — and only when a matching close quote still
-    /// exists later in the line. Both guards exist because the first quote-aware
-    /// version of this scanner entered quote mode on *any* `'` or `"`, so an ordinary
-    /// apostrophe (`delegate_task(worker, summarize the user's login flow)`) consumed
-    /// the rest of the line including the closing parenthesis, and the whole action
-    /// was silently dropped. Prose contractions are near-inevitable in prompts, so
-    /// this fired in routine operation; worse, an `ACTION: write_file(...)` open line
-    /// dropped this way un-fenced its block, and content lines written to be *stored*
-    /// were parsed as actions to *execute*.
+    /// The quote and escape rules are not repeated here: they live in `ActionScan`,
+    /// which this and `split_top_level_fields_limited` both drive, so the two readers
+    /// of the same line cannot disagree about where a quoted argument begins or ends.
     fn action_argument<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
         let trimmed = line
             .trim()
@@ -1640,68 +1751,13 @@ impl SwarmLedger {
             .trim_end_matches('`')
             .trim();
         let rest = trimmed.strip_prefix(marker)?;
-        let mut depth = 1usize;
-        let mut in_quote: Option<char> = None;
-        let mut chars = rest.char_indices().peekable();
-        let mut at_argument_start = true;
-        let mut top_level_commas = 0usize;
+        let mut scan = ActionScan::over_call(rest);
 
-        while let Some((i, c)) = chars.next() {
-            if let Some(quote_char) = in_quote {
-                if c == '\\' {
-                    // `\\` before the quote character is ambiguous: it is either an
-                    // escaped quote inside the argument, or a Windows path ending in a
-                    // separator right before the real closing quote. Peeking at the
-                    // next character or two cannot tell those apart — both look the
-                    // same locally — so decide on the only thing that actually
-                    // distinguishes them: whether a closing quote is still to come.
-                    // Skipping the quote only makes sense if the argument can still be
-                    // closed afterwards; when nothing later can close it, this quote is
-                    // the closing one and the backslash is a literal path separator.
-                    if let Some(&(qi, next_char)) = chars.peek()
-                        && next_char == quote_char
-                    {
-                        let after_quote = &rest[qi + next_char.len_utf8()..];
-                        let closes_first_argument =
-                            top_level_commas == 0 && after_quote.trim_start().starts_with(',');
-                        let has_later_call_closing_quote =
-                            after_quote.match_indices(quote_char).any(|(offset, _)| {
-                                after_quote[offset + quote_char.len_utf8()..]
-                                    .trim_start()
-                                    .starts_with(')')
-                            });
-                        if !closes_first_argument && has_later_call_closing_quote {
-                            chars.next();
-                        }
-                    }
-                } else if c == quote_char {
-                    in_quote = None;
-                }
-                continue;
-            }
-
-            match c {
-                '"' | '\'' if at_argument_start && rest[i + c.len_utf8()..].contains(c) => {
-                    in_quote = Some(c);
-                    at_argument_start = false;
-                }
-                '(' => {
-                    depth += 1;
-                    at_argument_start = false;
-                }
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(&rest[..i]);
-                    }
-                    at_argument_start = false;
-                }
-                ',' if depth == 1 => {
-                    top_level_commas += 1;
-                    at_argument_start = true;
-                }
-                c if !c.is_whitespace() => at_argument_start = false,
-                _ => {}
+        while let Some(event) = scan.next_event() {
+            match event {
+                ActionEvent::CallEnd(i) => return Some(&rest[..i]),
+                ActionEvent::Unbalanced => return None,
+                ActionEvent::Char(_) | ActionEvent::FieldBreak => {}
             }
         }
         None
@@ -3497,6 +3553,87 @@ mod tests {
         assert!(
             SwarmLedger::parse_delegations(&stripped).is_empty(),
             "file content must never execute as a delegation: {stripped}"
+        );
+    }
+
+    /// A generated corpus, not hand-picked cases: the defect this guards against was
+    /// found three times by three different literal strings, and each fix only pinned
+    /// the string that had just failed.
+    ///
+    /// The invariant is the failure mode itself. `parse_delegations` reads every line
+    /// twice — `action_argument` finds the call, then the field splitter reads its
+    /// arguments — and the damage happens when the first accepts and the second
+    /// refuses: the delegation disappears with no error and no ledger record, and if
+    /// the line was a `write_file` open, its content is parsed as actions instead of
+    /// being stored. So: whatever the scanner accepts, the splitter must be able to
+    /// read.
+    #[test]
+    fn the_two_readers_of_an_action_line_agree() {
+        // Every token that has ever been part of a divergence: both quote characters,
+        // the backslash that may or may not escape one, the delimiters, and a plain
+        // word to sit between them.
+        const TOKENS: [&str; 7] = ["a", "'", "\"", "\\", ",", "(", ")"];
+
+        let mut corpus: Vec<String> = vec![String::new()];
+        for _ in 0..4 {
+            let mut next = Vec::with_capacity(corpus.len() * TOKENS.len());
+            for base in &corpus {
+                for token in TOKENS {
+                    next.push(format!("{base}{token}"));
+                }
+            }
+            corpus.extend(next);
+        }
+
+        let mut accepted = 0usize;
+        for tail in &corpus {
+            for marker_args in [format!("worker, {tail}"), format!("1, worker, {tail}")] {
+                let three_fields = marker_args.starts_with("1, ");
+                let marker = if three_fields {
+                    "ACTION: delegate_in_copy("
+                } else {
+                    "ACTION: delegate_task("
+                };
+                let line = format!("{marker}{marker_args})");
+                let Some(inner) = SwarmLedger::action_argument(&line, marker) else {
+                    continue;
+                };
+                accepted += 1;
+
+                let limit = if three_fields { 3 } else { 2 };
+                let fields = split_top_level_fields_limited(inner, limit).unwrap_or_else(|| {
+                    panic!(
+                        "the scanner accepted {line:?} but the splitter refused its \
+                         arguments {inner:?} — this delegation would vanish silently"
+                    )
+                });
+                assert_eq!(
+                    fields.len(),
+                    limit,
+                    "{line:?}: the leading comma is top-level, so the arguments must \
+                     split into {limit} fields, got {fields:?}"
+                );
+
+                let prompt = normalize_action_field(fields.last().expect("non-empty"));
+                let found = SwarmLedger::parse_delegations(&line);
+                if prompt.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    found.len(),
+                    1,
+                    "{line:?}: scanner and splitter both read it, so exactly one \
+                     delegation must survive"
+                );
+                assert_eq!(found[0].prompt, prompt, "{line:?}: prompt disagreement");
+                assert_eq!(found[0].target, "worker", "{line:?}: target disagreement");
+            }
+        }
+
+        assert!(
+            accepted > 1_000,
+            "the corpus must actually exercise the scanner; only {accepted} lines \
+             parsed as calls"
         );
     }
 

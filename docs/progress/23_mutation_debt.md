@@ -1,13 +1,13 @@
 # Mutation Coverage Debt
 
-CI gates changed lines. `mutation-audit.yml` re-measures the crate weekly and files
-the score in an issue: measured, not remembered.
+CI gates changed lines. `mutation-audit.yml` re-measures the crate weekly and
+files the score in an issue: measured, not remembered.
 
 Full crate: ~953 mutants / ~3.5h (2026-08); awaiting the first scheduled run.
 
-2026-08-26 audit diff: 107 tested, 97 caught, 9 unviable, 1 survivor.
+2026-09-02: `usage_ledger.rs` 96/96, from 88. The 8: error paths, the
+real-clock wrapper, a pre-epoch branch no date after 1970 reaches.
 
 Debt: untouched provider/orchestrator/security paths, old vault branches.
-`restrict_to_owner` left it (see `config.rs`).
 
-Unset `RUSTFLAGS`: `-D warnings` hides stubs as unviable.
+Unset `RUSTFLAGS`: it hides stubs as unviable.

@@ -896,6 +896,21 @@ hours, so it is not the per-push gate. The 2026-08-26 audit re-measured its accu
 diff at 107 mutants: 97 caught, 9 unviable, and 1 equivalent survivor. Full-crate
 coverage remains a backlog; requiring changed lines stops that backlog growing.
 
+The backlog is now measured rather than described. `--in-diff` by construction never
+looks at code nobody touched, so the untouched orchestrator, provider, and security
+paths had no number at all, and the full-crate figure quoted above sat in
+`docs/progress/23_mutation_debt.md` for months marked "not recently re-measured".
+`.github/workflows/mutation-audit.yml` runs the whole crate weekly, uploads the
+per-mutant lists, and files the score in a rolling issue. It does not gate: a
+full-crate run would be red on day one against the pre-existing backlog, and a job
+that is always red is a job people learn to ignore.
+
+The security-posture table is checked the same way. Every load-bearing bullet in it
+carries a `<!-- proof: module::tests::name -->` marker, and `posture_proofs_test`
+fails if a named test stops existing — the moment a claim loses its witness is the
+moment someone has to decide whether the claim or the code is now wrong. A claim
+nothing exercises says `<!-- unproven: ... -->` instead, and those are budgeted.
+
 ## History
 
 **On the name:** the command, package, and on-disk state are all `simon`. The git
@@ -925,4 +940,11 @@ that no longer exist and were removed as superseded; both are recoverable at com
 
 ## License
 
-MIT OR Apache-2.0.
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. `Cargo.toml` has declared `MIT OR
+Apache-2.0` since the first Rust commit, but the repository tracked neither file until
+v0.1.0 — a declaration with nothing behind it, which is a licence nobody can rely on.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for
+inclusion in this crate by you, as defined in the Apache-2.0 licence, shall be dual
+licensed as above, without any additional terms or conditions.

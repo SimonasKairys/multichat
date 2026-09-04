@@ -6,6 +6,26 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Three more spending ceilings alongside `monthly_token_limit`:
+  `session_token_limit`, `daily_token_limit`, and `provider_token_limits` (keyed by
+  provider name, so one entry covers every model reached through that vendor). A month
+  is the billing period, but a day is the blast radius — an agent loop that goes wrong
+  burns a month's budget in an afternoon, and a monthly ceiling only notices once it is
+  gone. The narrowest spent window is the one named in the refusal, because the answer
+  differs per window: a spent session is fixed by restarting, a spent day by waiting, a
+  spent provider by delegating elsewhere.
+
+  The daily and per-provider totals live in a new `usage_windows.json` rather than
+  being added to `usage_history.json`. `MonthlyUsage` deserializes with no field-level
+  defaults and `load` turns a parse failure into an error, so extending it would have
+  made every existing ledger on every machine fail to parse. A file that has never
+  existed has no such history, and every field in it carries `#[serde(default)]` so the
+  next window added does not repeat the problem. The session total is not persisted at
+  all: a session ends with the process, so a counter that outlived it would be
+  measuring something else.
+
 ### Fixed
 
 - The keyring-anchor test leaked one OS credential per failing run and could not

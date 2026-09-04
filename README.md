@@ -140,17 +140,36 @@ endpoint.
     "copilot-enterprise": { "path": "/opt/copilot/bin/copilot", "args": ["--silent", "--prompt"], "model_arg": "--model", "stream_format": "copilot" },
     "claude": { "path": "/opt/claude/bin/claude", "model_arg": "--model", "stream_format": "claude" }
   },
-  "monthly_token_limit": 2000000
+  "session_token_limit": 200000,
+  "daily_token_limit": 500000,
+  "monthly_token_limit": 2000000,
+  "provider_token_limits": { "anthropic": 1000000 }
 }
 ```
 
-`monthly_token_limit` is a ceiling on the tokens spent in a UTC calendar month. It is
-checked against the same running total the status line shows (`usage_history.json`,
-see `src/usage_ledger.rs`) before every commander call and every delegation. Past the
-ceiling `simon` refuses the call and says which one it refused instead of making it;
-from 80% of the ceiling the session says once that it is close, and keeps working.
-Omit the field — which is what every config file written before this existed does — or
-set it to `0` for no ceiling, which is the default.
+There are four spending ceilings, all optional and all off by default. Each is checked
+before every commander call and every delegation; past any of them `simon` refuses the
+call and names both the window and the work it stopped, and from 80% of a ceiling the
+session says once that it is close and keeps working. Omit a field — which is what
+every config file written before these existed does — or set it to `0` for no ceiling.
+
+| Field | Window | Resets |
+|---|---|---|
+| `session_token_limit` | one run of the program | on exit; never persisted |
+| `daily_token_limit` | one UTC day | at midnight UTC |
+| `monthly_token_limit` | one UTC calendar month | at the turn of the month |
+| `provider_token_limits` | one vendor, per UTC month | at the turn of the month |
+
+The narrowest spent window is the one named, because the answer differs: a spent
+session is fixed by restarting, a spent day by waiting, a spent provider by delegating
+elsewhere. `provider_token_limits` is keyed by provider name rather than model label,
+so one entry covers every model reached through that vendor — which is how the metering
+it stands in for actually works, and it is what stops a metered vendor and a free local
+daemon sharing one budget.
+
+The monthly total lives in `usage_history.json` (the same number the status line shows);
+the daily and per-provider totals live in `usage_windows.json`. Both are under the data
+directory — see `src/usage_ledger.rs`.
 
 It bounds **tokens, not money**: tokens are what providers actually report, and
 per-model pricing is not something this project can track, for the same reason the

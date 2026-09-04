@@ -306,6 +306,29 @@ pub struct Settings {
     /// per-model rates this project cannot track, for the same reason `swarm.rs`'s
     /// `model_hint` states relative cost in words rather than numbers.
     pub monthly_token_limit: Option<u64>,
+    /// Ceiling on tokens spent in one UTC calendar day. Same conventions as
+    /// `monthly_token_limit`: absent or `0` means no ceiling.
+    ///
+    /// A month is the billing period, but a day is the blast radius. An agent loop that
+    /// goes wrong burns a month's budget in an afternoon, and a monthly ceiling only
+    /// notices once it is gone.
+    pub daily_token_limit: Option<u64>,
+    /// Ceiling on tokens spent by a single run of the program. Absent or `0` means no
+    /// ceiling.
+    ///
+    /// Not persisted anywhere: a session is over when the process exits, so a counter
+    /// that survived it would be measuring something else. This is the window that
+    /// catches one runaway conversation without waiting for a day or a month of other
+    /// work to accumulate underneath it.
+    pub session_token_limit: Option<u64>,
+    /// Per-provider ceilings for the UTC calendar month, keyed by provider name
+    /// (`anthropic`, `ollama`, a custom endpoint's name) rather than by model label, so
+    /// one entry covers every model reached through that vendor.
+    ///
+    /// This is where a metered vendor and a free local daemon stop sharing one budget.
+    /// A provider with no entry has no ceiling of its own and is still bound by the
+    /// session, daily, and monthly ones.
+    pub provider_token_limits: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,6 +367,9 @@ impl Default for Settings {
             connections: Default::default(),
             commander: None,
             monthly_token_limit: None,
+            daily_token_limit: None,
+            session_token_limit: None,
+            provider_token_limits: Default::default(),
         }
     }
 }

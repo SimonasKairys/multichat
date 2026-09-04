@@ -120,6 +120,19 @@ fn normalize_token_limit(limit: Option<u64>) -> Option<u64> {
     limit.filter(|&limit| limit > 0)
 }
 
+/// The provider half of a `provider:model` label, or the whole string when there is no
+/// separator.
+///
+/// Per-provider ceilings are keyed by vendor rather than by model on purpose:
+/// `anthropic:claude-opus-5` and `anthropic:claude-sonnet-5` bill to the same account,
+/// so a user who sets a limit for `anthropic` means both, and would be surprised to
+/// find it applied to whichever model they happened to name.
+fn provider_of(label: &str) -> &str {
+    label
+        .split_once(':')
+        .map_or(label, |(provider, _)| provider)
+}
+
 /// Whether a delegation may run alongside other delegations.
 ///
 /// This predicate is the safety boundary of concurrent delegation, so it states both
@@ -457,7 +470,7 @@ pub enum Event {
         /// Running total of tokens spent so far this UTC calendar month, across every
         /// model and session, persisted by `usage_ledger.rs` so it survives restarts.
         /// Set to `0` if persisting this call's tokens failed (see
-        /// `Orchestrator::record_month_usage`) rather than silently keeping the
+        /// `Orchestrator::record_call_usage`) rather than silently keeping the
         /// previous, now-inaccurate, total.
         month_tokens: u64,
     },
@@ -2580,17 +2593,70 @@ pub struct Orchestrator {
     /// `Paths` struct (whose other fields describe files this orchestrator never
     /// touches) threaded through every call site.
     data_dir: PathBuf,
-    /// `Settings::monthly_token_limit`, normalized so that `Some(0)` is stored as
-    /// `None`. `None` means no ceiling, which is what an installation that never
-    /// configured one gets, so the default session behaves exactly as it did before
-    /// this field existed.
-    monthly_token_limit: Option<u64>,
-    /// Whether the "approaching the ceiling" notice has already been shown this
-    /// session. The check runs before every commander call and every delegation, so
-    /// without this a session spending its last tenth of the budget would repeat the
-    /// same warning on every turn until it was refused — which trains the user to
-    /// ignore the line that later says the work actually stopped.
-    budget_warning_sent: bool,
+    /// Every configured spending ceiling, plus the state that belongs to this session
+    /// rather than to disk.
+    ///
+    /// One field rather than one per window: the orchestrator is built by struct
+    /// literal in dozens of tests, so each separate field is a line every one of them
+    /// has to carry. Grouping them means the next window added is a change to this
+    /// struct alone.
+    limits: SpendLimits,
+}
+
+/// The configured ceilings and the running totals that only this process knows.
+#[derive(Debug, Clone, Default)]
+pub struct SpendLimits {
+    /// Tokens this run of the program may spend. Deliberately not persisted — a
+    /// session ends with the process, so a counter that outlived it would be measuring
+    /// something else.
+    session: Option<u64>,
+    /// Tokens this UTC day may spend, across every session.
+    daily: Option<u64>,
+    /// Tokens this UTC calendar month may spend, across every session.
+    monthly: Option<u64>,
+    /// Per-provider monthly ceilings, keyed by provider name rather than model label.
+    per_provider: BTreeMap<String, u64>,
+    /// What this session has spent so far. The only window whose total lives here
+    /// rather than in `usage_ledger`.
+    session_spent: u64,
+    /// Whether the "approaching a ceiling" notice has already been shown this session.
+    /// The check runs before every commander call and every delegation, so without this
+    /// a session spending its last tenth of a budget would repeat the same warning
+    /// every turn until it was refused — which trains the user to ignore the line that
+    /// later says the work actually stopped.
+    warning_sent: bool,
+}
+
+impl SpendLimits {
+    /// Reads the ceilings out of `config.json`, folding `Some(0)` to `None` so both
+    /// spellings of "no ceiling" behave the same — see `normalize_token_limit`.
+    pub fn from_settings(settings: &Settings) -> Self {
+        Self {
+            session: normalize_token_limit(settings.session_token_limit),
+            daily: normalize_token_limit(settings.daily_token_limit),
+            monthly: normalize_token_limit(settings.monthly_token_limit),
+            per_provider: settings
+                .provider_token_limits
+                .iter()
+                .filter(|(_, limit)| **limit > 0)
+                .map(|(provider, &limit)| (provider.clone(), limit))
+                .collect(),
+            session_spent: 0,
+            warning_sent: false,
+        }
+    }
+}
+
+/// One ceiling and what has been spent against it.
+///
+/// `name` is carried because the windows are not interchangeable to the person reading
+/// the refusal: a spent session ceiling is fixed by restarting, a daily one by waiting
+/// until tomorrow, a per-provider one by delegating elsewhere. "Budget exceeded" on its
+/// own leaves the user with no next step.
+struct BudgetWindow {
+    name: String,
+    spent: u64,
+    limit: u64,
 }
 
 /// What one monthly-ceiling check concluded about the call that is about to be made.
@@ -2642,19 +2708,18 @@ impl Orchestrator {
             decisions,
             approve_all: auto_write,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         })
     }
 
-    /// Applies `Settings::monthly_token_limit` to a freshly constructed orchestrator.
+    /// Applies the configured spending ceilings to a freshly constructed orchestrator.
     ///
     /// A builder method rather than an eighth constructor parameter: `new` already
-    /// takes seven, and this one is optional in the strongest sense — a caller that
-    /// never sets it gets the pre-existing unlimited behaviour, so the only site that
-    /// has to know about ceilings is the one that has already read `Settings`.
-    pub fn with_monthly_token_limit(mut self, limit: Option<u64>) -> Self {
-        self.monthly_token_limit = normalize_token_limit(limit);
+    /// takes seven, and these are optional in the strongest sense — a caller that never
+    /// sets them gets the pre-existing unlimited behaviour, so the only site that has to
+    /// know about ceilings is the one that has already read `Settings`.
+    pub fn with_spend_limits(mut self, limits: SpendLimits) -> Self {
+        self.limits = limits;
         self
     }
 
@@ -2675,8 +2740,18 @@ impl Orchestrator {
     /// it into this month's total"; the status line stays believable (no phantom
     /// spike, no stale-looking freeze) rather than propagating an error the caller
     /// has no good way to surface anyway.
-    fn record_month_usage(&mut self, usage: &TokenUsage) -> u64 {
+    fn record_call_usage(&mut self, label: &str, usage: &TokenUsage) -> u64 {
         let tokens = usage.observed_total().unwrap_or(0);
+        // The session total is the one window with nowhere else to live, so it is
+        // updated first and unconditionally — a disk fault must not lose it.
+        self.limits.session_spent = self.limits.session_spent.saturating_add(tokens);
+        if let Err(e) =
+            crate::usage_ledger::record_windows(&self.data_dir, provider_of(label), tokens)
+        {
+            let _ = self
+                .audit
+                .log("usage.persist_failed", &safe_error_detail(&e));
+        }
         match crate::usage_ledger::record(&self.data_dir, tokens) {
             Ok(total) => total,
             Err(e) => {
@@ -2692,19 +2767,16 @@ impl Orchestrator {
     /// ceiling, without spending anything to find out.
     ///
     /// A ledger this cannot read allows the call. That is the same trade
-    /// `record_month_usage` makes in the other direction, for the same reason: a
+    /// `record_call_usage` makes in the other direction, for the same reason: a
     /// permissions problem or a concurrent writer is a disk fault, not evidence that
     /// the user is out of budget, and refusing every turn until someone finds
     /// `usage_history.json` would turn one file's failure into an unusable session.
     /// The fault is recorded as `usage.cap_unreadable` so the choice is auditable
     /// rather than silent — a ceiling that cannot be evaluated is not a ceiling, and
     /// the log says exactly when that happened.
-    fn monthly_budget_verdict(&mut self) -> BudgetVerdict {
-        let Some(limit) = self.monthly_token_limit else {
-            return BudgetVerdict::Clear;
-        };
-        let spent = match crate::usage_ledger::total(&self.data_dir) {
-            Ok(spent) => spent,
+    fn monthly_budget_verdict(&mut self, target_label: &str) -> BudgetVerdict {
+        let windows = match self.budget_windows(target_label) {
+            Ok(windows) => windows,
             Err(e) => {
                 let _ = self
                     .audit
@@ -2712,20 +2784,71 @@ impl Orchestrator {
                 return BudgetVerdict::Clear;
             }
         };
-        if spent >= limit {
+
+        // Narrowest window first: a session ceiling and a monthly ceiling can both be
+        // spent, and the one worth naming is the one the user can act on soonest.
+        if let Some(window) = windows.iter().find(|w| w.spent >= w.limit) {
             return BudgetVerdict::Refuse(format!(
-                "this month's token ceiling is spent ({spent} of {limit}). Raise \
-                 `monthly_token_limit` in config.json, or wait for the next UTC month"
+                "the {} token ceiling is spent ({} of {}). Raise it in config.json, or \
+                 wait for the window to reset",
+                window.name, window.spent, window.limit
             ));
         }
         // Multiplied out rather than divided, so a ceiling small enough that
         // `limit / 100` truncates to zero still has a real threshold.
-        if spent.saturating_mul(100) >= limit.saturating_mul(BUDGET_WARNING_PERCENT) {
+        if let Some(window) = windows
+            .iter()
+            .find(|w| w.spent.saturating_mul(100) >= w.limit.saturating_mul(BUDGET_WARNING_PERCENT))
+        {
             return BudgetVerdict::Warn(format!(
-                "approaching this month's token ceiling: {spent} of {limit} spent"
+                "approaching the {} token ceiling: {} of {} spent",
+                window.name, window.spent, window.limit
             ));
         }
         BudgetVerdict::Clear
+    }
+
+    /// Every configured ceiling that applies to a call to `target_label`, paired with
+    /// what has been spent against it, narrowest window first.
+    ///
+    /// Reads the persisted windows once per call. `Err` means the ledger could not be
+    /// read at all, which the caller turns into "allow the call" — see
+    /// `monthly_budget_verdict`.
+    fn budget_windows(&self, target_label: &str) -> Result<Vec<BudgetWindow>> {
+        let mut windows = Vec::new();
+        if let Some(limit) = self.limits.session {
+            windows.push(BudgetWindow {
+                name: "session".into(),
+                spent: self.limits.session_spent,
+                limit,
+            });
+        }
+        if let Some(limit) = self.limits.daily {
+            windows.push(BudgetWindow {
+                name: "daily".into(),
+                spent: crate::usage_ledger::day_total(&self.data_dir)?,
+                limit,
+            });
+        }
+        if let Some(limit) = self.limits.monthly {
+            windows.push(BudgetWindow {
+                name: "monthly".into(),
+                spent: crate::usage_ledger::total(&self.data_dir)?,
+                limit,
+            });
+        }
+        // Keyed by provider rather than by model label, so one entry covers every model
+        // reached through that vendor — which is how the metering it stands in for
+        // works.
+        let provider = provider_of(target_label);
+        if let Some(&limit) = self.limits.per_provider.get(provider) {
+            windows.push(BudgetWindow {
+                name: format!("{provider} monthly"),
+                spent: crate::usage_ledger::provider_total(&self.data_dir, provider)?,
+                limit,
+            });
+        }
+        Ok(windows)
     }
 
     /// Runs a monthly-ceiling check and reports whether the work named by `what` may
@@ -2741,12 +2864,12 @@ impl Orchestrator {
     /// auto-continuation caps in `run` use it the same way. A dedicated notice variant
     /// would have to be threaded through `App::apply` and the transcript renderer to
     /// carry one line of text.
-    async fn monthly_budget_allows(&mut self, what: &str) -> bool {
-        match self.monthly_budget_verdict() {
+    async fn monthly_budget_allows(&mut self, what: &str, target_label: &str) -> bool {
+        match self.monthly_budget_verdict(target_label) {
             BudgetVerdict::Clear => true,
             BudgetVerdict::Warn(notice) => {
-                if !self.budget_warning_sent {
-                    self.budget_warning_sent = true;
+                if !self.limits.warning_sent {
+                    self.limits.warning_sent = true;
                     let _ = self.audit.log("usage.cap_warning", "threshold=reached");
                     self.emit(Event::Error(notice)).await;
                 }
@@ -2932,7 +3055,14 @@ impl Orchestrator {
         // between openings takes effect here rather than only on the next launch. The
         // warning latch is deliberately not reset: it belongs to the session, and
         // reopening the picker is not new evidence that the user needs telling twice.
-        self.monthly_token_limit = normalize_token_limit(settings.monthly_token_limit);
+        let warning_sent = self.limits.warning_sent;
+        let session_spent = self.limits.session_spent;
+        self.limits = SpendLimits::from_settings(&settings);
+        // The session total and the warning latch belong to the session, not to the
+        // config file: re-reading settings must not forget what has been spent, nor
+        // arrange for the same notice to be shown twice.
+        self.limits.warning_sent = warning_sent;
+        self.limits.session_spent = session_spent;
         let candidates = discover_candidates(&settings, self.classified).await;
         let model_statuses = candidate_statuses(&candidates, &settings);
         match Registry::build_discovered(
@@ -3033,7 +3163,10 @@ impl Orchestrator {
         // reached a model, and under a spent ceiling none does. Checking each round
         // rather than only the user's first also stops an auto-continuation workflow,
         // which is where an unattended session can spend the most.
-        if !self.monthly_budget_allows("the commander call").await {
+        if !self
+            .monthly_budget_allows("the commander call", &primary_label)
+            .await
+        {
             return TurnOutcome {
                 commander_failed: true,
                 action_fingerprint: Vec::new(),
@@ -3102,7 +3235,7 @@ impl Orchestrator {
         // needs.
         drop(progress);
 
-        let month_tokens = self.record_month_usage(&reply.usage);
+        let month_tokens = self.record_call_usage(&primary_label, &reply.usage);
         self.emit(Event::UsageUpdated {
             label: primary_label.clone(),
             usage: reply.usage.clone(),
@@ -3327,7 +3460,7 @@ impl Orchestrator {
         // queued behind the in-flight window still sees what the calls ahead of it
         // spent. See `MAX_CONCURRENT_DELEGATIONS` for the overshoot this leaves.
         if !self
-            .monthly_budget_allows(&format!("delegation to {target_label}"))
+            .monthly_budget_allows(&format!("delegation to {target_label}"), &target_label)
             .await
         {
             self.report_budget_refused_delegation(delegation, &target_label)
@@ -3377,7 +3510,7 @@ impl Orchestrator {
         }
         match result {
             Ok((usage, rate_limit, sub_text)) => {
-                let month_tokens = self.record_month_usage(&usage);
+                let month_tokens = self.record_call_usage(&target_label, &usage);
                 self.emit(Event::UsageUpdated {
                     label: target_label.clone(),
                     usage,
@@ -3532,7 +3665,7 @@ impl Orchestrator {
             // the same way an unknown model is, so the commander learns on its next
             // automatic turn that the work did not run — and why.
             if !self
-                .monthly_budget_allows(&format!("delegation to {target_label}"))
+                .monthly_budget_allows(&format!("delegation to {target_label}"), &target_label)
                 .await
             {
                 let task_id = self.ledger.add_task(&delegation.prompt);
@@ -3815,7 +3948,7 @@ impl Orchestrator {
             match outcome {
                 Ok((reply, sub_writes, sub_text)) => {
                     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    let month_tokens = self.record_month_usage(&reply.usage);
+                    let month_tokens = self.record_call_usage(&target_label, &reply.usage);
                     self.emit(Event::UsageUpdated {
                         label: target_label.clone(),
                         usage: reply.usage.clone(),
@@ -5258,8 +5391,7 @@ mod tests {
             decisions,
             approve_all: auto_write,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         }
     }
 
@@ -5288,8 +5420,7 @@ mod tests {
             decisions,
             approve_all: auto_write,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         }
     }
 
@@ -7537,8 +7668,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -7601,11 +7731,17 @@ mod tests {
             total_tokens: Some(total),
             ..Default::default()
         };
-        assert_eq!(orch.record_month_usage(&usage(1_200)), 1_200);
-        assert_eq!(orch.record_month_usage(&usage(300)), 1_500);
+        assert_eq!(
+            orch.record_call_usage("ollama:llama3", &usage(1_200)),
+            1_200
+        );
+        assert_eq!(orch.record_call_usage("ollama:llama3", &usage(300)), 1_500);
         // A call the provider reported no usage for adds nothing but must still
         // report the total so far, not reset the status line to zero.
-        assert_eq!(orch.record_month_usage(&TokenUsage::default()), 1_500);
+        assert_eq!(
+            orch.record_call_usage("ollama:llama3", &TokenUsage::default()),
+            1_500
+        );
         // And it is genuinely persisted, not just accumulated in memory.
         assert_eq!(
             crate::usage_ledger::record(&paths.data_dir, 0).unwrap(),
@@ -7848,7 +7984,10 @@ mod tests {
             None,
             false,
         )
-        .with_monthly_token_limit(Some(1_000));
+        .with_spend_limits(SpendLimits {
+            monthly: Some(1_000),
+            ..Default::default()
+        });
 
         let outcome = orch.handle_prompt("summarise the project").await;
 
@@ -7871,6 +8010,154 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_of_reads_the_vendor_half_of_a_label() {
+        assert_eq!(provider_of("anthropic:claude-opus-5"), "anthropic");
+        // A model id that carries its own colons still resolves to the first segment,
+        // which is the vendor a per-provider ceiling means.
+        assert_eq!(provider_of("ollama:llama3.2:3b"), "ollama");
+        // A bare name with no separator is itself the provider, not an empty string.
+        assert_eq!(provider_of("anthropic"), "anthropic");
+    }
+
+    /// Builds an orchestrator whose only configured ceilings are the ones under test,
+    /// so a refusal names the window being exercised rather than leaving which one
+    /// fired ambiguous.
+    fn orchestrator_with_limits(
+        paths: &Paths,
+        project_root: PathBuf,
+        events: mpsc::Sender<Event>,
+        registry: Registry,
+        limits: SpendLimits,
+    ) -> Orchestrator {
+        workflow_orchestrator(registry, paths, project_root, false, events, None, false)
+            .with_spend_limits(limits)
+    }
+
+    #[tokio::test]
+    async fn a_spent_session_ceiling_stops_the_call_and_names_that_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (registry, calls) = capturing_registry("primary", "commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+
+        // The session window is the only one with no file behind it, so this is also
+        // the check that it is consulted at all.
+        let mut orch = orchestrator_with_limits(
+            &paths,
+            project_dir.path().to_path_buf(),
+            event_tx,
+            registry,
+            SpendLimits {
+                session: Some(500),
+                session_spent: 500,
+                ..Default::default()
+            },
+        );
+
+        let outcome = orch.handle_prompt("summarise the project").await;
+
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(outcome.commander_failed);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Error(message) if message.contains("session token ceiling")
+            )),
+            "a spent session is fixed by restarting, a spent month by waiting: the \
+             refusal has to say which one stopped the work: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spent_daily_ceiling_stops_the_call_while_the_month_still_has_room() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (registry, calls) = capturing_registry("primary", "commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+
+        crate::usage_ledger::record_windows(&paths.data_dir, "primary", 200).unwrap();
+        crate::usage_ledger::record(&paths.data_dir, 200).unwrap();
+        let mut orch = orchestrator_with_limits(
+            &paths,
+            project_dir.path().to_path_buf(),
+            event_tx,
+            registry,
+            SpendLimits {
+                daily: Some(200),
+                monthly: Some(1_000_000),
+                ..Default::default()
+            },
+        );
+
+        let outcome = orch.handle_prompt("summarise the project").await;
+
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(outcome.commander_failed);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Error(message)
+                    if message.contains("daily token ceiling") && !message.contains("monthly")
+            )),
+            "the narrow window is the one that fired and the one worth naming: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_per_provider_ceiling_binds_only_that_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+
+        // `expensive` has spent its allowance; `cheap` has spent nothing. A ceiling on
+        // one vendor must not stop work going to another — that is the whole reason
+        // these are keyed by provider rather than by model.
+        crate::usage_ledger::record_windows(&paths.data_dir, "expensive", 300).unwrap();
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for provider_name in ["expensive", "cheap"] {
+            let provider = ContextCapturingProvider {
+                provider: provider_name.into(),
+                model: "m".into(),
+                calls: calls.clone(),
+            };
+            providers.insert(provider.label(), Arc::new(provider));
+        }
+        let registry = Registry {
+            providers,
+            primary: "primary:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let mut orch = orchestrator_with_limits(
+            &paths,
+            project_dir.path().to_path_buf(),
+            event_tx,
+            registry,
+            SpendLimits {
+                per_provider: [("expensive".to_string(), 300u64)].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+
+        orch.run_delegations(
+            "primary:commander",
+            "ACTION: delegate_task(expensive:m, blocked)\n\
+             ACTION: delegate_task(cheap:m, allowed)",
+        )
+        .await;
+
+        let made = calls.lock().unwrap();
+        assert_eq!(made.len(), 1, "exactly one delegation should have run");
+        assert_eq!(made[0].0, "cheap:m");
+    }
+
     #[tokio::test]
     async fn a_monthly_ceiling_with_budget_left_lets_the_turn_through() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7889,7 +8176,10 @@ mod tests {
             None,
             false,
         )
-        .with_monthly_token_limit(Some(1_000));
+        .with_spend_limits(SpendLimits {
+            monthly: Some(1_000),
+            ..Default::default()
+        });
 
         let outcome = orch.handle_prompt("summarise the project").await;
 
@@ -7923,7 +8213,16 @@ mod tests {
             None,
             false,
         )
-        .with_monthly_token_limit(Some(0));
+        // Through `from_settings`, not by constructing `SpendLimits` directly: the
+        // claim under test is about what a *config file* containing zeroes means, and
+        // `from_settings` is where that folding happens.
+        .with_spend_limits(SpendLimits::from_settings(&Settings {
+            monthly_token_limit: Some(0),
+            daily_token_limit: Some(0),
+            session_token_limit: Some(0),
+            provider_token_limits: [("primary".to_string(), 0u64)].into_iter().collect(),
+            ..Default::default()
+        }));
 
         let outcome = orch.handle_prompt("summarise the project").await;
 
@@ -7956,7 +8255,10 @@ mod tests {
             None,
             false,
         )
-        .with_monthly_token_limit(Some(1_000));
+        .with_spend_limits(SpendLimits {
+            monthly: Some(1_000),
+            ..Default::default()
+        });
 
         orch.handle_prompt("first").await;
         orch.handle_prompt("second").await;
@@ -8003,7 +8305,10 @@ mod tests {
             None,
             false,
         )
-        .with_monthly_token_limit(Some(1_000));
+        .with_spend_limits(SpendLimits {
+            monthly: Some(1_000),
+            ..Default::default()
+        });
 
         orch.handle_prompt("first").await;
 
@@ -8051,7 +8356,10 @@ mod tests {
             None,
             false,
         )
-        .with_monthly_token_limit(Some(1_000));
+        .with_spend_limits(SpendLimits {
+            monthly: Some(1_000),
+            ..Default::default()
+        });
 
         orch.run_delegations(
             "primary:commander",
@@ -8112,8 +8420,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -8170,8 +8477,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -8228,8 +8534,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
         orch.ledger
             .record_commander_reply("COMMANDER-SECRET-MARKER and all delegation lines");
@@ -8308,8 +8613,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations("ollama:llama3", "ACTION: delegate_task(ghost:model, hi)")
@@ -8360,8 +8664,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -8417,8 +8720,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -8474,8 +8776,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -8539,8 +8840,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -8608,8 +8908,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -8689,8 +8988,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -8767,8 +9065,7 @@ mod tests {
             decisions: None,
             approve_all: true,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
         orch.workspace.enable_task_copies(&paths.data_dir).unwrap();
         orch.run_delegations(
@@ -8838,8 +9135,7 @@ mod tests {
             // text-only delegation.
             approve_all: true,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -8884,8 +9180,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         let long_task = format!("a{}", "€".repeat(130));
@@ -8926,8 +9221,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
@@ -8969,8 +9263,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
@@ -9021,8 +9314,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_skill_reads(
@@ -9079,8 +9371,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(nope.md)")
@@ -9140,8 +9431,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         let prompt = orch.system_prompt();
@@ -9169,8 +9459,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -9223,8 +9512,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         // Bare model name, not the full label — exercises `set_primary`'s flexible
@@ -9270,8 +9558,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.set_commander("ghost").await;
@@ -9300,8 +9587,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         // Load the ledger with content that `clear_content` is documented to drop.
@@ -9355,8 +9641,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         // `StubProvider::send` echoes `"echo: {prompt}"`, prefixing only the first
@@ -9407,8 +9692,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_file_writes(
@@ -9456,8 +9740,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_file_writes(
@@ -9503,8 +9786,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
         orch.run_delegations(
             "ollama:llama3",
@@ -9557,8 +9839,7 @@ mod tests {
             decisions: Some(decisions),
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         }
     }
 
@@ -9839,8 +10120,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
         orch.workspace.enable_task_copies(&paths.data_dir).unwrap();
 
@@ -10049,8 +10329,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -10095,8 +10374,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -10297,8 +10575,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.handle_prompt("hello").await;
@@ -10355,8 +10632,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(notes.txt)")
@@ -10394,8 +10670,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(notes.txt)")
@@ -10447,8 +10722,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(../secret.txt)")
@@ -10506,8 +10780,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         // Leading newline so the marker lands at the start of a line in the stub's
@@ -10563,8 +10836,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_file_lists("ollama:llama3", "ACTION: list_files()")
@@ -10611,8 +10883,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(missing.md)")
@@ -10661,8 +10932,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         // Traversal attempt: the file exists outside the project root but must be
@@ -10713,8 +10983,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         // Request listing of a path that does not exist inside the project root.
@@ -10796,8 +11065,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(
@@ -10848,8 +11116,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(utf8.txt)")
@@ -10890,8 +11157,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(utf8.md)")
@@ -10954,8 +11220,7 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
-            monthly_token_limit: None,
-            budget_warning_sent: false,
+            limits: SpendLimits::default(),
         };
 
         orch.run_delegations(

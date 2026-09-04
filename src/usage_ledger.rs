@@ -102,6 +102,138 @@ pub fn total(data_dir: &Path) -> Result<u64> {
     total_at(data_dir, &current_month_utc())
 }
 
+/// On-disk shape of `usage_windows.json`: the narrower spending windows that arrived
+/// after the monthly total, kept in their own file rather than added to
+/// `MonthlyUsage`.
+///
+/// A separate file because `usage_history.json` already exists on every machine that
+/// has run this program, and `MonthlyUsage` deserializes with no field-level defaults —
+/// adding fields to it would make every existing ledger fail to parse, and `load` turns
+/// a parse failure into an error rather than a reset. A file that has never existed has
+/// no such history. Every field here carries `#[serde(default)]` so the next window to
+/// be added does not repeat that problem.
+///
+/// `month` scopes `per_provider` only. The whole-month total stays in `MonthlyUsage`,
+/// which remains the single source of truth for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct UsageWindows {
+    #[serde(default)]
+    day: String,
+    #[serde(default)]
+    day_tokens: u64,
+    #[serde(default)]
+    month: String,
+    #[serde(default)]
+    per_provider: std::collections::BTreeMap<String, u64>,
+}
+
+fn windows_file(data_dir: &Path) -> PathBuf {
+    data_dir.join("usage_windows.json")
+}
+
+fn load_windows(data_dir: &Path) -> Result<UsageWindows> {
+    let path = windows_file(data_dir);
+    match fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(UsageWindows::default()),
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+fn save_windows(data_dir: &Path, windows: &UsageWindows) -> Result<()> {
+    let encoded = serde_json::to_vec_pretty(windows)?;
+    write_atomically(&windows_file(data_dir), &encoded)
+}
+
+/// Rolls both windows over as needed, then adds `tokens` to today's total and to
+/// `provider`'s total for this month.
+///
+/// Rollover works the way `record_at` does — a stored period that is not the current
+/// one is treated as ended and reset — so nothing has to notice midnight or the turn of
+/// the month; the next write does it while reading stale state.
+pub fn record_windows_at(
+    data_dir: &Path,
+    provider: &str,
+    tokens: u64,
+    current_day: &str,
+    current_month: &str,
+) -> Result<()> {
+    let mut windows = load_windows(data_dir)?;
+    if windows.day != current_day {
+        windows.day = current_day.to_string();
+        windows.day_tokens = 0;
+    }
+    if windows.month != current_month {
+        windows.month = current_month.to_string();
+        windows.per_provider.clear();
+    }
+    windows.day_tokens = windows.day_tokens.saturating_add(tokens);
+    let entry = windows
+        .per_provider
+        .entry(provider.to_string())
+        .or_insert(0);
+    *entry = entry.saturating_add(tokens);
+    save_windows(data_dir, &windows)
+}
+
+/// `record_windows_at` against the real clock.
+pub fn record_windows(data_dir: &Path, provider: &str, tokens: u64) -> Result<()> {
+    record_windows_at(
+        data_dir,
+        provider,
+        tokens,
+        &current_day_utc(),
+        &current_month_utc(),
+    )
+}
+
+/// Today's running total, read without recording anything — see `total_at` for why a
+/// spending check must not write.
+pub fn day_total_at(data_dir: &Path, current_day: &str) -> Result<u64> {
+    let windows = load_windows(data_dir)?;
+    Ok(if windows.day == current_day {
+        windows.day_tokens
+    } else {
+        0
+    })
+}
+
+/// `day_total_at` against the real clock.
+pub fn day_total(data_dir: &Path) -> Result<u64> {
+    day_total_at(data_dir, &current_day_utc())
+}
+
+/// This month's running total for one provider, read without recording anything.
+pub fn provider_total_at(data_dir: &Path, provider: &str, current_month: &str) -> Result<u64> {
+    let windows = load_windows(data_dir)?;
+    Ok(if windows.month == current_month {
+        windows.per_provider.get(provider).copied().unwrap_or(0)
+    } else {
+        0
+    })
+}
+
+/// `provider_total_at` against the real clock.
+pub fn provider_total(data_dir: &Path, provider: &str) -> Result<u64> {
+    provider_total_at(data_dir, provider, &current_month_utc())
+}
+
+/// The current UTC calendar day as `"YYYY-MM-DD"`.
+pub fn current_day_utc() -> String {
+    day_utc(SystemTime::now())
+}
+
+fn day_utc(time: SystemTime) -> String {
+    let secs = time
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = (secs / 86_400) as i64;
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// The current UTC calendar month as `"YYYY-MM"`.
 pub fn current_month_utc() -> String {
     month_utc(SystemTime::now())
@@ -223,6 +355,70 @@ mod tests {
         let before = fs::read_to_string(usage_file(dir)).unwrap();
         assert_eq!(total_at(dir, "2024-06").unwrap(), 120);
         assert_eq!(fs::read_to_string(usage_file(dir)).unwrap(), before);
+    }
+
+    #[test]
+    fn the_day_window_accumulates_and_rolls_over_independently_of_the_month() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        record_windows_at(dir, "ollama", 100, "2024-06-14", "2024-06").unwrap();
+        record_windows_at(dir, "ollama", 50, "2024-06-14", "2024-06").unwrap();
+        assert_eq!(day_total_at(dir, "2024-06-14").unwrap(), 150);
+
+        // A new day starts from zero while the month it sits in has not changed, which
+        // is the whole reason the two windows are tracked separately.
+        record_windows_at(dir, "ollama", 7, "2024-06-15", "2024-06").unwrap();
+        assert_eq!(day_total_at(dir, "2024-06-15").unwrap(), 7);
+        assert_eq!(day_total_at(dir, "2024-06-14").unwrap(), 0);
+        assert_eq!(provider_total_at(dir, "ollama", "2024-06").unwrap(), 157);
+    }
+
+    #[test]
+    fn provider_totals_are_scoped_to_one_provider_and_one_month() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        record_windows_at(dir, "anthropic", 900, "2024-06-14", "2024-06").unwrap();
+        record_windows_at(dir, "ollama", 5, "2024-06-14", "2024-06").unwrap();
+        assert_eq!(provider_total_at(dir, "anthropic", "2024-06").unwrap(), 900);
+        assert_eq!(provider_total_at(dir, "ollama", "2024-06").unwrap(), 5);
+        // A provider that has spent nothing is zero, not an error and not another
+        // provider's total.
+        assert_eq!(provider_total_at(dir, "openai", "2024-06").unwrap(), 0);
+
+        // The next month starts every provider from zero, the way `record_at` does for
+        // the whole-month total.
+        record_windows_at(dir, "openai", 3, "2024-07-01", "2024-07").unwrap();
+        assert_eq!(provider_total_at(dir, "anthropic", "2024-07").unwrap(), 0);
+        assert_eq!(provider_total_at(dir, "openai", "2024-07").unwrap(), 3);
+    }
+
+    #[test]
+    fn reading_a_window_neither_creates_nor_modifies_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Same rule as `total_at`: a ceiling check runs before any tokens are spent and
+        // must leave no trace when it allows the work.
+        assert_eq!(day_total_at(dir, "2024-06-14").unwrap(), 0);
+        assert_eq!(provider_total_at(dir, "ollama", "2024-06").unwrap(), 0);
+        assert!(!windows_file(dir).exists());
+
+        record_windows_at(dir, "ollama", 12, "2024-06-14", "2024-06").unwrap();
+        let before = fs::read_to_string(windows_file(dir)).unwrap();
+        assert_eq!(day_total_at(dir, "2024-06-14").unwrap(), 12);
+        assert_eq!(fs::read_to_string(windows_file(dir)).unwrap(), before);
+    }
+
+    #[test]
+    fn day_utc_formats_year_month_and_day_from_epoch_seconds() {
+        // 2024-01-15T00:00:00Z.
+        let t = UNIX_EPOCH + std::time::Duration::from_secs(1_705_276_800);
+        assert_eq!(day_utc(t), "2024-01-15");
+        // 2024-12-31T23:59:59Z stays on the 31st rather than rolling into January.
+        let t = UNIX_EPOCH + std::time::Duration::from_secs(1_735_689_599);
+        assert_eq!(day_utc(t), "2024-12-31");
+        // And the day it rolls into is the 1st of the next year.
+        let t = UNIX_EPOCH + std::time::Duration::from_secs(1_735_689_600);
+        assert_eq!(day_utc(t), "2025-01-01");
     }
 
     #[test]

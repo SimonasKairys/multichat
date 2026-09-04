@@ -503,7 +503,7 @@ async fn chat(
         write_gate,
         auto_write,
     )?
-    .with_monthly_token_limit(settings.monthly_token_limit);
+    .with_spend_limits(crate::orchestrator::SpendLimits::from_settings(&settings));
     let mut worker = tokio::spawn(orchestrator.run(command_rx));
 
     let ui_result = ui::run(

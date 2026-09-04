@@ -22,6 +22,17 @@ All notable changes to this project are recorded here. The format follows
   that runs on the panicking paths too, and the probe writes an anchor-sized value, so
   a store with no room skips the test the same way a machine with no keyring does.
 
+- A second, larger leak of the same credentials, from
+  `vault_save_after_chat_actually_persists_the_transcript_for_reload`. It drives the
+  real `vault_save_after_chat`, which opens a real `AuditLogger` to record
+  `vault.saved` — and that files a keyring anchor named after the test's temporary
+  directory. Unlike the keyring-anchor test it had no cleanup at all, so it leaked one
+  credential on *every* run, passing or failing. Measured before the fix: one new
+  credential per full-suite run; after it, four consecutive suite runs add none. The
+  cleanup guard now lives in `audit.rs` as `KeyringAnchorGuard` so both tests use one
+  implementation, and so the next test that opens a real logger has something to reach
+  for.
+
 ### Changed
 
 - Plain `delegate_task` calls now run concurrently, four at a time, instead of one

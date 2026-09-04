@@ -1396,6 +1396,11 @@ mod tests {
         // reads the encrypted file back to confirm the save actually happened.
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::from_data_dir(dir.path().to_path_buf()).unwrap();
+        // `vault_save_after_chat` opens a real `AuditLogger` to record `vault.saved`,
+        // which files a keyring anchor named after this temporary directory. Without
+        // this guard the test left one OS credential behind on every run — see
+        // `KeyringAnchorGuard` for what a credential store full of them then breaks.
+        let _anchor = crate::audit::KeyringAnchorGuard::new(&paths.audit_log);
         let vault = EncryptedVault::new(paths.vault_file.clone());
         assert!(
             !vault.exists(),

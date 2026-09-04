@@ -993,6 +993,40 @@ fn keyring_anchor_service(log_path: &Path) -> String {
     format!("audit-anchor-hmac-{}", hex(&hasher.finalize()))
 }
 
+/// Deletes a log's keyring anchor when it goes out of scope, on panicking paths too.
+///
+/// Any test that opens a *real* `AuditLogger` — rather than building one with
+/// `with_key`, which does no keyring I/O — files an anchor under a name derived from
+/// the log's path. Tests point that at a fresh temporary directory, so every run
+/// creates a new OS credential rather than reusing one, and nothing removes it.
+///
+/// Left unmanaged those accumulate until the credential store reaches its per-user
+/// capacity. What then happens is quiet and confusing: `sync_keyring_anchor` swallows
+/// write failures by design, so the anchor simply stops being written, and
+/// `two_real_processes...`-style tests that read it back fail on every run for a reason
+/// that has nothing to do with what they test. Measured on Windows in that state:
+/// writing 220 bytes fails with "Not enough memory resources are available to process
+/// this command" while a five-byte write still succeeds.
+///
+/// Construct one alongside the log path and *before* any logger, so it drops after
+/// them — a logger's own `Drop` is what writes the anchor.
+#[cfg(test)]
+pub(crate) struct KeyringAnchorGuard(String);
+
+#[cfg(test)]
+impl KeyringAnchorGuard {
+    pub(crate) fn new(log_path: &Path) -> Self {
+        Self(keyring_anchor_service(log_path))
+    }
+}
+
+#[cfg(test)]
+impl Drop for KeyringAnchorGuard {
+    fn drop(&mut self) {
+        let _ = Credentials::delete(&self.0);
+    }
+}
+
 /// What to do with whatever `Credentials::get(KEYRING_SERVICE)` returned. Split out
 /// from `load_or_create_key` as a pure function of `Option<&str>` — no keyring I/O —
 /// so the "generate on first run" vs. "reject a corrupt existing value" decision is
@@ -2039,25 +2073,6 @@ mod tests {
         ok
     }
 
-    /// Deletes a log's keyring anchor when it goes out of scope — on the failing and
-    /// panicking paths as well as the passing one.
-    ///
-    /// This test writes a credential named after its own temporary directory, so every
-    /// run creates a *new* entry rather than reusing one. Deleting it only at the end
-    /// of the test meant any run that failed first left one behind, and `cargo mutants`
-    /// runs this suite once per mutant with failure as the expected outcome — so
-    /// mutation-testing the crate leaked them by the hundred. Once the store fills up,
-    /// the anchor write starts failing and this test fails on every run, for a reason
-    /// that has nothing to do with what it tests, until the store is cleared by hand.
-    /// Cleaning up on the way out is what stops that being reachable.
-    struct AnchorCleanup(String);
-
-    impl Drop for AnchorCleanup {
-        fn drop(&mut self) {
-            let _ = Credentials::delete(&self.0);
-        }
-    }
-
     #[test]
     fn reproduction_test_sync_keyring_anchor_does_not_regress_concurrently_advanced_anchor() {
         if !keyring_is_available() {
@@ -2071,7 +2086,7 @@ mod tests {
         let log_path = dir.path().join("audit.log");
         // Declared before the loggers so it drops after them: their `Drop` writes the
         // anchor, and cleaning up before that would leave the entry behind again.
-        let _cleanup = AnchorCleanup(keyring_anchor_service(&log_path));
+        let _cleanup = KeyringAnchorGuard::new(&log_path);
 
         let _ = Credentials::delete(&keyring_anchor_service(&log_path));
 

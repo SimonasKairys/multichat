@@ -379,6 +379,15 @@ pub struct SwarmLedger {
     budgets: BTreeMap<String, String>,
     /// Labels of every model currently reachable.
     roster: Vec<String>,
+    /// Model label -> what delegating to it has actually achieved on this machine, from
+    /// `delegation_history`. Absent for a model nothing has been observed of yet, which
+    /// on a fresh install is all of them — so the roster is unchanged until there is
+    /// something true to add to it.
+    ///
+    /// Kept beside `budgets` rather than folded into `model_hint` because the two say
+    /// different kinds of thing: `model_hint` states what a vendor is like in general
+    /// and is hand-maintained, this states what happened here and is derived.
+    observations: BTreeMap<String, String>,
     /// Skills loaded via `ACTION: read_skill(...)`, oldest first. Capped at
     /// `MAX_LOADED_SKILLS`; see `record_skill`.
     loaded_skills: Vec<LoadedSkill>,
@@ -688,6 +697,15 @@ impl SwarmLedger {
 
     pub fn tasks(&self) -> &[Task] {
         &self.tasks
+    }
+
+    /// Replaces what has been observed of each model, keyed by label.
+    ///
+    /// Refreshed after every delegation rather than only when the roster changes, so a
+    /// model that has just failed twice is reflected in the prompt of the very next
+    /// turn — which is the turn where it matters.
+    pub fn set_observations(&mut self, observations: BTreeMap<String, String>) {
+        self.observations = observations;
     }
 
     pub fn set_roster(&mut self, roster: Vec<String>) {
@@ -1176,10 +1194,18 @@ impl SwarmLedger {
             out.push_str("No other models are reachable.\n");
         } else {
             for label in &self.roster {
-                match model_hint(label) {
-                    Some(hint) => out.push_str(&format!("- {label} — {hint}\n")),
-                    None => out.push_str(&format!("- {label}\n")),
-                }
+                // `model_hint` is what the vendor is like in general; `observations` is
+                // what happened here. Both, either, or neither — a fresh install has no
+                // observations at all and renders exactly as it did before they existed.
+                let line = match (model_hint(label), self.observations.get(label)) {
+                    (Some(hint), Some(observed)) => {
+                        format!("- {label} — {hint} · observed: {observed}\n")
+                    }
+                    (Some(hint), None) => format!("- {label} — {hint}\n"),
+                    (None, Some(observed)) => format!("- {label} — observed: {observed}\n"),
+                    (None, None) => format!("- {label}\n"),
+                };
+                out.push_str(&line);
             }
         }
         out

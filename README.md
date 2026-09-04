@@ -330,6 +330,25 @@ prompt annotates each model with roughly what it costs and how much context it h
 and the commander is told to pick the cheapest model that can do the task, keeping only
 judgement and synthesis for itself.
 
+Those cost hints are hand-written and deliberately coarse — real per-token pricing
+changes under this project. Reliability is different: it is not a property of the vendor
+at all but of this machine, and `simon` observes it on every delegation. So each roster
+entry also carries what has actually happened here, once there is enough of it to mean
+anything:
+
+```
+- ollama:mistral — local · free · no quota · smallest context · observed: 1/4 file tasks ok, ~52s; 9/9 text tasks ok, ~3s
+```
+
+The record lives in `delegation_history.json` beside the usage ledger, keyed by model
+and by the *form* of the delegation (`delegate_task`, `delegate_file_task`,
+`delegate_in_copy`) rather than by any classification of the prompt's prose — the form
+is a fact `simon` already holds and cannot be wrong about, and it is the distinction
+that matters, since a model can be good at summarising and hopeless at producing a file.
+It is local, never sent anywhere, and nothing `--classified` has to refuse. A model with
+fewer than three observations of a class is annotated with nothing, so a fresh install's
+roster is exactly what it was before this existed.
+
 That instruction is prepended to your own message rather than left in the system prompt
 alone. An agentic CLI (`claude`, `agy`) ships its own system prompt and tool loop, and
 given the mandate only in the system prompt it ignores it and does the work itself —

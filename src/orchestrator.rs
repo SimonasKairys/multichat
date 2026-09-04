@@ -2696,7 +2696,7 @@ impl Orchestrator {
         let mut workspace = Workspace::new(project_root.clone())?;
         workspace.enable_task_copies(&paths.data_dir)?;
 
-        Ok(Self {
+        let mut orchestrator = Self {
             registry,
             ledger,
             audit: AuditLogger::open(paths.audit_log.clone())?,
@@ -2709,7 +2709,11 @@ impl Orchestrator {
             approve_all: auto_write,
             data_dir: paths.data_dir.clone(),
             limits: SpendLimits::default(),
-        })
+        };
+        // Populated before the first turn so a session opens knowing what previous ones
+        // observed, rather than only learning from delegations made after startup.
+        orchestrator.refresh_roster_observations();
+        Ok(orchestrator)
     }
 
     /// Applies the configured spending ceilings to a freshly constructed orchestrator.
@@ -2763,6 +2767,47 @@ impl Orchestrator {
         }
     }
 
+    /// Folds one finished delegation into the per-model record and refreshes what the
+    /// commander is shown about the roster.
+    ///
+    /// Best-effort, like the usage ledger: a disk fault here loses an observation, and
+    /// losing an observation must never fail a delegation that has already run. The
+    /// fault is audited rather than swallowed.
+    fn record_delegation_outcome(
+        &mut self,
+        label: &str,
+        class: crate::delegation_history::TaskClass,
+        ok: bool,
+        millis: u64,
+    ) {
+        if let Err(e) = crate::delegation_history::record(&self.data_dir, label, class, ok, millis)
+        {
+            let _ = self
+                .audit
+                .log("history.persist_failed", &safe_error_detail(&e));
+        }
+        self.refresh_roster_observations();
+    }
+
+    /// Rebuilds the per-model observations rendered into the system prompt's roster.
+    ///
+    /// Called after each delegation as well as when the roster changes, so a model that
+    /// has just failed twice is reflected on the very next turn rather than the next
+    /// session. Models with too little history annotate nothing — see
+    /// `delegation_history::annotation` — so a fresh install's roster is byte-identical
+    /// to what it was before any of this existed.
+    fn refresh_roster_observations(&mut self) {
+        let observations = self
+            .registry
+            .labels()
+            .into_iter()
+            .filter_map(|label| {
+                crate::delegation_history::annotation(&self.data_dir, &label)
+                    .map(|annotation| (label, annotation))
+            })
+            .collect();
+        self.ledger.set_observations(observations);
+    }
     /// Decides whether the next provider call may be made under this month's token
     /// ceiling, without spending anything to find out.
     ///
@@ -3075,6 +3120,7 @@ impl Orchestrator {
             Ok(registry) => {
                 self.registry = registry;
                 self.ledger.set_roster(self.registry.labels());
+                self.refresh_roster_observations();
                 let _ = self.audit.log(
                     "connections.updated",
                     &format!(
@@ -3508,6 +3554,12 @@ impl Orchestrator {
         for detail in retries {
             let _ = self.audit.log("task.retrying", &detail);
         }
+        self.record_delegation_outcome(
+            &target_label,
+            crate::delegation_history::TaskClass::Text,
+            result.is_ok(),
+            millis,
+        );
         match result {
             Ok((usage, rate_limit, sub_text)) => {
                 let month_tokens = self.record_call_usage(&target_label, &usage);
@@ -3945,6 +3997,16 @@ impl Orchestrator {
                 })
                 .await;
             };
+            // The class comes from the form of the delegation, never from its prose —
+            // see `delegation_history`. A fresh copy carries no `workspace_task`, so the
+            // two file forms are told apart by that rather than by `allow_writes`.
+            let class = if delegation.workspace_task.is_some() {
+                crate::delegation_history::TaskClass::InCopy
+            } else {
+                crate::delegation_history::TaskClass::File
+            };
+            let elapsed_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.record_delegation_outcome(&target_label, class, outcome.is_ok(), elapsed_millis);
             match outcome {
                 Ok((reply, sub_writes, sub_text)) => {
                     let millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -8010,6 +8072,129 @@ mod tests {
         );
     }
 
+    /// Fails with a reason `is_retryable_delegation_error` classifies as permanent, so
+    /// the test spends no time in the retry backoff proving something about recording.
+    struct PermanentlyFailingProvider {
+        provider: String,
+        model: String,
+    }
+
+    #[async_trait]
+    impl Provider for PermanentlyFailingProvider {
+        async fn send(&self, _system: Option<&str>, _prompt: &str) -> Result<Reply> {
+            Err(anyhow!("model `{}` does not exist", self.model))
+        }
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+        fn provider_name(&self) -> &str {
+            &self.provider
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delegations_outcome_is_recorded_and_shown_on_the_roster_next_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        let registry = registry_with(
+            vec![("ollama", "llama3", false), ("ollama", "mistral", false)],
+            "ollama:llama3",
+        );
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        );
+        orch.ledger.set_roster(orch.registry.labels());
+
+        // A roster with nothing observed yet reads exactly as it always did. A fresh
+        // install is not the place to start showing statistics about nothing.
+        assert!(
+            !orch.system_prompt().contains("observed:"),
+            "an unobserved roster must be unchanged"
+        );
+
+        // `MIN_OBSERVATIONS` delegations, so the record crosses the threshold at which
+        // it is worth telling the commander anything.
+        for _ in 0..3 {
+            orch.run_delegations(
+                "ollama:llama3",
+                "ACTION: delegate_task(ollama:mistral, summarise)",
+            )
+            .await;
+        }
+
+        let prompt = orch.system_prompt();
+        let line = prompt
+            .lines()
+            .find(|line| line.contains("ollama:mistral"))
+            .expect("the delegated model must still be on the roster");
+        assert!(
+            line.contains("3/3 text tasks ok"),
+            "the commander is told to pick the cheapest model that can do the task; \
+             what actually happened here is how it can tell: {line}"
+        );
+        // The hand-written hint is not replaced by the observation — they say different
+        // kinds of thing and the commander needs both.
+        assert!(line.contains("local · free"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_delegation_is_recorded_as_a_failure_rather_than_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (event_tx, _event_rx) = mpsc::channel(64);
+
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(
+            "ollama:broken".into(),
+            Arc::new(PermanentlyFailingProvider {
+                provider: "ollama".into(),
+                model: "broken".into(),
+            }),
+        );
+        let registry = Registry {
+            providers,
+            primary: "primary:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        );
+        orch.ledger.set_roster(orch.registry.labels());
+
+        for _ in 0..3 {
+            orch.run_delegations(
+                "primary:commander",
+                "ACTION: delegate_task(ollama:broken, anything)",
+            )
+            .await;
+        }
+
+        // Recording only successes would leave a model that fails every time looking
+        // exactly like one that has never been tried.
+        let annotation =
+            crate::delegation_history::annotation(&paths.data_dir, "ollama:broken").unwrap();
+        assert!(annotation.contains("0/3 text tasks ok"), "{annotation}");
+        assert!(orch.system_prompt().contains("0/3 text tasks ok"));
+    }
     #[test]
     fn provider_of_reads_the_vendor_half_of_a_label() {
         assert_eq!(provider_of("anthropic:claude-opus-5"), "anthropic");

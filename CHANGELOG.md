@@ -8,6 +8,29 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- The roster now carries what delegating to each model has actually achieved on this
+  machine, not only a hand-written guess at what it costs. `swarm::model_hint`'s own
+  doc comment explains why it is coarse — real per-token pricing changes under this
+  project and cannot be tracked — and that trade is right for cost. It is wrong for
+  reliability, which is not a property of the vendor at all but of this machine, and
+  which `simon` already observes on every single delegation. The commander is told to
+  pick the cheapest model that can do a task; without this it has no way to learn that
+  one particular local model times out on anything longer than a paragraph.
+
+  `delegation_history.json` keeps counts, an exponential moving average of the success
+  rate, and an average duration, keyed by model and by the *form* of the delegation.
+  The form, not a classification of the prompt's prose: it is a fact the orchestrator
+  already holds and cannot be wrong about, whereas a prose classifier would add a way
+  for the record to be confidently mistaken about what it observed — and the form is
+  the distinction that matters, since a model can be good at summarising and hopeless
+  at producing a file. Local, never sent anywhere, nothing `--classified` has to refuse.
+
+  A model with fewer than three observations of a class annotates nothing, so a fresh
+  install's roster is byte-identical to what it was before this existed, and a model
+  that had one bad afternoon does not get routed around. Observations refresh after
+  every delegation rather than only at startup, so a model that has just failed twice is
+  reflected in the very next turn's prompt — which is the turn where it matters.
+
 - Three more spending ceilings alongside `monthly_token_limit`:
   `session_token_limit`, `daily_token_limit`, and `provider_token_limits` (keyed by
   provider name, so one entry covers every model reached through that vendor). A month

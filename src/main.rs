@@ -10,6 +10,7 @@ pub mod app;
 pub mod audit;
 pub mod command_runner;
 pub mod config;
+pub mod delegation_history;
 pub mod isolation;
 pub mod orchestrator;
 pub mod picker;

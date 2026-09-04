@@ -1607,7 +1607,8 @@ impl SwarmLedger {
              A sub-agent does NOT see this conversation, this ledger, or the user's \
              question — its prompt is all it gets, so state the full task and the \
              context it needs in the prompt itself. You may emit up to 10 delegation \
-             lines in one turn; they run one after another, not at the same time. The \
+             lines in one turn; plain delegate_task lines may run at the same time as \
+             each other, while every file task runs one after another. The \
              result (or, on failure, the error) is recorded in this ledger under the \
              task and becomes visible to you on your NEXT turn — not this one, since \
              this reply is already on its way out when the sub-agent runs. So do not \
@@ -3083,9 +3084,12 @@ mod tests {
     fn the_delegation_protocol_warns_that_a_sub_agent_sees_only_its_prompt() {
         let text = SwarmLedger::new().system_prompt();
         assert!(text.contains("does NOT see this conversation"));
-        // Sub-agents run sequentially (see `run_delegations`), so the prompt must not
-        // imply they run at the same time.
-        assert!(text.contains("one after another, not at the same time"));
+        // The prompt has to match how `run_delegation_requests` actually dispatches:
+        // text-only delegations run concurrently, everything touching a task copy runs
+        // one at a time. Keeping the assertion — rather than deleting it when the
+        // behaviour changed — is what stops the two drifting apart again.
+        assert!(text.contains("plain delegate_task lines may run at the same time"));
+        assert!(text.contains("every file task runs one after another"));
     }
 
     #[test]

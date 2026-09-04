@@ -36,6 +36,16 @@ use crate::workspace::Workspace;
 /// retaining a hard upper bound against a malformed or hostile commander response.
 const MAX_DELEGATIONS_PER_TURN: usize = 10;
 
+/// Text-only delegations allowed to be in flight at the same time.
+///
+/// Four rather than `MAX_DELEGATIONS_PER_TURN`, because the width of the fan-out is
+/// also the width of the monthly ceiling's blind spot: the ceiling is re-read before
+/// every launch, but a call already in flight has not recorded its tokens yet, so a
+/// batch can pass the ceiling by at most the cost of one in-flight window. Four bounds
+/// that to four answers' worth while still removing the case this exists for — three
+/// independent summarisation calls costing three round trips end to end.
+const MAX_CONCURRENT_DELEGATIONS: usize = 4;
+
 /// Skill loads and project reads honoured per turn. These are independent of the
 /// model roster: increasing delegation capacity for "ask everyone" must not also
 /// multiply filesystem work a model can trigger.
@@ -108,6 +118,161 @@ enum ActionLimit {
 /// find and re-read config.json.
 fn normalize_token_limit(limit: Option<u64>) -> Option<u64> {
     limit.filter(|&limit| limit > 0)
+}
+
+/// Whether a delegation may run alongside other delegations.
+///
+/// This predicate is the safety boundary of concurrent delegation, so it states both
+/// conditions rather than the one that happens to be sufficient. `delegate_file_task`
+/// creates a snapshot and carries `allow_writes`, but its `workspace_task` is `None` —
+/// a fresh copy has no source task — so a predicate that tested only for an existing
+/// copy would route exactly the snapshot-creating delegations into the concurrent set,
+/// which is the disk and quota race this boundary exists to prevent.
+/// `delegate_in_copy` carries `workspace_task` instead. Both write into
+/// quota-accounted directories and can pause the loop on a write approval, so both
+/// stay strictly sequential.
+fn may_run_concurrently(delegation: &Delegation) -> bool {
+    !delegation.allow_writes && delegation.workspace_task.is_none()
+}
+
+/// Forwards a provider's progress lines to the UI as `ActivityProgress` events.
+///
+/// A free function rather than only a method because a concurrently-running delegation
+/// owns nothing but a cloned event sender — see `call_text_subagent`, whose future must
+/// be `'static`. `Orchestrator::spawn_progress_forwarder` is the same thing with the
+/// sender taken from `self`.
+fn spawn_progress_forwarder_on(events: mpsc::Sender<Event>, label: String) -> ProgressSink {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(detail) = rx.recv().await {
+            // A closed UI channel here just means the session is shutting down;
+            // dropping the rest of the progress stream is correct, same as `emit`.
+            let _ = events
+                .send(Event::ActivityProgress {
+                    label: label.clone(),
+                    detail: sanitize_progress_detail(&detail),
+                })
+                .await;
+        }
+    });
+    ProgressSink::new(tx)
+}
+
+/// What one concurrently-run text delegation produced.
+///
+/// The call runs off on its own; everything that touches the ledger, the audit log or
+/// the month's token total comes back here to be applied by the single task that owns
+/// them. That is what keeps the audit log a single-writer hash chain and the ledger's
+/// ordering independent of which model answered first.
+/// Everything one text-only delegation's call needs, once the orchestrator has done
+/// the parts only it can do: the ceiling check, the ledger task, and the audit entry.
+struct PreparedTextDelegation {
+    provider: Arc<dyn Provider>,
+    task_id: usize,
+    target_label: String,
+    system: String,
+    effective_task: String,
+}
+
+struct TextDelegationOutcome {
+    task_id: usize,
+    target_label: String,
+    /// One audit detail per retry, recorded here rather than written from the
+    /// concurrent future, so the chain stays single-writer.
+    retries: Vec<String>,
+    millis: u64,
+    /// The reply's usage and quota metadata plus its text with any write block
+    /// stripped, or the error the delegation failed with.
+    result: Result<(TokenUsage, RateLimit, String)>,
+}
+
+/// Runs one text-only delegation to completion, retries included, owning everything it
+/// needs so the future is `'static` and can be polled alongside its siblings.
+///
+/// This is the serial path's provider call with the workspace machinery removed rather
+/// than a second implementation of it: a text-only delegation has no isolated copy, so
+/// there is no copy quota to watch, no rerooted provider, and no write block to
+/// execute. What remains — retry classification, backoff, and the progress sink — is
+/// identical, and the retry constants are shared with it.
+async fn call_text_subagent(
+    provider: Arc<dyn Provider>,
+    events: mpsc::Sender<Event>,
+    task_id: usize,
+    target_label: String,
+    system: String,
+    effective_task: String,
+    reannounce: Option<String>,
+) -> TextDelegationOutcome {
+    let started = Instant::now();
+    let mut attempts = 1;
+    let mut retries = Vec::new();
+    let result = loop {
+        let progress = spawn_progress_forwarder_on(events.clone(), target_label.clone());
+        let outcome = provider
+            .send_with_progress(Some(&system), &effective_task, &progress)
+            .await
+            .and_then(|reply| {
+                if reply.text.trim().is_empty() {
+                    return Err(anyhow!("{target_label} produced no output"));
+                }
+                // A text-only delegation's reply is still parsed for write blocks, and
+                // they are still discarded — the parser removes an unterminated block
+                // so its swallowed content cannot execute as another action, which
+                // means the *usable* text is what has to be judged empty, not the raw
+                // response. Same rule as the sequential path.
+                let (_, sub_text) = SwarmLedger::parse_file_writes(&reply.text);
+                if sub_text.trim().is_empty() {
+                    Err(anyhow!("{target_label} produced no usable output"))
+                } else {
+                    Ok((reply.usage, reply.rate_limit, sub_text))
+                }
+            });
+        // Drops the sink, closing the forwarding task's channel. Inside the loop
+        // because a retry needs a fresh sink; the old one's task has already ended.
+        drop(progress);
+
+        let Err(error) = outcome else {
+            break outcome;
+        };
+        let reason = error.to_string();
+        if attempts >= MAX_DELEGATION_ATTEMPTS || !is_retryable_delegation_error(&reason) {
+            break Err(error);
+        }
+        retries.push(format!(
+            "task={task_id} attempt={attempts} {}",
+            safe_error_detail(&error)
+        ));
+        let _ = events
+            .send(Event::DelegationRetry {
+                to: target_label.clone(),
+                attempt: attempts + 1,
+                max: MAX_DELEGATION_ATTEMPTS,
+                reason: sanitize_transcript_detail(&reason),
+            })
+            .await;
+        tokio::time::sleep(DELEGATION_RETRY_BACKOFF[attempts - 1]).await;
+        attempts += 1;
+        // The retry event above cleared the activity line, so it has to be
+        // re-announced or the status line stays blank for the whole next attempt.
+        // `reannounce` carries the batch's label when several calls share one line;
+        // see `run_concurrent_text_delegations`.
+        if let Some(label) = &reannounce {
+            let _ = events
+                .send(Event::ActivityStarted {
+                    label: label.clone(),
+                    kind: ActivityKind::Delegating,
+                })
+                .await;
+        }
+    };
+
+    TextDelegationOutcome {
+        task_id,
+        target_label,
+        retries,
+        millis: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        result,
+    }
 }
 
 fn hash_action_str(value: &str) -> u64 {
@@ -2609,21 +2774,7 @@ impl Orchestrator {
     /// see both call sites), `rx.recv()` returns `None` and the task's loop exits.
     /// Nothing here needs to be joined or cancelled explicitly.
     fn spawn_progress_forwarder(&self, label: String) -> ProgressSink {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let events = self.events.clone();
-        tokio::spawn(async move {
-            while let Some(detail) = rx.recv().await {
-                // A closed UI channel here just means the session is shutting down;
-                // dropping the rest of the progress stream is correct, same as `emit`.
-                let _ = events
-                    .send(Event::ActivityProgress {
-                        label: label.clone(),
-                        detail: sanitize_progress_detail(&detail),
-                    })
-                    .await;
-            }
-        });
-        ProgressSink::new(tx)
+        spawn_progress_forwarder_on(self.events.clone(), label)
     }
 
     /// Assembles the system prompt: ledger blackboard plus any skills on disk.
@@ -3112,6 +3263,243 @@ impl Orchestrator {
             .await;
     }
 
+    /// Records a delegation to a label no connected model answers to.
+    ///
+    /// Shared by the sequential and concurrent paths so the two cannot describe the
+    /// same failure differently.
+    async fn report_unknown_delegation_target(&mut self, delegation: &Delegation) {
+        let err_msg = format!("cannot delegate to unknown model `{}`", delegation.target);
+        let task_id = self.ledger.add_task(&delegation.prompt);
+        self.ledger.assign_task(task_id, &delegation.target);
+        self.ledger.record_result(task_id, &err_msg);
+        self.ledger.update_status(task_id, TaskStatus::Failed);
+        let _ = self.audit.log(
+            "task.failed",
+            &format!("task={task_id} kind=not_found detail=withheld"),
+        );
+        self.emit(Event::Error(err_msg)).await;
+        self.emit(Event::DelegationFinished {
+            to: delegation.target.clone(),
+            ok: false,
+            chars: 0,
+            millis: 0,
+        })
+        .await;
+    }
+
+    /// Records a delegation stopped by the monthly token ceiling, the way
+    /// `report_unknown_delegation_target` records one aimed at nothing.
+    ///
+    /// The refusal itself was already announced by `monthly_budget_allows`; this puts
+    /// it on the task so the commander learns on its next automatic turn that the work
+    /// did not run, and gives the status line the terminal event it needs.
+    async fn report_budget_refused_delegation(&mut self, delegation: &Delegation, label: &str) {
+        let task_id = self.ledger.add_task(&delegation.prompt);
+        self.ledger.assign_task(task_id, label);
+        self.ledger
+            .record_result(task_id, "refused: this month's token ceiling is spent");
+        self.ledger.update_status(task_id, TaskStatus::Failed);
+        let _ = self.audit.log(
+            "task.failed",
+            &format!("task={task_id} kind=budget_exhausted detail=withheld"),
+        );
+        self.emit(Event::DelegationFinished {
+            to: label.to_string(),
+            ok: false,
+            chars: 0,
+            millis: 0,
+        })
+        .await;
+    }
+
+    /// Opens one text-only delegation: the ceiling check, the ledger task, the audit
+    /// entry and the dispatch event, all on this task. Returns what the call itself
+    /// needs, or `None` when the delegation was refused before it started.
+    async fn prepare_text_delegation(
+        &mut self,
+        from: &str,
+        provider: Arc<dyn Provider>,
+        delegation: &Delegation,
+    ) -> Option<PreparedTextDelegation> {
+        let target_label = provider.label();
+
+        // Re-read before every launch rather than once for the batch, so a delegation
+        // queued behind the in-flight window still sees what the calls ahead of it
+        // spent. See `MAX_CONCURRENT_DELEGATIONS` for the overshoot this leaves.
+        if !self
+            .monthly_budget_allows(&format!("delegation to {target_label}"))
+            .await
+        {
+            self.report_budget_refused_delegation(delegation, &target_label)
+                .await;
+            return None;
+        }
+
+        let task_id = self.ledger.add_task(&delegation.prompt);
+        self.ledger.assign_task(task_id, &target_label);
+        let _ = self.audit.log(
+            "task.delegated",
+            &format!("from={from} to={target_label} task={task_id}"),
+        );
+        self.emit(Event::Delegated {
+            from: from.to_string(),
+            to: target_label.clone(),
+            task: delegation.prompt.clone(),
+        })
+        .await;
+
+        // A delegated task is intentionally isolated from the shared ledger, and a
+        // text-only one never receives the file-write protocol. Same construction as
+        // the sequential path, with `allow_writes` known to be false here.
+        let system = SwarmLedger::subagent_system_prompt(&target_label, false);
+        let preamble = subagent_preamble(provider.requires_subagent_tool_guardrails(), false);
+        Some(PreparedTextDelegation {
+            effective_task: format!("{preamble}{}", delegation.prompt),
+            provider,
+            task_id,
+            target_label,
+            system,
+        })
+    }
+
+    /// Folds one finished text delegation back into the ledger, the audit log and the
+    /// month's token total. The single writer of all three.
+    async fn finish_text_delegation(&mut self, outcome: TextDelegationOutcome) {
+        let TextDelegationOutcome {
+            task_id,
+            target_label,
+            retries,
+            millis,
+            result,
+        } = outcome;
+        for detail in retries {
+            let _ = self.audit.log("task.retrying", &detail);
+        }
+        match result {
+            Ok((usage, rate_limit, sub_text)) => {
+                let month_tokens = self.record_month_usage(&usage);
+                self.emit(Event::UsageUpdated {
+                    label: target_label.clone(),
+                    usage,
+                    rate_limit: rate_limit.clone(),
+                    month_tokens,
+                })
+                .await;
+                if let Some(budget) = rate_limit.summary() {
+                    self.ledger.update_budget(&target_label, &budget);
+                }
+                self.ledger.record_result(task_id, &sub_text);
+                self.ledger.update_status(task_id, TaskStatus::Done);
+                let _ = self.audit.log(
+                    "task.completed",
+                    &format!("task={task_id} model={target_label}"),
+                );
+                self.emit(Event::DelegationFinished {
+                    to: target_label.clone(),
+                    ok: true,
+                    chars: sub_text.chars().count(),
+                    millis,
+                })
+                .await;
+                self.emit(Event::Reply {
+                    label: target_label,
+                    text: sub_text,
+                })
+                .await;
+            }
+            Err(error) => {
+                let reason = error.to_string();
+                self.ledger.record_result(task_id, &reason);
+                self.ledger.update_status(task_id, TaskStatus::Failed);
+                let _ = self.audit.log(
+                    "task.failed",
+                    &format!("task={task_id} {}", safe_error_detail(&error)),
+                );
+                self.emit(Event::DelegationFinished {
+                    to: target_label.clone(),
+                    ok: false,
+                    chars: 0,
+                    millis,
+                })
+                .await;
+                self.emit(Event::Error(format!("{target_label}: {reason}")))
+                    .await;
+            }
+        }
+    }
+
+    /// Runs every text-only delegation from one commander reply, up to
+    /// `MAX_CONCURRENT_DELEGATIONS` of them at a time.
+    ///
+    /// Launch order is the order the commander wrote them, so ledger task ids and the
+    /// transcript's dispatch lines stay deterministic; only completion order varies,
+    /// and every result is folded back in by this task, the sole writer of the ledger
+    /// and the audit log. File delegations never reach here — see `may_run_concurrently`.
+    async fn run_concurrent_text_delegations(&mut self, from: &str, delegations: Vec<Delegation>) {
+        // Resolved before anything is launched, so a delegation aimed at no connected
+        // model is reported in the order it was written rather than whenever a
+        // resolution happened to be attempted.
+        let mut resolved = Vec::new();
+        for delegation in delegations {
+            match self.registry.get(&delegation.target) {
+                Some(provider) => resolved.push((provider, delegation)),
+                None => self.report_unknown_delegation_target(&delegation).await,
+            }
+        }
+        if resolved.is_empty() {
+            return;
+        }
+
+        // `App` keeps one activity, and applies `ActivityProgress` only when its label
+        // matches. With several calls in flight there is no single true model name, so
+        // a batch of more than one gets one line naming the batch and gives up
+        // per-model streaming detail for its duration. A batch of one keeps the model's
+        // own label and behaves exactly as it did when every delegation was sequential.
+        let activity_label = if resolved.len() > 1 {
+            format!("{} models", resolved.len())
+        } else {
+            resolved[0].0.label()
+        };
+
+        let mut pending = resolved.into_iter();
+        let mut in_flight = futures::stream::FuturesUnordered::new();
+        loop {
+            while in_flight.len() < MAX_CONCURRENT_DELEGATIONS {
+                let Some((provider, delegation)) = pending.next() else {
+                    break;
+                };
+                if let Some(prepared) = self
+                    .prepare_text_delegation(from, provider, &delegation)
+                    .await
+                {
+                    in_flight.push(call_text_subagent(
+                        prepared.provider,
+                        self.events.clone(),
+                        prepared.task_id,
+                        prepared.target_label,
+                        prepared.system,
+                        prepared.effective_task,
+                        Some(activity_label.clone()),
+                    ));
+                }
+            }
+            if in_flight.is_empty() {
+                break;
+            }
+            // Every event emitted above cleared the activity line, so it is announced
+            // here, once per pass, rather than at each launch.
+            self.emit(Event::ActivityStarted {
+                label: activity_label.clone(),
+                kind: ActivityKind::Delegating,
+            })
+            .await;
+            let Some(outcome) = futures::StreamExt::next(&mut in_flight).await else {
+                break;
+            };
+            self.finish_text_delegation(outcome).await;
+        }
+    }
+
     async fn run_delegation_requests(
         &mut self,
         from: &str,
@@ -3122,26 +3510,17 @@ impl Orchestrator {
             return None;
         }
 
+        // Text-only delegations have no isolated copy, no write protocol and no
+        // approval gate, so nothing about them has to happen one at a time. Everything
+        // that touches a task copy stays in the sequential loop below.
+        let (concurrent, serial): (Vec<_>, Vec<_>) =
+            delegations.into_iter().partition(may_run_concurrently);
+        self.run_concurrent_text_delegations(from, concurrent).await;
+
         let mut action_limit = None;
-        for delegation in delegations {
+        for delegation in serial {
             let Some(target) = self.registry.get(&delegation.target) else {
-                let err_msg = format!("cannot delegate to unknown model `{}`", delegation.target);
-                let task_id = self.ledger.add_task(&delegation.prompt);
-                self.ledger.assign_task(task_id, &delegation.target);
-                self.ledger.record_result(task_id, &err_msg);
-                self.ledger.update_status(task_id, TaskStatus::Failed);
-                let _ = self.audit.log(
-                    "task.failed",
-                    &format!("task={task_id} kind=not_found detail=withheld"),
-                );
-                self.emit(Event::Error(err_msg)).await;
-                self.emit(Event::DelegationFinished {
-                    to: delegation.target.clone(),
-                    ok: false,
-                    chars: 0,
-                    millis: 0,
-                })
-                .await;
+                self.report_unknown_delegation_target(&delegation).await;
                 continue;
             };
             let target_label = target.label();
@@ -7259,6 +7638,197 @@ mod tests {
         )
     }
 
+    #[test]
+    fn only_text_delegations_may_run_concurrently() {
+        let text = Delegation {
+            target: "worker:one".into(),
+            prompt: "summarise".into(),
+            workspace_task: None,
+            allow_writes: false,
+        };
+        assert!(may_run_concurrently(&text));
+
+        // `delegate_file_task`: makes a fresh copy, so it carries `allow_writes` while
+        // its `workspace_task` is still `None`. A predicate that tested only for an
+        // existing copy would call this concurrent — the exact inversion this guards.
+        let fresh_file_task = Delegation {
+            allow_writes: true,
+            ..text.clone()
+        };
+        assert!(!may_run_concurrently(&fresh_file_task));
+
+        // `delegate_in_copy`: continues an existing copy.
+        let in_copy = Delegation {
+            workspace_task: Some(12),
+            ..text.clone()
+        };
+        assert!(!may_run_concurrently(&in_copy));
+
+        let in_copy_writing = Delegation {
+            workspace_task: Some(12),
+            allow_writes: true,
+            ..text
+        };
+        assert!(!may_run_concurrently(&in_copy_writing));
+    }
+
+    /// Records how many delegated calls were inside the provider at the same moment,
+    /// which is what "concurrent" means here — an elapsed-time assertion would only
+    /// say the machine was fast.
+    #[derive(Default)]
+    struct Overlap {
+        current: usize,
+        max: usize,
+    }
+
+    struct OverlapProvider {
+        provider: String,
+        model: String,
+        state: Arc<std::sync::Mutex<Overlap>>,
+    }
+
+    #[async_trait]
+    impl Provider for OverlapProvider {
+        async fn send(&self, _system: Option<&str>, _prompt: &str) -> Result<Reply> {
+            {
+                let mut state = self.state.lock().unwrap();
+                state.current += 1;
+                state.max = state.max.max(state.current);
+            }
+            // Long enough that every call permitted to start has started before the
+            // first one returns, and short enough not to slow the suite noticeably.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            self.state.lock().unwrap().current -= 1;
+            Ok(Reply {
+                text: format!("done by {}", self.model),
+                rate_limit: RateLimit::default(),
+                usage: TokenUsage::default(),
+            })
+        }
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+        fn provider_name(&self) -> &str {
+            &self.provider
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+    }
+
+    fn overlap_registry(models: &[&str]) -> (Registry, Arc<std::sync::Mutex<Overlap>>) {
+        let state = Arc::new(std::sync::Mutex::new(Overlap::default()));
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        for model in models {
+            let provider = OverlapProvider {
+                provider: "worker".into(),
+                model: (*model).into(),
+                state: state.clone(),
+            };
+            providers.insert(provider.label(), Arc::new(provider));
+        }
+        (
+            Registry {
+                providers,
+                primary: "primary:commander".into(),
+                applied: BTreeMap::new(),
+                connection_ids: BTreeMap::new(),
+            },
+            state,
+        )
+    }
+
+    #[tokio::test]
+    async fn text_delegations_run_at_the_same_time_up_to_the_concurrency_width() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let models = ["one", "two", "three", "four", "five", "six"];
+        let (registry, state) = overlap_registry(&models);
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        );
+
+        let reply = models
+            .iter()
+            .map(|model| format!("ACTION: delegate_task(worker:{model}, task for {model})"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        orch.run_delegations("primary:commander", &reply).await;
+
+        let max = state.lock().unwrap().max;
+        assert!(
+            max > 1,
+            "six independent text delegations must not have run one at a time"
+        );
+        assert!(
+            max <= MAX_CONCURRENT_DELEGATIONS,
+            "the fan-out is bounded because its width is also the monthly ceiling's \
+             blind spot; saw {max} in flight"
+        );
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::DelegationFinished { ok: true, .. }))
+                .count(),
+            6,
+            "every delegation still has to finish and report: {events:?}"
+        );
+        assert_eq!(orch.ledger.tasks().len(), 6);
+        assert!(
+            orch.ledger
+                .tasks()
+                .iter()
+                .all(|task| task.status == TaskStatus::Done)
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_delegations_keep_the_ledger_in_the_order_the_commander_wrote_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (registry, _state) = overlap_registry(&["one", "two", "three"]);
+        let (event_tx, _event_rx) = mpsc::channel(256);
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        );
+
+        orch.run_delegations(
+            "primary:commander",
+            "ACTION: delegate_task(worker:three, third)\n\
+             ACTION: delegate_task(worker:one, first)\n\
+             ACTION: delegate_task(worker:two, second)",
+        )
+        .await;
+
+        // Completion order is not fixed; task ids are assigned at launch, and launch
+        // follows the commander's own line order. The ledger the commander reads back
+        // next turn therefore matches what it asked for, whoever answered first.
+        let assigned: Vec<_> = orch
+            .ledger
+            .tasks()
+            .iter()
+            .map(|task| task.assigned_to.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(assigned, ["worker:three", "worker:one", "worker:two"]);
+    }
+
     #[tokio::test]
     async fn a_spent_monthly_ceiling_stops_the_commander_call() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7676,7 +8246,11 @@ mod tests {
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
-        for (index, (label, system, prompt)) in calls.iter().enumerate() {
+        // Keyed off each call's own label rather than its position: text-only
+        // delegations run concurrently, so which of the two lands first is not fixed.
+        // The label is what identifies the caller, and using it makes the assertion
+        // say what it means — this model got its own task and nobody else's.
+        for (label, system, prompt) in calls.iter() {
             assert!(
                 system.contains(&format!("connected as `{label}`")),
                 "delegated model did not receive its own identity: {system}"
@@ -7695,15 +8269,10 @@ mod tests {
                     && !system.contains("### File read protocol"),
                 "delegated model received shared conversation/task context: {system}"
             );
-            let own_marker = if index == 0 {
-                "FIRST-TASK-MARKER"
+            let (own_marker, other_marker) = if label == "worker:one" {
+                ("FIRST-TASK-MARKER", "SECOND-TASK-MARKER")
             } else {
-                "SECOND-TASK-MARKER"
-            };
-            let other_marker = if index == 0 {
-                "SECOND-TASK-MARKER"
-            } else {
-                "FIRST-TASK-MARKER"
+                ("SECOND-TASK-MARKER", "FIRST-TASK-MARKER")
             };
             assert!(
                 prompt.contains(own_marker)

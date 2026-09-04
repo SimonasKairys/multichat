@@ -6,6 +6,36 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Plain `delegate_task` calls now run concurrently, four at a time, instead of one
+  after another. A commander that hands four independent analyses to four models no
+  longer costs the sum of four round trips. Everything touching a task copy —
+  `delegate_file_task`, `delegate_in_copy`, worker writes, proof commands — stays
+  strictly sequential: copy quotas are accounted serially and a write approval pauses
+  the loop until the user answers. The boundary is one predicate,
+  `may_run_concurrently`, which tests both `allow_writes` and `workspace_task` rather
+  than whichever is sufficient today — `delegate_file_task` creates a fresh copy and so
+  carries no `workspace_task`, and a predicate testing only for an existing copy would
+  route exactly the snapshot-creating delegations into the concurrent set.
+
+  Launch order stays the order the commander wrote its lines, so ledger task ids and
+  dispatch lines are unchanged; only the order results arrive in varies. Every result
+  is still folded into the ledger and the audit log by the single task that owns them,
+  which keeps the audit chain single-writer. The delegation protocol in the system
+  prompt now says which forms run together, and its guard test asserts the new wording
+  rather than being deleted — that assertion is what keeps prompt and behaviour from
+  drifting apart.
+
+  Four rather than ten because the width of the fan-out is also the blind spot of
+  `monthly_token_limit`: a call in flight has not recorded its tokens yet, so a batch
+  can pass the ceiling by at most one window's cost. The ceiling is re-read before every
+  launch, so anything queued behind that window still sees what ran ahead of it.
+
+  While several calls are in flight the status line names the batch rather than a
+  single model, because `App` keeps one activity and applies streaming progress only
+  when its label matches; a batch of one is unchanged.
+
 ### Added
 
 - `monthly_token_limit` in `config.json`: an optional ceiling on the tokens spent in a

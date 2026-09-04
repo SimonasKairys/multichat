@@ -253,7 +253,24 @@ the isolated copy as its working directory — not the shared ledger, conversati
 other models' prompts and results. This prevents sequential workers from copying one
 another's answers or identities. Ordinary `delegate_task` calls are text-only; only
 file-task forms receive the write protocol. At most 10 delegations run per commander
-turn, and they run one after another, not concurrently.
+turn.
+
+Plain `delegate_task` calls run **concurrently**, up to four at a time: they have no
+isolated copy, no write protocol and no approval gate, so nothing about them has to
+happen one at a time. Everything that touches a task copy — `delegate_file_task`,
+`delegate_in_copy`, worker writes and proof commands — still runs strictly one after
+another, because copy quotas are accounted serially and a write approval pauses the
+loop until you answer. Launch order is the order the commander wrote the lines, so
+ledger task ids and the transcript's dispatch lines do not depend on which model
+answers first; only the order results arrive in does. While more than one call is in
+flight the status line names the batch (`4 models`) rather than a single model, and
+per-model streaming detail is not shown for its duration.
+
+The width is capped at four because it is also the blind spot of
+`monthly_token_limit`: a call already in flight has not recorded its tokens yet, so a
+batch can pass the ceiling by at most the cost of one in-flight window. The ceiling is
+re-read before every launch, so delegations queued behind that window do see what the
+calls ahead of them spent.
 
 Snapshots exclude `.git`, credential-shaped files such as `.env` and private keys,
 symlinks, sockets/FIFOs/devices, `.simon-run`, and common dependency/build caches such

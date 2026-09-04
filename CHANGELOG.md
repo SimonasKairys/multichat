@@ -6,6 +6,22 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The keyring-anchor test leaked one OS credential per failing run and could not
+  detect the condition that made it fail. It names its credential after its own
+  temporary directory, so every run creates a new entry, and the entry was deleted
+  only on the passing path — while `cargo mutants` runs this suite once per mutant
+  with failure as the expected outcome. Several hundred accumulated, the Windows
+  credential store reached its per-user capacity, and from then on the anchor write
+  failed and the test failed on every run for a reason unrelated to what it tests.
+  Measured: with the store in that state, writing 220 bytes fails with "Not enough
+  memory resources are available to process this command" while a five-byte write
+  still succeeds — which is why `keyring_is_available`'s five-byte probe reported the
+  keyring as usable and the test ran instead of skipping. Cleanup is now an RAII guard
+  that runs on the panicking paths too, and the probe writes an anchor-sized value, so
+  a store with no room skips the test the same way a machine with no keyring does.
+
 ### Changed
 
 - Plain `delegate_task` calls now run concurrently, four at a time, instead of one

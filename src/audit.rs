@@ -2025,19 +2025,53 @@ mod tests {
     /// that cannot run in an environment is not the same as a test that failed in it.
     fn keyring_is_available() -> bool {
         const PROBE: &str = "simon-test-keyring-probe";
-        let ok = Credentials::set(PROBE, "probe").is_ok();
+        // Sized like a real anchor rather than like a word. A Windows credential store
+        // that has reached its per-user capacity still accepts a five-byte value while
+        // refusing an anchor-sized one — measured: writing 220 bytes fails with "Not
+        // enough memory resources are available to process this command" while a
+        // five-byte write succeeds. A tiny probe therefore reports "keyring available"
+        // in exactly the environment this guard exists to skip, and the test then fails
+        // at `sync_keyring_anchor`'s write instead of skipping. An `Anchor` serializes
+        // to roughly 200 bytes of JSON.
+        let probe = "x".repeat(256);
+        let ok = Credentials::set(PROBE, &probe).is_ok();
         let _ = Credentials::delete(PROBE);
         ok
+    }
+
+    /// Deletes a log's keyring anchor when it goes out of scope — on the failing and
+    /// panicking paths as well as the passing one.
+    ///
+    /// This test writes a credential named after its own temporary directory, so every
+    /// run creates a *new* entry rather than reusing one. Deleting it only at the end
+    /// of the test meant any run that failed first left one behind, and `cargo mutants`
+    /// runs this suite once per mutant with failure as the expected outcome — so
+    /// mutation-testing the crate leaked them by the hundred. Once the store fills up,
+    /// the anchor write starts failing and this test fails on every run, for a reason
+    /// that has nothing to do with what it tests, until the store is cleared by hand.
+    /// Cleaning up on the way out is what stops that being reachable.
+    struct AnchorCleanup(String);
+
+    impl Drop for AnchorCleanup {
+        fn drop(&mut self) {
+            let _ = Credentials::delete(&self.0);
+        }
     }
 
     #[test]
     fn reproduction_test_sync_keyring_anchor_does_not_regress_concurrently_advanced_anchor() {
         if !keyring_is_available() {
-            eprintln!("skipping: no OS keyring in this environment");
+            eprintln!(
+                "skipping: no OS keyring here that can hold an anchor — either none is \
+                 available, or the credential store is full"
+            );
             return;
         }
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("audit.log");
+        // Declared before the loggers so it drops after them: their `Drop` writes the
+        // anchor, and cleaning up before that would leave the entry behind again.
+        let _cleanup = AnchorCleanup(keyring_anchor_service(&log_path));
 
         let _ = Credentials::delete(&keyring_anchor_service(&log_path));
 
@@ -2062,8 +2096,8 @@ mod tests {
             anchor_after_logger1_drop.count, 3,
             "stale logger drop regressed keyring anchor from 3 to 0!"
         );
-
-        let _ = Credentials::delete(&keyring_anchor_service(&log_path));
+        // No explicit delete here: `_cleanup` does it on the way out of every path,
+        // including the two `expect`s above.
     }
 
     #[test]

@@ -303,6 +303,28 @@ quota is stopped and released. Otherwise copies are retained until explicitly
 applied/discarded or until the session ends. A fresh copy is also released if its
 provider fails before producing usable work.
 
+**Consulting several models at once.** Because plain `delegate_task` calls run
+concurrently, one commander reply carrying the same prompt to several models *is* a
+consultation — no separate command exists or is needed. What `simon` adds is the part
+that makes it worth doing: when two or more different models have answered the same
+request, the ledger names the group and asks for the answers to be read against each
+other rather than one after another, which is what a model left with a plain task list
+tends not to do.
+
+```
+### Consultations
+- 2 answered the same request — make the failing test pass: #1 ollama:mistral (proof
+  failed, exit 1), #2 anthropic:claude (proof passed)
+  Read those results against each other rather than in turn. …a proof that ran beats a
+  majority that did not, and one well-argued minority answer beats several vague ones.
+```
+
+Where a task ran a proof command, its outcome is reported beside it. That is the point:
+ranking answers by how they read is what a tool with no ground truth has to do, and this
+one can run the tests. The section points at the task entries rather than repeating
+their results, and is dropped whole if the prompt budget is tight — it is an aid to
+reading results the commander already has, not a replacement for them.
+
 **The commander orients and proposes before it delegates.** Given anything more than a
 direct question it works in three steps: look at the project first (listing directories
 and reading the few files that decide the answer, with its own read requests — not by

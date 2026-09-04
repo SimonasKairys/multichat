@@ -336,6 +336,14 @@ const BUDGET_NOTE_RESERVE_CHARS: usize = 1000;
 /// cannot simply be dropped instead: a model cannot delegate to a model it cannot see,
 /// which is why they are capped and announced rather than budgeted like content.
 const ROSTER_MAX_CHARS: usize = 2000;
+
+/// How much of a consulted prompt is echoed when naming the group it identifies.
+///
+/// The prompt is already rendered in full on each task entry above; this only has to be
+/// enough for the commander to recognise *which* request the group answered. Echoing it
+/// whole would spend the budget twice on the same text, which is what the whole section
+/// is built to avoid.
+const MAX_CONSULTATION_PROMPT_CHARS: usize = 120;
 const RESOURCE_BUDGETS_MAX_CHARS: usize = 1000;
 
 /// Checks whether `text` fits in the remaining content budget, consuming it if so.
@@ -1134,6 +1142,16 @@ impl SwarmLedger {
         let mut budget = available - note_budget;
 
         out.push_str(&self.render_tasks_section(&mut budget, &mut note_budget));
+        // After the tasks it points at, so the numbers it names have just been read.
+        // Rendered only if it fits in what is left: it is an aid to reading results the
+        // commander already has, not a load-bearing section, so dropping it whole is
+        // better than taking characters from the results themselves.
+        let consultations = self.render_consultations();
+        let consultations_len = consultations.chars().count();
+        if consultations_len <= budget {
+            budget -= consultations_len;
+            out.push_str(&consultations);
+        }
         out.push_str(&self.render_previous_turn_section(&mut budget, &mut note_budget));
         out.push_str(&self.render_loaded_skills_section(&mut budget, &mut note_budget));
         out.push_str(&self.render_loaded_reads_section(&mut budget, &mut note_budget));
@@ -1209,6 +1227,99 @@ impl SwarmLedger {
             }
         }
         out
+    }
+
+    /// Names any group of tasks that were given the *same* prompt, and asks for a
+    /// synthesis of them rather than a summary.
+    ///
+    /// The commander can already consult several models at once — since text
+    /// delegations run concurrently, that is one reply carrying several
+    /// `delegate_task` lines with the same prompt. No new action was needed for it. What
+    /// it had no help with is the part that makes consulting several models worth doing:
+    /// reading the answers *against* each other instead of one after another. Left to
+    /// the plain task list, a model tends to relay the last answer it read.
+    ///
+    /// Deliberately a pointer to the task entries rather than a repetition of them.
+    /// Their results are already rendered above, and printing them twice would spend
+    /// the prompt budget twice on the same text — the scarce thing here is characters,
+    /// not the model's ability to look up a task number.
+    ///
+    /// Where a task produced a proof run, its outcome is reported alongside. That is
+    /// this project's advantage over ranking answers by how they read: when the work was
+    /// a file task with a test behind it, agreement is not the strongest evidence
+    /// available — passing is.
+    fn render_consultations(&self) -> String {
+        let mut groups: BTreeMap<&str, Vec<&Task>> = BTreeMap::new();
+        for task in &self.tasks {
+            if task.result.is_some() && task.assigned_to.is_some() {
+                groups
+                    .entry(task.description.as_str())
+                    .or_default()
+                    .push(task);
+            }
+        }
+
+        let mut out = String::new();
+        for (prompt, tasks) in groups {
+            // Two answers to the same question from two *different* models is a
+            // consultation; the same model asked twice is a retry, and saying "compare
+            // these" about one model's two attempts would be noise.
+            let distinct: std::collections::BTreeSet<&str> = tasks
+                .iter()
+                .filter_map(|task| task.assigned_to.as_deref())
+                .collect();
+            if distinct.len() < 2 {
+                continue;
+            }
+            if out.is_empty() {
+                out.push_str("\n### Consultations\n");
+            }
+            let members: Vec<String> = tasks
+                .iter()
+                .map(|task| {
+                    let assignee = task.assigned_to.as_deref().unwrap_or("unassigned");
+                    match self.proof_summary(task.id) {
+                        Some(proof) => format!("#{} {assignee} ({proof})", task.id),
+                        None => format!("#{} {assignee}", task.id),
+                    }
+                })
+                .collect();
+            out.push_str(&format!(
+                "- {} answered the same request — {}: {}\n",
+                members.len(),
+                truncate_head_chars(prompt, MAX_CONSULTATION_PROMPT_CHARS),
+                members.join(", ")
+            ));
+        }
+        if !out.is_empty() {
+            out.push_str(
+                "  Read those results against each other rather than in turn. Say what \
+                 they agree on, name where they differ, and settle each difference on \
+                 the strength of the reasoning or the evidence — a proof that ran beats \
+                 a majority that did not, and one well-argued minority answer beats \
+                 several vague ones. Give the user the settled answer in your own voice, \
+                 without attributing claims to individual models.\n",
+            );
+        }
+        out
+    }
+
+    /// How a task's most recent proof run turned out, if it had one.
+    ///
+    /// Most recent rather than first: a red-then-green workflow runs a failing test
+    /// before a passing one on the same task, and the state that matters is where it
+    /// ended up.
+    fn proof_summary(&self, task_id: usize) -> Option<String> {
+        let record = self
+            .run_records
+            .iter()
+            .rev()
+            .find(|record| record.task_id == task_id)?;
+        Some(match &record.outcome {
+            RunOutcome::Exited(0) => "proof passed".to_string(),
+            RunOutcome::Exited(code) => format!("proof failed, exit {code}"),
+            other => format!("proof {}", other.label().to_lowercase()),
+        })
     }
 
     fn render_resource_budgets(&self) -> String {
@@ -3118,6 +3229,125 @@ mod tests {
         assert!(text.contains("every file task runs one after another"));
     }
 
+    #[test]
+    fn two_models_given_the_same_prompt_are_grouped_and_asked_for_a_synthesis() {
+        let mut ledger = SwarmLedger::new();
+        let first = ledger.add_task("compare the two parser designs");
+        ledger.assign_task(first, "ollama:mistral");
+        ledger.record_result(first, "the recursive one is clearer");
+        ledger.update_status(first, TaskStatus::Done);
+        let second = ledger.add_task("compare the two parser designs");
+        ledger.assign_task(second, "anthropic:claude");
+        ledger.record_result(second, "the table-driven one is faster");
+        ledger.update_status(second, TaskStatus::Done);
+
+        let prompt = ledger.system_prompt();
+        assert!(prompt.contains("### Consultations"), "{prompt}");
+        assert!(prompt.contains("#1 ollama:mistral"), "{prompt}");
+        assert!(prompt.contains("#2 anthropic:claude"), "{prompt}");
+        assert!(
+            prompt.contains("Read those results against each other rather than in turn"),
+            "left to the plain task list a model relays the last answer it read: {prompt}"
+        );
+        // The results themselves are rendered once, on the task entries — printing them
+        // again here would spend the prompt budget twice on the same text.
+        assert_eq!(
+            prompt.matches("the recursive one is clearer").count(),
+            1,
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn one_model_asked_the_same_thing_twice_is_a_retry_not_a_consultation() {
+        let mut ledger = SwarmLedger::new();
+        for _ in 0..2 {
+            let id = ledger.add_task("summarise the diff");
+            ledger.assign_task(id, "ollama:mistral");
+            ledger.record_result(id, "done");
+            ledger.update_status(id, TaskStatus::Done);
+        }
+        assert!(
+            !ledger.system_prompt().contains("### Consultations"),
+            "asking one model twice produces nothing to compare"
+        );
+    }
+
+    #[test]
+    fn a_consultation_reports_each_members_proof_outcome() {
+        let mut ledger = SwarmLedger::new();
+        let failed = ledger.add_task("make the failing test pass");
+        ledger.assign_task(failed, "ollama:mistral");
+        ledger.record_result(failed, "patched the parser");
+        ledger.record_run(
+            failed,
+            &["cargo".into(), "test".into()],
+            RunOutcome::Exited(1),
+            "",
+            10,
+        );
+        let passed = ledger.add_task("make the failing test pass");
+        ledger.assign_task(passed, "anthropic:claude");
+        ledger.record_result(passed, "patched the lexer");
+        ledger.record_run(
+            passed,
+            &["cargo".into(), "test".into()],
+            RunOutcome::Exited(0),
+            "",
+            10,
+        );
+
+        let prompt = ledger.system_prompt();
+        // Ranking prose by how it reads is what a tool with no ground truth has to do.
+        // This one can run the tests, so the ranking says which answer actually worked.
+        assert!(
+            prompt.contains("#1 ollama:mistral (proof failed, exit 1)"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("#2 anthropic:claude (proof passed)"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("a proof that ran beats a majority that did not"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn a_later_proof_run_supersedes_an_earlier_one_on_the_same_task() {
+        let mut ledger = SwarmLedger::new();
+        let red_then_green = ledger.add_task("fix it");
+        ledger.assign_task(red_then_green, "ollama:mistral");
+        ledger.record_result(red_then_green, "fixed");
+        ledger.record_run(
+            red_then_green,
+            &["cargo".into()],
+            RunOutcome::Exited(1),
+            "",
+            10,
+        );
+        ledger.record_run(
+            red_then_green,
+            &["cargo".into()],
+            RunOutcome::Exited(0),
+            "",
+            10,
+        );
+        let other = ledger.add_task("fix it");
+        ledger.assign_task(other, "anthropic:claude");
+        ledger.record_result(other, "also fixed");
+
+        // A red-then-green workflow runs a failing test before a passing one on the
+        // same task; where it ended up is the state that matters.
+        assert!(
+            ledger
+                .system_prompt()
+                .contains("#1 ollama:mistral (proof passed)"),
+            "{}",
+            ledger.system_prompt()
+        );
+    }
     #[test]
     fn the_roster_annotates_each_model_with_cost_and_context() {
         let mut ledger = SwarmLedger::new();

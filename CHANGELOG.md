@@ -8,6 +8,29 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- A `Consultations` section in the ledger: when two or more *different* models have
+  answered the same request, it names the group, reports each member's proof-run
+  outcome, and asks for the answers to be read against each other rather than one after
+  another. Left to the plain task list a model tends to relay the last answer it read.
+
+  No new action was added, and none was needed — now that plain `delegate_task` calls
+  run concurrently, one commander reply carrying the same prompt to several models
+  already *is* a consultation. The missing piece was never orchestration, only the
+  comparative presentation, so this is rendering rather than protocol surface: no new
+  verb, no parser, no action budget, no guard tests for any of that.
+
+  Proof outcomes are what the members are annotated with. Ranking answers by how they
+  read is what a tool with no ground truth has to do; this one can run the tests, so
+  the instruction says a proof that ran beats a majority that did not. The most recent
+  run wins, because a red-then-green workflow runs a failing test before a passing one
+  on the same task and where it ended up is the state that matters.
+
+  The section points at the task entries rather than repeating their results — printing
+  them twice would spend the prompt budget twice on the same text — and is dropped
+  whole when the budget is tight, since it is an aid to reading results the commander
+  already has rather than a load-bearing section. One model asked the same thing twice
+  is a retry, not a consultation, and produces nothing.
+
 - The roster now carries what delegating to each model has actually achieved on this
   machine, not only a hand-written guess at what it costs. `swarm::model_hint`'s own
   doc comment explains why it is coarse — real per-token pricing changes under this

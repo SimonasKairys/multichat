@@ -294,6 +294,22 @@ pub struct AuditLogger {
     /// loggers (i.e. every test) never touch the OS keyring.
     keyring_anchor: Option<Anchor>,
     use_keyring_anchor: bool,
+    /// Why the keyring anchor could not be written, when a write was attempted and
+    /// failed; `None` when the last attempt succeeded or none was made.
+    ///
+    /// `sync_keyring_anchor` swallows write failures on purpose — it runs from `open()`
+    /// and from `Drop`, and bookkeeping must never fail either. But swallowing the
+    /// error also swallowed the *fact*, and the fact matters: with the keyring anchor
+    /// unwritten, tamper-evidence rests on the sidecar file alone, which anyone who can
+    /// edit the log can also edit. That is a real reduction in what this module
+    /// promises, and it was happening with no indication at all — a full Windows
+    /// credential store produced exactly that, silently, for as long as it stayed full.
+    ///
+    /// So the failure is recorded here rather than acted on here, and whoever owns a
+    /// user-facing surface reports it: the orchestrator at session start, `simon audit`
+    /// when it runs. A failure inside `Drop` cannot be surfaced in the session that is
+    /// ending, but the next `open()` retries the write and reports it if it fails again.
+    keyring_anchor_unwritten: Option<String>,
 }
 
 /// Process-local exclusion for one log path, layered *under* the file lock.
@@ -338,6 +354,7 @@ impl AuditLogger {
             key,
             keyring_anchor,
             use_keyring_anchor: true,
+            keyring_anchor_unwritten: None,
         };
         // Coarse-cadence sync #1: pick up wherever a previous (possibly crashed)
         // process left off. See `sync_keyring_anchor` for why this can never regress
@@ -362,6 +379,7 @@ impl AuditLogger {
             key: LockedBuffer::new(key),
             keyring_anchor: None,
             use_keyring_anchor: false,
+            keyring_anchor_unwritten: None,
         })
     }
 
@@ -381,6 +399,7 @@ impl AuditLogger {
             key: LockedBuffer::new(key),
             keyring_anchor: None,
             use_keyring_anchor: false,
+            keyring_anchor_unwritten: None,
         })
     }
 
@@ -547,8 +566,14 @@ impl AuditLogger {
                 Ok(j) => j,
                 Err(_) => return,
             };
-            if Credentials::set(&keyring_anchor_service(&self.path), &json).is_ok() {
-                self.keyring_anchor = Some(candidate);
+            match Credentials::set(&keyring_anchor_service(&self.path), &json) {
+                Ok(()) => {
+                    self.keyring_anchor = Some(candidate);
+                    self.keyring_anchor_unwritten = None;
+                }
+                Err(e) => {
+                    self.keyring_anchor_unwritten = Some(bounded_anchor_reason(&e.to_string()))
+                }
             }
         }
     }
@@ -568,9 +593,40 @@ impl AuditLogger {
         let Ok(json) = serde_json::to_string(&candidate) else {
             return;
         };
-        if Credentials::set(&keyring_anchor_service(&self.path), &json).is_ok() {
-            self.keyring_anchor = Some(candidate);
+        match Credentials::set(&keyring_anchor_service(&self.path), &json) {
+            Ok(()) => {
+                self.keyring_anchor = Some(candidate);
+                self.keyring_anchor_unwritten = None;
+            }
+            // `reset_anchor`'s whole purpose is re-baselining tamper-evidence, so a
+            // write that fails here leaves the user believing they have re-baselined
+            // when they have not. Recorded for the same reason as in
+            // `sync_keyring_anchor`, and reported by the same surfaces.
+            Err(e) => {
+                self.keyring_anchor_unwritten = Some(bounded_anchor_reason(&e.to_string()));
+            }
         }
+    }
+
+    /// Why the keyring anchor could not be written, if the last attempt failed.
+    ///
+    /// `None` covers both "written" and "never attempted" — a logger built with
+    /// `with_key` does no keyring I/O at all. Callers with somewhere to say it should
+    /// report this: an unwritten keyring anchor means tamper-evidence rests on the
+    /// sidecar file alone, which anyone who can edit the log can also edit.
+    pub fn keyring_anchor_unwritten(&self) -> Option<&str> {
+        self.keyring_anchor_unwritten.as_deref()
+    }
+
+    /// Sets the unwritten-anchor state so a caller's reporting path can be exercised
+    /// without a broken OS keyring.
+    ///
+    /// There is no portable way to make `Credentials::set` fail on demand, and the
+    /// behaviour worth testing is not the failing write — it is that the failure
+    /// reaches the user, which is exactly what silently did not happen before.
+    #[cfg(test)]
+    pub(crate) fn set_keyring_anchor_unwritten_for_test(&mut self, reason: &str) {
+        self.keyring_anchor_unwritten = Some(reason.to_string());
     }
 
     /// Wipes both anchors outright rather than re-baselining them to a state. Used by
@@ -977,6 +1033,21 @@ fn anchor_is_unchanged(live: Option<&Anchor>, candidate: &Anchor) -> bool {
 /// falling back to the path as given is still safe — at worst this process just won't
 /// find a previous anchor filed under the canonical form, which `verify()` treats as
 /// "no anchor yet" (see `AnchorStatus::Missing`), not as tampering.
+/// Bounds a keyring error before it is stored and later printed.
+///
+/// The text comes from the OS credential store, not from this crate, and it is rendered
+/// into a TUI line and a terminal warning. Truncating on a char boundary rather than a
+/// byte index because the message may be multi-byte UTF-8 and slicing mid-character
+/// panics — the same rule `providers::truncate_error_detail` follows, for the same
+/// reason.
+fn bounded_anchor_reason(reason: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    match reason.char_indices().nth(MAX_CHARS) {
+        Some((cut, _)) => format!("{}…", &reason[..cut]),
+        None => reason.to_string(),
+    }
+}
+
 fn keyring_anchor_service(log_path: &Path) -> String {
     let parent = match log_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
@@ -2113,6 +2184,31 @@ mod tests {
         );
         // No explicit delete here: `_cleanup` does it on the way out of every path,
         // including the two `expect`s above.
+    }
+
+    #[test]
+    fn a_logger_that_does_no_keyring_io_reports_no_unwritten_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        // `with_key` sets `use_keyring_anchor: false`, so no write is ever attempted.
+        // "Never attempted" must read as `None`, not as a warning — otherwise every
+        // test-built logger would claim tamper-evidence was reduced.
+        let log = logger(&dir);
+        assert_eq!(log.keyring_anchor_unwritten(), None);
+    }
+
+    #[test]
+    fn a_bounded_anchor_reason_truncates_on_a_char_boundary() {
+        assert_eq!(bounded_anchor_reason("short"), "short");
+        // Multi-byte throughout: slicing this at a byte index would panic, which is the
+        // failure mode this exists to avoid — the text comes from the OS, not from here.
+        let long = "é".repeat(500);
+        let bounded = bounded_anchor_reason(&long);
+        assert!(
+            bounded.chars().count() <= 201,
+            "{}",
+            bounded.chars().count()
+        );
+        assert!(bounded.ends_with('…'));
     }
 
     #[test]

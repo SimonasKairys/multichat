@@ -410,6 +410,21 @@ fn verify_audit(paths: &Paths, reset_anchor: bool, reset_key: bool) -> Result<()
         );
     }
 
+    // Both the open above and any `--reset-anchor` write to the keyring anchor, and both
+    // swallow a failure so that bookkeeping never fails the command. Reported here
+    // because this is the command whose entire job is telling the user what state
+    // tamper-evidence is in, and "the anchor I just tried to write did not land" is
+    // exactly that. Printed before the verification result so it cannot be mistaken for
+    // a comment on the chain, which is verified independently of the keyring.
+    if let Some(reason) = logger.keyring_anchor_unwritten() {
+        println!(
+            "Warning: the keyring anchor could not be written ({reason}). Tamper-\
+             evidence now rests on the sidecar anchor file alone, which is reachable by \
+             anyone who can edit the log itself. On Windows this is usually a full \
+             credential store."
+        );
+    }
+
     let report = logger.verify()?;
     match report.anchor {
         AnchorStatus::Current => {

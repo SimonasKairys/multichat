@@ -2991,6 +2991,20 @@ impl Orchestrator {
             self.emit(Event::Error(format!("audit log unavailable: {e}")))
                 .await;
         }
+        // Opening the logger syncs the keyring anchor. A write that failed there is
+        // swallowed by design — bookkeeping must never fail an open — but the *fact*
+        // was swallowed with it, and it is not a small one: with the keyring anchor
+        // unwritten, tamper-evidence rests on the sidecar file alone, which anyone who
+        // can edit the log can also edit. A full Windows credential store produced
+        // exactly that, silently, for as long as it stayed full.
+        if let Some(reason) = self.audit.keyring_anchor_unwritten() {
+            let message = format!(
+                "audit tamper-evidence reduced: the keyring anchor could not be written \
+                 ({reason}). The sidecar anchor file still applies, but it is reachable \
+                 by anyone who can edit the log itself"
+            );
+            self.emit(Event::Error(message)).await;
+        }
 
         while let Some(command) = commands.recv().await {
             match command {
@@ -8195,6 +8209,42 @@ mod tests {
         assert!(annotation.contains("0/3 text tasks ok"), "{annotation}");
         assert!(orch.system_prompt().contains("0/3 text tasks ok"));
     }
+    #[tokio::test]
+    async fn an_unwritten_keyring_anchor_is_reported_at_session_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let mut orch = workflow_orchestrator(
+            registry_with(vec![("ollama", "llama3", false)], "ollama:llama3"),
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        );
+        orch.audit
+            .set_keyring_anchor_unwritten_for_test("credential store is full");
+
+        command_tx.send(Command::Shutdown).await.unwrap();
+        drop(command_tx);
+        orch.run(command_rx).await;
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Error(message)
+                    if message.contains("tamper-evidence reduced")
+                        && message.contains("credential store is full")
+            )),
+            "a keyring anchor that did not land is a real reduction in what the audit \
+             log promises, and used to happen with no indication at all: {events:?}"
+        );
+    }
+
     #[test]
     fn provider_of_reads_the_vendor_half_of_a_label() {
         assert_eq!(provider_of("anthropic:claude-opus-5"), "anthropic");

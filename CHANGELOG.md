@@ -6,6 +6,24 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed keyring-anchor write is no longer silent. `sync_keyring_anchor` swallows
+  write failures on purpose — it runs from `open()` and from `Drop`, and bookkeeping
+  must never fail either — but swallowing the error also swallowed the fact, and the
+  fact is not small: with the keyring anchor unwritten, tamper-evidence rests on the
+  sidecar anchor file alone, which anyone who can edit the log can also edit. A full
+  Windows credential store produced exactly that state, silently, for as long as it
+  stayed full, and the only symptom was an unrelated-looking test failure.
+
+  The failure is now recorded on the logger rather than acted on there, and reported by
+  whoever has somewhere to say it: the orchestrator emits a warning at session start,
+  and `simon audit` prints one before its verification result — that command's entire
+  job is saying what state tamper-evidence is in. `reset_anchor`'s forced write reports
+  it too, since a failure there leaves the user believing they have re-baselined when
+  they have not. A failure inside `Drop` cannot be surfaced in the session that is
+  ending; the next `open()` retries the write and reports it if it fails again.
+
 ### Added
 
 - A `Consultations` section in the ledger: when two or more *different* models have

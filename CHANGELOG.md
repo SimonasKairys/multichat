@@ -54,6 +54,13 @@ All notable changes to this project are recorded here. The format follows
   every delegation rather than only at startup, so a model that has just failed twice is
   reflected in the very next turn's prompt — which is the turn where it matters.
 
+  `cargo mutants` on the new file: 37 of 37 caught. One survivor was found and killed
+  first — `load`'s `NotFound` guard could widen to `true`, which would make every read
+  failure look like "no history yet", hand back an empty record, and let the next write
+  save that emptiness over the top, wiping every model's history without a word. The
+  same mutant is already covered in `usage_ledger` and `config`; this file was missing
+  the equivalent test.
+
 - Three more spending ceilings alongside `monthly_token_limit`:
   `session_token_limit`, `daily_token_limit`, and `provider_token_limits` (keyed by
   provider name, so one entry covers every model reached through that vendor). A month

@@ -247,6 +247,33 @@ mod tests {
     }
 
     #[test]
+    fn a_non_notfound_read_error_is_not_swallowed_as_an_empty_history() {
+        // Mutation-testing regression, and the same one `usage_ledger` and `config`
+        // already carry a test for: widening `load`'s `NotFound` guard to `true` makes
+        // every read failure look like "no history yet". A permissions problem or a
+        // corrupt file would then hand back an empty record — and the next `record`
+        // call would save that emptiness over the top, wiping every model's history
+        // without a word. The genuine "file absent" case is covered by
+        // `nothing_is_annotated_until_there_is_enough_to_say`; this covers the other
+        // branch, which must propagate rather than reset.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // A directory where the file is expected. Reading it as a file fails on every
+        // platform, with an error whose kind is not `NotFound` — the path plainly
+        // exists.
+        fs::create_dir(history_file(dir)).unwrap();
+
+        assert!(
+            load(dir).is_err(),
+            "an unreadable history is an error, not an empty one"
+        );
+        assert!(
+            record(dir, "a:m", TaskClass::Text, true, 1).is_err(),
+            "recording over an unreadable history would destroy it"
+        );
+    }
+
+    #[test]
     fn records_are_kept_separately_per_model_and_per_class() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();

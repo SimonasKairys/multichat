@@ -100,6 +100,16 @@ enum ActionLimit {
     Workflow,
 }
 
+/// Folds `Some(0)` into `None` so both spellings of "no ceiling" behave identically.
+///
+/// Zero is the conventional way to write "unlimited" in a rate-limit config, and it is
+/// also what a half-finished edit leaves behind. Reading it as a literal ceiling would
+/// refuse every call in the session with a message the user cannot act on until they
+/// find and re-read config.json.
+fn normalize_token_limit(limit: Option<u64>) -> Option<u64> {
+    limit.filter(|&limit| limit > 0)
+}
+
 fn hash_action_str(value: &str) -> u64 {
     const OFFSET: u64 = 14_695_981_039_346_656_037;
     const PRIME: u64 = 1_099_511_628_211;
@@ -2405,7 +2415,40 @@ pub struct Orchestrator {
     /// `Paths` struct (whose other fields describe files this orchestrator never
     /// touches) threaded through every call site.
     data_dir: PathBuf,
+    /// `Settings::monthly_token_limit`, normalized so that `Some(0)` is stored as
+    /// `None`. `None` means no ceiling, which is what an installation that never
+    /// configured one gets, so the default session behaves exactly as it did before
+    /// this field existed.
+    monthly_token_limit: Option<u64>,
+    /// Whether the "approaching the ceiling" notice has already been shown this
+    /// session. The check runs before every commander call and every delegation, so
+    /// without this a session spending its last tenth of the budget would repeat the
+    /// same warning on every turn until it was refused — which trains the user to
+    /// ignore the line that later says the work actually stopped.
+    budget_warning_sent: bool,
 }
+
+/// What one monthly-ceiling check concluded about the call that is about to be made.
+#[derive(Debug, PartialEq, Eq)]
+enum BudgetVerdict {
+    /// No ceiling is configured, spending is below the warning threshold, or the
+    /// ledger could not be read (see `monthly_budget_verdict` for why that allows the
+    /// call rather than refusing it).
+    Clear,
+    /// Below the ceiling but at or past `BUDGET_WARNING_PERCENT` of it. Carries the
+    /// notice text; the call still proceeds.
+    Warn(String),
+    /// At or past the ceiling. Carries the refusal text; the call must not be made.
+    Refuse(String),
+}
+
+/// Percentage of the monthly ceiling at which the session starts saying so.
+///
+/// A ceiling with no approach warning is a cliff: the first sign of it is a refused
+/// turn mid-task, with a half-finished workflow and isolated copies still open. Eighty
+/// percent leaves room to finish what is in flight, raise the ceiling, or stop
+/// deliberately.
+const BUDGET_WARNING_PERCENT: u64 = 80;
 
 impl Orchestrator {
     pub fn new(
@@ -2434,7 +2477,20 @@ impl Orchestrator {
             decisions,
             approve_all: auto_write,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         })
+    }
+
+    /// Applies `Settings::monthly_token_limit` to a freshly constructed orchestrator.
+    ///
+    /// A builder method rather than an eighth constructor parameter: `new` already
+    /// takes seven, and this one is optional in the strongest sense — a caller that
+    /// never sets it gets the pre-existing unlimited behaviour, so the only site that
+    /// has to know about ceilings is the one that has already read `Settings`.
+    pub fn with_monthly_token_limit(mut self, limit: Option<u64>) -> Self {
+        self.monthly_token_limit = normalize_token_limit(limit);
+        self
     }
 
     async fn emit(&self, event: Event) {
@@ -2463,6 +2519,81 @@ impl Orchestrator {
                     .audit
                     .log("usage.persist_failed", &safe_error_detail(&e));
                 0
+            }
+        }
+    }
+
+    /// Decides whether the next provider call may be made under this month's token
+    /// ceiling, without spending anything to find out.
+    ///
+    /// A ledger this cannot read allows the call. That is the same trade
+    /// `record_month_usage` makes in the other direction, for the same reason: a
+    /// permissions problem or a concurrent writer is a disk fault, not evidence that
+    /// the user is out of budget, and refusing every turn until someone finds
+    /// `usage_history.json` would turn one file's failure into an unusable session.
+    /// The fault is recorded as `usage.cap_unreadable` so the choice is auditable
+    /// rather than silent — a ceiling that cannot be evaluated is not a ceiling, and
+    /// the log says exactly when that happened.
+    fn monthly_budget_verdict(&mut self) -> BudgetVerdict {
+        let Some(limit) = self.monthly_token_limit else {
+            return BudgetVerdict::Clear;
+        };
+        let spent = match crate::usage_ledger::total(&self.data_dir) {
+            Ok(spent) => spent,
+            Err(e) => {
+                let _ = self
+                    .audit
+                    .log("usage.cap_unreadable", &safe_error_detail(&e));
+                return BudgetVerdict::Clear;
+            }
+        };
+        if spent >= limit {
+            return BudgetVerdict::Refuse(format!(
+                "this month's token ceiling is spent ({spent} of {limit}). Raise \
+                 `monthly_token_limit` in config.json, or wait for the next UTC month"
+            ));
+        }
+        // Multiplied out rather than divided, so a ceiling small enough that
+        // `limit / 100` truncates to zero still has a real threshold.
+        if spent.saturating_mul(100) >= limit.saturating_mul(BUDGET_WARNING_PERCENT) {
+            return BudgetVerdict::Warn(format!(
+                "approaching this month's token ceiling: {spent} of {limit} spent"
+            ));
+        }
+        BudgetVerdict::Clear
+    }
+
+    /// Runs a monthly-ceiling check and reports whether the work named by `what` may
+    /// proceed, emitting the refusal or the once-per-session warning on the way.
+    ///
+    /// `what` names the specific call being gated ("the commander call", "delegation
+    /// to ollama:llama3") because a session that stops has to say *which* piece of
+    /// work stopped; "budget exceeded" on its own leaves the user guessing whether
+    /// anything ran at all.
+    ///
+    /// Both outcomes travel through `Event::Error`, which is this codebase's channel
+    /// for "the session continues, and here is why something stopped" — the
+    /// auto-continuation caps in `run` use it the same way. A dedicated notice variant
+    /// would have to be threaded through `App::apply` and the transcript renderer to
+    /// carry one line of text.
+    async fn monthly_budget_allows(&mut self, what: &str) -> bool {
+        match self.monthly_budget_verdict() {
+            BudgetVerdict::Clear => true,
+            BudgetVerdict::Warn(notice) => {
+                if !self.budget_warning_sent {
+                    self.budget_warning_sent = true;
+                    let _ = self.audit.log("usage.cap_warning", "threshold=reached");
+                    self.emit(Event::Error(notice)).await;
+                }
+                true
+            }
+            BudgetVerdict::Refuse(reason) => {
+                let _ = self
+                    .audit
+                    .log("usage.cap_reached", &format!("blocked={what}"));
+                self.emit(Event::Error(format!("{what} stopped: {reason}")))
+                    .await;
+                false
             }
         }
     }
@@ -2646,6 +2777,11 @@ impl Orchestrator {
     /// reopened mid-chat) and resets the swarm roster so the system prompt matches
     /// reality.
     async fn reconfigure(&mut self, settings: Settings) {
+        // The picker writes the whole settings file back, so a ceiling edited on disk
+        // between openings takes effect here rather than only on the next launch. The
+        // warning latch is deliberately not reset: it belongs to the session, and
+        // reopening the picker is not new evidence that the user needs telling twice.
+        self.monthly_token_limit = normalize_token_limit(settings.monthly_token_limit);
         let candidates = discover_candidates(&settings, self.classified).await;
         let model_statuses = candidate_statuses(&candidates, &settings);
         match Registry::build_discovered(
@@ -2741,6 +2877,20 @@ impl Orchestrator {
         remaining_actions: &mut usize,
     ) -> TurnOutcome {
         let primary_label = self.registry.primary().to_string();
+
+        // Before the audit entry, not after: `prompt.sent` records a prompt that
+        // reached a model, and under a spent ceiling none does. Checking each round
+        // rather than only the user's first also stops an auto-continuation workflow,
+        // which is where an unattended session can spend the most.
+        if !self.monthly_budget_allows("the commander call").await {
+            return TurnOutcome {
+                commander_failed: true,
+                action_fingerprint: Vec::new(),
+                state_fingerprint: self.ledger.state_fingerprint(),
+                action_limit: None,
+            };
+        }
+
         let _ = self.audit.log(
             if is_continuation {
                 "prompt.continuation"
@@ -2995,6 +3145,35 @@ impl Orchestrator {
                 continue;
             };
             let target_label = target.label();
+
+            // Gating each delegation rather than the turn as a whole: one commander
+            // reply can dispatch up to `MAX_DELEGATIONS_PER_TURN` calls, so a check
+            // that ran only once per turn would let the ceiling be passed nine more
+            // times before the next round noticed. The refusal is recorded on the task
+            // the same way an unknown model is, so the commander learns on its next
+            // automatic turn that the work did not run — and why.
+            if !self
+                .monthly_budget_allows(&format!("delegation to {target_label}"))
+                .await
+            {
+                let task_id = self.ledger.add_task(&delegation.prompt);
+                self.ledger.assign_task(task_id, &target_label);
+                self.ledger
+                    .record_result(task_id, "refused: this month's token ceiling is spent");
+                self.ledger.update_status(task_id, TaskStatus::Failed);
+                let _ = self.audit.log(
+                    "task.failed",
+                    &format!("task={task_id} kind=budget_exhausted detail=withheld"),
+                );
+                self.emit(Event::DelegationFinished {
+                    to: target_label.clone(),
+                    ok: false,
+                    chars: 0,
+                    millis: 0,
+                })
+                .await;
+                continue;
+            }
 
             let task_id = self.ledger.add_task(&delegation.prompt);
             self.ledger.assign_task(task_id, &target_label);
@@ -4700,6 +4879,8 @@ mod tests {
             decisions,
             approve_all: auto_write,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         }
     }
 
@@ -4728,15 +4909,22 @@ mod tests {
             decisions,
             approve_all: auto_write,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         }
     }
+
+    /// What a `ContextCapturingProvider` records per call: the provider's own label,
+    /// the system prompt it was handed, and the user prompt. Named because clippy
+    /// rejects the bare nested type in a function signature.
+    type CapturedContexts = Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
 
     /// A provider that records the exact system/user context it receives, making
     /// delegated prompt isolation observable without a live model call.
     struct ContextCapturingProvider {
         provider: String,
         model: String,
-        calls: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+        calls: CapturedContexts,
     }
 
     #[async_trait]
@@ -6970,6 +7158,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -7044,6 +7234,291 @@ mod tests {
         );
     }
 
+    /// A registry whose single provider records every call it receives, so a test can
+    /// assert that a prompt never reached a model rather than only that an error was
+    /// announced. The two are different failures: emitting the refusal *after*
+    /// spending the tokens would satisfy an events-only assertion.
+    fn capturing_registry(label_provider: &str, label_model: &str) -> (Registry, CapturedContexts) {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = ContextCapturingProvider {
+            provider: label_provider.into(),
+            model: label_model.into(),
+            calls: calls.clone(),
+        };
+        let primary = provider.label();
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        providers.insert(primary.clone(), Arc::new(provider));
+        (
+            Registry {
+                providers,
+                primary,
+                applied: BTreeMap::new(),
+                connection_ids: BTreeMap::new(),
+            },
+            calls,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_spent_monthly_ceiling_stops_the_commander_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (registry, calls) = capturing_registry("primary", "commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+
+        // The month's whole allowance is already spent when the turn starts.
+        crate::usage_ledger::record(&paths.data_dir, 1_000).unwrap();
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        )
+        .with_monthly_token_limit(Some(1_000));
+
+        let outcome = orch.handle_prompt("summarise the project").await;
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no prompt may reach a model once the ceiling is spent"
+        );
+        assert!(
+            outcome.commander_failed,
+            "a refused turn must not fall through into auto-continuation"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Error(message)
+                    if message.contains("the commander call") && message.contains("1000 of 1000")
+            )),
+            "the refusal must name what stopped and how much was spent: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_monthly_ceiling_with_budget_left_lets_the_turn_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (registry, calls) = capturing_registry("primary", "commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+
+        crate::usage_ledger::record(&paths.data_dir, 10).unwrap();
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        )
+        .with_monthly_token_limit(Some(1_000));
+
+        let outcome = orch.handle_prompt("summarise the project").await;
+
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(!outcome.commander_failed);
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Error(message) if message.contains("ceiling")
+            )),
+            "a session well under its ceiling must not be told about it: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_monthly_ceiling_means_unlimited_rather_than_refuse_everything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (registry, calls) = capturing_registry("primary", "commander");
+        let (event_tx, _event_rx) = mpsc::channel(32);
+
+        crate::usage_ledger::record(&paths.data_dir, 5_000).unwrap();
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        )
+        .with_monthly_token_limit(Some(0));
+
+        let outcome = orch.handle_prompt("summarise the project").await;
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "0 is how a config file spells `unlimited`; reading it as a literal ceiling \
+             would refuse every call in the session"
+        );
+        assert!(!outcome.commander_failed);
+    }
+
+    #[tokio::test]
+    async fn the_approaching_ceiling_warning_is_shown_once_per_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (registry, calls) = capturing_registry("primary", "commander");
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+
+        // Exactly at the warning threshold, and stays there: the stub reports no
+        // usage, so neither turn moves the total.
+        crate::usage_ledger::record(&paths.data_dir, 800).unwrap();
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        )
+        .with_monthly_token_limit(Some(1_000));
+
+        orch.handle_prompt("first").await;
+        orch.handle_prompt("second").await;
+
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "a warning must not stop the work it is warning about"
+        );
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        let warnings = events
+            .iter()
+            .filter(
+                |event| matches!(event, Event::Error(message) if message.contains("approaching")),
+            )
+            .count();
+        assert_eq!(
+            warnings, 1,
+            "repeating the notice every turn trains the user to ignore the line that \
+             later says the work actually stopped: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn just_below_the_warning_threshold_stays_silent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+        let (registry, _calls) = capturing_registry("primary", "commander");
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+
+        // One token below `BUDGET_WARNING_PERCENT` of the ceiling. Paired with
+        // `the_approaching_ceiling_warning_is_shown_once_per_session`, which sits
+        // exactly on the threshold, this pins it from both sides — without the pair, a
+        // comparison that warned from the first token, or never warned at all, would
+        // still pass.
+        crate::usage_ledger::record(&paths.data_dir, 799).unwrap();
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        )
+        .with_monthly_token_limit(Some(1_000));
+
+        orch.handle_prompt("first").await;
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Error(message) if message.contains("approaching")
+            )),
+            "799 of 1000 is below the threshold and must not warn: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spent_monthly_ceiling_refuses_each_delegation_and_records_it_on_the_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        let project_dir = tempfile::tempdir().unwrap();
+
+        let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for model in ["one", "two"] {
+            let provider = ContextCapturingProvider {
+                provider: "worker".into(),
+                model: model.into(),
+                calls: calls.clone(),
+            };
+            providers.insert(provider.label(), Arc::new(provider));
+        }
+        let registry = Registry {
+            providers,
+            primary: "primary:commander".into(),
+            applied: BTreeMap::new(),
+            connection_ids: BTreeMap::new(),
+        };
+
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        crate::usage_ledger::record(&paths.data_dir, 1_000).unwrap();
+        let mut orch = workflow_orchestrator(
+            registry,
+            &paths,
+            project_dir.path().to_path_buf(),
+            false,
+            event_tx,
+            None,
+            false,
+        )
+        .with_monthly_token_limit(Some(1_000));
+
+        orch.run_delegations(
+            "primary:commander",
+            "ACTION: delegate_task(worker:one, first)\n\
+             ACTION: delegate_task(worker:two, second)",
+        )
+        .await;
+
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "one commander reply can dispatch ten calls; the ceiling has to hold for \
+             every one of them, not just the turn as a whole"
+        );
+        let tasks = orch.ledger.tasks();
+        assert_eq!(tasks.len(), 2);
+        for task in tasks {
+            assert_eq!(task.status, TaskStatus::Failed);
+            assert!(
+                task.result
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("refused"),
+                "the commander learns from the ledger why the work did not run: {task:?}"
+            );
+        }
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::DelegationFinished { ok: false, .. }))
+                .count(),
+            2,
+            "a refused delegation still needs its terminal event, or the status line \
+             spins forever: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn delegation_dispatches_to_the_named_model() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7067,6 +7542,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -7123,6 +7600,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -7179,6 +7658,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
         orch.ledger
             .record_commander_reply("COMMANDER-SECRET-MARKER and all delegation lines");
@@ -7258,6 +7739,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations("ollama:llama3", "ACTION: delegate_task(ghost:model, hi)")
@@ -7308,6 +7791,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -7363,6 +7848,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -7418,6 +7905,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -7481,6 +7970,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -7548,6 +8039,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -7627,6 +8120,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -7703,6 +8198,8 @@ mod tests {
             decisions: None,
             approve_all: true,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
         orch.workspace.enable_task_copies(&paths.data_dir).unwrap();
         orch.run_delegations(
@@ -7772,6 +8269,8 @@ mod tests {
             // text-only delegation.
             approve_all: true,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -7816,6 +8315,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         let long_task = format!("a{}", "€".repeat(130));
@@ -7856,6 +8357,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
@@ -7897,6 +8400,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(notes.md)")
@@ -7947,6 +8452,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_skill_reads(
@@ -8003,6 +8510,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(nope.md)")
@@ -8062,6 +8571,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         let prompt = orch.system_prompt();
@@ -8089,6 +8600,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
         orch.ledger.set_roster(orch.registry.labels());
 
@@ -8141,6 +8654,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         // Bare model name, not the full label — exercises `set_primary`'s flexible
@@ -8186,6 +8701,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.set_commander("ghost").await;
@@ -8214,6 +8731,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         // Load the ledger with content that `clear_content` is documented to drop.
@@ -8267,6 +8786,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         // `StubProvider::send` echoes `"echo: {prompt}"`, prefixing only the first
@@ -8317,6 +8838,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_file_writes(
@@ -8364,6 +8887,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_file_writes(
@@ -8409,6 +8934,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
         orch.run_delegations(
             "ollama:llama3",
@@ -8461,6 +8988,8 @@ mod tests {
             decisions: Some(decisions),
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         }
     }
 
@@ -8741,6 +9270,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
         orch.workspace.enable_task_copies(&paths.data_dir).unwrap();
 
@@ -8949,6 +9480,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -8993,6 +9526,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -9193,6 +9728,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.handle_prompt("hello").await;
@@ -9249,6 +9786,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(notes.txt)")
@@ -9286,6 +9825,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(notes.txt)")
@@ -9337,6 +9878,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(../secret.txt)")
@@ -9394,6 +9937,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         // Leading newline so the marker lands at the start of a line in the stub's
@@ -9449,6 +9994,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_file_lists("ollama:llama3", "ACTION: list_files()")
@@ -9495,6 +10042,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(missing.md)")
@@ -9543,6 +10092,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         // Traversal attempt: the file exists outside the project root but must be
@@ -9593,6 +10144,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         // Request listing of a path that does not exist inside the project root.
@@ -9674,6 +10227,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(
@@ -9724,6 +10279,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_file_reads("ollama:llama3", "ACTION: read_file(utf8.txt)")
@@ -9764,6 +10321,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_skill_reads("ollama:llama3", "ACTION: read_skill(utf8.md)")
@@ -9826,6 +10385,8 @@ mod tests {
             decisions: None,
             approve_all: false,
             data_dir: paths.data_dir.clone(),
+            monthly_token_limit: None,
+            budget_warning_sent: false,
         };
 
         orch.run_delegations(

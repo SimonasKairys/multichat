@@ -75,6 +75,33 @@ pub fn record(data_dir: &Path, tokens: u64) -> Result<u64> {
     record_at(data_dir, tokens, &current_month_utc())
 }
 
+/// The running total for `current_month`, read without recording anything.
+///
+/// `record_at(data_dir, 0, current_month)` returns the same number, and the
+/// orchestrator's own test uses it that way to prove persistence. It is the wrong
+/// call for a spending check: that check runs *before* any tokens are spent, on every
+/// turn and every delegation, and asking a question should not write to disk.
+/// Recording zero would also create `usage_history.json` on a fresh install the first
+/// time a user merely started a session under a configured ceiling, and would roll a
+/// stale month over as a side effect of asking whether work may proceed.
+///
+/// A file covering a month that has already ended reads as zero here, for the same
+/// reason `record_at` resets it: last month's spending is not this month's, and a
+/// ceiling enforced against a stale total would refuse work the user has budget for.
+pub fn total_at(data_dir: &Path, current_month: &str) -> Result<u64> {
+    let usage = load(data_dir)?;
+    Ok(if usage.month == current_month {
+        usage.tokens
+    } else {
+        0
+    })
+}
+
+/// `total_at` against the real clock — the only entry point production code calls.
+pub fn total(data_dir: &Path) -> Result<u64> {
+    total_at(data_dir, &current_month_utc())
+}
+
 /// The current UTC calendar month as `"YYYY-MM"`.
 pub fn current_month_utc() -> String {
     month_utc(SystemTime::now())
@@ -159,6 +186,43 @@ mod tests {
         // A new month must start from zero, not carry June's total forward.
         assert_eq!(record_at(dir, 10, "2024-07").unwrap(), 10);
         assert_eq!(record_at(dir, 5, "2024-07").unwrap(), 15);
+    }
+
+    #[test]
+    fn total_at_reads_the_stored_total_for_the_current_month() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        record_at(dir, 100, "2024-06").unwrap();
+        record_at(dir, 50, "2024-06").unwrap();
+        assert_eq!(total_at(dir, "2024-06").unwrap(), 150);
+    }
+
+    #[test]
+    fn total_at_reports_zero_for_a_month_that_has_already_ended() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        record_at(dir, 900, "2024-06").unwrap();
+        // July has spent nothing yet. Reporting June's 900 here would make a ceiling
+        // refuse the first call of a month the user has their whole budget for.
+        assert_eq!(total_at(dir, "2024-07").unwrap(), 0);
+        // And reading it did not perform the rollover write itself: June's total is
+        // still on disk for `record_at` to reset when tokens are actually spent.
+        assert_eq!(total_at(dir, "2024-06").unwrap(), 900);
+    }
+
+    #[test]
+    fn total_at_neither_creates_nor_modifies_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // A ceiling check on a fresh install must not leave a ledger behind: the file
+        // appearing is what tells a later reader that tokens were spent this month.
+        assert_eq!(total_at(dir, "2024-06").unwrap(), 0);
+        assert!(!usage_file(dir).exists());
+
+        record_at(dir, 120, "2024-06").unwrap();
+        let before = fs::read_to_string(usage_file(dir)).unwrap();
+        assert_eq!(total_at(dir, "2024-06").unwrap(), 120);
+        assert_eq!(fs::read_to_string(usage_file(dir)).unwrap(), before);
     }
 
     #[test]

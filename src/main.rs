@@ -502,7 +502,8 @@ async fn chat(
         event_tx,
         write_gate,
         auto_write,
-    )?;
+    )?
+    .with_monthly_token_limit(settings.monthly_token_limit);
     let mut worker = tokio::spawn(orchestrator.run(command_rx));
 
     let ui_result = ui::run(

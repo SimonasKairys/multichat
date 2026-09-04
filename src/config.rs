@@ -291,6 +291,21 @@ pub struct Settings {
     /// The connection id chosen as commander. `None` falls back to the first enabled
     /// connection.
     pub commander: Option<String>,
+    /// Ceiling on the tokens this session will spend in a UTC calendar month, checked
+    /// against the running total in `usage_ledger.rs` before each commander call and
+    /// each delegation.
+    ///
+    /// `None` — the default, and what every existing config file deserializes to —
+    /// means no ceiling, so the behaviour of an installation that never sets this is
+    /// unchanged. `Some(0)` also means no ceiling rather than "refuse everything",
+    /// which would make a mistyped zero brick the session with a message the user
+    /// cannot act on without finding this file.
+    ///
+    /// This is deliberately a token count and not a currency amount. Tokens are what
+    /// providers actually report (see `providers::TokenUsage`); a price would need
+    /// per-model rates this project cannot track, for the same reason `swarm.rs`'s
+    /// `model_hint` states relative cost in words rather than numbers.
+    pub monthly_token_limit: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,6 +343,7 @@ impl Default for Settings {
             local_binaries: Default::default(),
             connections: Default::default(),
             commander: None,
+            monthly_token_limit: None,
         }
     }
 }
@@ -658,6 +674,25 @@ mod tests {
             Settings::load(&paths).unwrap().default_provider,
             "anthropic"
         );
+    }
+
+    #[test]
+    fn a_config_file_written_before_the_spend_ceiling_existed_still_loads() {
+        // `monthly_token_limit` was added to `Settings` after 0.1.1 shipped. Every
+        // config.json already on a user's disk predates it, so the field's absence has
+        // to deserialize as "no ceiling" rather than failing the whole file and
+        // dropping the user's endpoints, connections, and commander choice with it.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_data_dir(tmp.path().to_path_buf()).unwrap();
+        fs::write(
+            &paths.config_file,
+            r#"{"ollama_host":"http://127.0.0.1:11434","default_provider":"anthropic"}"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load(&paths).unwrap();
+        assert_eq!(loaded.default_provider, "anthropic");
+        assert_eq!(loaded.monthly_token_limit, None);
     }
 
     #[test]

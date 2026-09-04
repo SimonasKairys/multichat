@@ -139,9 +139,29 @@ endpoint.
   "local_binaries": {
     "copilot-enterprise": { "path": "/opt/copilot/bin/copilot", "args": ["--silent", "--prompt"], "model_arg": "--model", "stream_format": "copilot" },
     "claude": { "path": "/opt/claude/bin/claude", "model_arg": "--model", "stream_format": "claude" }
-  }
+  },
+  "monthly_token_limit": 2000000
 }
 ```
+
+`monthly_token_limit` is a ceiling on the tokens spent in a UTC calendar month. It is
+checked against the same running total the status line shows (`usage_history.json`,
+see `src/usage_ledger.rs`) before every commander call and every delegation. Past the
+ceiling `simon` refuses the call and says which one it refused instead of making it;
+from 80% of the ceiling the session says once that it is close, and keeps working.
+Omit the field — which is what every config file written before this existed does — or
+set it to `0` for no ceiling, which is the default.
+
+It bounds **tokens, not money**: tokens are what providers actually report, and
+per-model pricing is not something this project can track, for the same reason the
+roster states relative cost in words rather than numbers. It cannot see spending from
+outside this application, and a provider that reports no usage metadata contributes
+nothing to the total (the status line already labels those `tokens unavailable`) — so
+it is a brake on a runaway delegation loop, not a billing guarantee. A ledger that
+cannot be read allows the call and records `usage.cap_unreadable` in the audit log: a
+disk fault is not evidence that the budget is gone, and one unreadable file should not
+end the session.
+
 ## What models can do
 
 Beyond answering, a model can act by emitting a line in its reply. The actions are

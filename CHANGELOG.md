@@ -4,6 +4,25 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `monthly_token_limit` in `config.json`: an optional ceiling on the tokens spent in a
+  UTC calendar month, checked before every commander call and every delegation. Past
+  it, the call is refused and named rather than made; from 80% of it the session says
+  once that the ceiling is close. The monthly total has been on the status line since
+  it was added, but nothing consulted it — a gauge with no brake, and the failure it
+  could not prevent was an unattended auto-continuation loop discovered after the
+  invoice. Absent (every config file written before now) or `0` means no ceiling, so
+  an installation that sets nothing behaves exactly as it did.
+
+  A refused delegation is recorded on its ledger task as failed, so the commander
+  learns on its next automatic turn that the work did not run and why. A ledger that
+  will not load allows the call and records `usage.cap_unreadable`: a disk fault is not
+  evidence that the budget is spent, and this counter is not worth ending a session
+  over — the same trade `record_month_usage` already makes for write failures.
+
 ## [0.1.1] — 2026-09-02
 
 Test-suite fixes. No change to shipped behaviour.
